@@ -133,7 +133,7 @@ const AP_Scheduler::Task Rover::scheduler_tasks[] = {
 #endif
     SCHED_TASK(fardriver_throttle_update,20,    100,   120),
     SCHED_TASK(modbus_steering_update,20,    100,   121),
-    
+
     SCHED_TASK(crash_check,            10,    200, 123),
     SCHED_TASK(cruise_learn_update,    50,    200, 126),
 #if AP_ROVER_ADVANCED_FAILSAFE_ENABLED
@@ -568,11 +568,29 @@ void Rover::fardriver_throttle_update()
     fardriver_throttle.update(current_throttle);
 }
 
-// 2. Выделенная задача для управления рулем (Modbus)
 void Rover::modbus_steering_update() 
 {
-    // Берем системный выход руля автопилота от -1.0f (лево) до 1.0f (право)
-    float current_steering = g2.motors.get_steering();
+    float current_steering = 0.0f;
+
+    // В ручном режиме MANUAL полностью обходим защитные фильтры ArduPilot
+    if (control_mode == &mode_manual) {
+        // Читаем сырой ШИМ напрямую из аппаратного слоя HAL (входной канал 0)
+        // Он содержит чистые микросекунды (1000...2000), которые прилетают из MAVProxy
+        uint16_t raw_pwm = hal.rcin->read(0);
+        
+        // Защита от мусора при первоначальном старте симулятора
+        if (raw_pwm < 900 || raw_pwm > 2100) {
+            raw_pwm = 1500;
+        }
+
+        // Нормализуем диапазон 1000...2000 мкс во float от -1.0f до 1.0f
+        current_steering = ((float)raw_pwm - 1500.0f) / 500.0f;
+    } else {
+        // В автоматических режимах (AUTO, GUIDED) возвращаем управление навигатору ArduPilot
+        current_steering = g2.motors.get_steering();
+    }
+
+    // Отправляем значение в ваш Modbus-драйвер руля
     modbus_steering.update(current_steering);
 }
 

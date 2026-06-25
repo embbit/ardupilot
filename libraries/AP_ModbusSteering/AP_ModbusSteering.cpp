@@ -5,7 +5,7 @@ extern "C" {
     void modbus_create_write_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t value, uint8_t *out_buffer);
     void modbus_create_write32_packet(uint8_t slave_id, uint16_t reg_addr, int32_t value, uint8_t *out_buffer);
     void modbus_create_read_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t reg_count, uint8_t *out_buffer);
-    bool modbus_parse_read_response(uint8_t byte, uint8_t expected_bytes, StepperTelemetry *out_telemetry);
+    uint16_t modbus_crc16(const uint8_t *buf, uint16_t len);
 }
 
 extern const AP_HAL::HAL& hal;
@@ -35,52 +35,84 @@ void AP_ModbusSteering::update(float steering_out) {
 
     uint32_t now = AP_HAL::millis();
     uint32_t available_bytes = _uart->available();
-    StepperTelemetry telemetry;
-    const uint8_t expected_response_len = 7; // Length for function 0x03
-
-    // FIX 1: Strictly limit the number of bytes read per tick.
-    // On Mac M3, this protects the scheduler from freezing during packet parsing.
-    if (available_bytes > 16) {
-        available_bytes = 16;
-    }
-
-    for (uint32_t i = 0; i < available_bytes; i++) {
-        uint8_t b = _uart->read();
+    
+    // БРОНЕБОЙНЫЙ РАЗБОР: Читаем весь доступный буфер за один раз
+    if (available_bytes > 0) {
+        uint8_t local_buf[64];
+        if (available_bytes > 64) {
+            available_bytes = 64;
+        }
         
-        // Parse only answers to the read request (function 0x03)
-        if (modbus_parse_read_response(b, expected_response_len, &telemetry)) {
-            if (telemetry.error_code != 0) {
-                // FIX: Limit the frequency of critical messages (once every 1000 ms)
-                static uint32_t last_err_text_ms = 0;
-                if (now - last_err_text_ms >= 1000) {
-                    last_err_text_ms = now;
-                    const char* err_msg = "Unknown error";
-                    if (telemetry.error_code == 1) err_msg = "Overcurrent";
-                    if (telemetry.error_code == 2) err_msg = "Bus overvoltage";
-                    if (telemetry.error_code == 4) err_msg = "Encoder position error";
-                    gcs().send_text(MAV_SEVERITY_CRITICAL, "CL57R FAULT: %s", err_msg);
+        for (uint32_t i = 0; i < available_bytes; i++) {
+            local_buf[i] = _uart->read();
+        }
+
+         // ОКОНЧАТЕЛЬНОЕ ИСПРАВЛЕНИЕ: Реальный ответ функции 0x03 (4 байта данных) занимает ровно 9 байт!
+        if (available_bytes >= 9) {
+            for (uint32_t i = 0; i <= available_bytes - 9; i++) {
+                if (local_buf[i] == (uint8_t)slave_id.get() && local_buf[i+1] == 0x03 && local_buf[i+2] == 0x04) {
+                    
+                    // Контрольная сумма CRC-16 для 9-байтового пакета находится в байтах i+7 и i+8
+                    // Сама функция modbus_crc16 должна посчитать сумму по первым 7 байтам пакета!
+                    uint16_t received_crc = (local_buf[i+8] << 8) | local_buf[i+7];
+                    uint16_t calculated_crc = modbus_crc16(&local_buf[i], 7); 
+
+                    if (received_crc == calculated_crc) {
+                        // Точная сборка 32-битного значения в формате Leadshine CL57R (Low-Word First)
+                        // Младшее слово (Low Word) лежит в байтах i+3 и i+4
+                        uint16_t low_word  = (local_buf[i+3] << 8) | local_buf[i+4];
+                        
+                        // Старшее слово (High Word) лежит в байтах i+5 и i+6
+                        uint16_t high_word = (local_buf[i+5] << 8) | local_buf[i+6];
+                        
+                        // Склеиваем в единую 32-битную беззнаковую переменную
+                        uint32_t combined = ((uint32_t)high_word << 16) | low_word;
+                        
+                        // Восстанавливаем знак для поддержки отрицательных шагов (поворот влево)
+                        int32_t actual_position = 0;
+                        if (combined > 2147483647) {
+                            actual_position = (int32_t)combined - 4294967296;
+                        } else {
+                            actual_position = (int32_t)combined;
+                        }
+
+                        // 1. Отправляем график позиции в Mission Planner
+                        gcs().send_named_float("ST_Pos", (float)actual_position);
+
+                        // 2. ВЫВОД В КОНСОЛЬ: Отображаем статус руля в зеленом окне раз в 2000 мс
+                        static uint32_t last_steer_text_ms = 0;
+                        if (now - last_steer_text_ms >= 2000) {
+                            last_steer_text_ms = now;
+                            
+                            float max_val = max_steps.get() > 0 ? (float)max_steps.get() : 1.0f;
+                            float steer_pct = ((float)actual_position / max_val) * 100.0f;
+
+                            gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Pos: %ld steps | %.1f%%", 
+                                            (long)actual_position, 
+                                            (double)steer_pct);
+                        }
+                        break; // Валидный пакет успешно обработан, выходим из цикла сканирования
+                    }
                 }
             }
         }
+
+
     }
 
-    // Check control packet transmission interval (20 Hz = every 50 ms)
+    // --- Логика отправки команд управления (20 Гц = каждые 50 мс) ---
     if ((now - _last_send_ms) < SEND_INTERVAL_MS) {
         return;
     }
-    
-    // FIX 2: To send the position packet (13b) + trigger (8b), we need 21b in the TX buffer.
-    // If there is less space in TX, we exit to prevent locking the ArduPilot stream.
     if (_uart->txspace() < 22) {
         return;
     }
     _last_send_ms = now;
 
     static bool is_motor_enabled = false;
-    static uint8_t query_toggle = 0; // 0 - control, 1 - error reading
+    static uint8_t query_toggle = 0; 
     uint8_t tx_packet[16]; 
 
-    // Initial enablement of winding power
     if (!is_motor_enabled) {
         modbus_create_write_packet((uint8_t)slave_id.get(), 0x0038, 0x0001, tx_packet);
         _uart->write(tx_packet, 8);
@@ -90,28 +122,26 @@ void AP_ModbusSteering::update(float steering_out) {
         return; 
     }
 
-    // FIX 3: New two-stroke state machine.
-    // Eliminates the 150ms delay, making steering responsive.
     if (query_toggle == 0) {
         if (steering_out < -1.0f) steering_out = -1.0f;
         if (steering_out > 1.0f)  steering_out = 1.0f;
 
-        // Step A: Calculate and immediately send target steps (13 bytes)
+        // Шаг А: Запись целевой позиции (13 байт)
         int32_t target_pulses = (int32_t)(steering_out * max_steps.get());
         modbus_create_write32_packet((uint8_t)slave_id.get(), 0x0034, target_pulses, tx_packet);
         _uart->write(tx_packet, 13);
 
-        // Step B: IMMEDIATELY send movement trigger (8 bytes), drive runs instantly
+        // Шаг Б: Триггер старта (8 байт)
         modbus_create_write_packet((uint8_t)slave_id.get(), 0x0036, 0x0007, tx_packet);
         _uart->write(tx_packet, 8);
 
-        query_toggle = 1; // Check drive status on the next tick
+        query_toggle = 1; 
     } 
     else {
-        // Query the drive error register (8 bytes)
-        modbus_create_read_packet((uint8_t)slave_id.get(), 0x0004, 1, tx_packet);
+        // Запрос чтения текущей позиции (0x001C, длина 2 регистра)
+        modbus_create_read_packet((uint8_t)slave_id.get(), 0x001C, 2, tx_packet);
         _uart->write(tx_packet, 8);
         
-        query_toggle = 0; // Return to position control mode
+        query_toggle = 0; 
     }
 }

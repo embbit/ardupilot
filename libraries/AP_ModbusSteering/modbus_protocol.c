@@ -119,14 +119,20 @@ bool modbus_parse_read_response(uint8_t byte, uint8_t expected_bytes, StepperTel
 
         case MB_STATE_CRC_H: {
             uint16_t received_crc = (byte << 8) | crc_low;
-            parse_state = MB_STATE_IDLE; // Всегда возвращаемся в IDLE
+            parse_state = MB_STATE_IDLE; 
 
             uint16_t calculated_crc = modbus_crc16(rx_buf, expected_len_global - 2);
             if (received_crc == calculated_crc) {
-                // Структура ответа функции 0x03: [ID][0x03][BytesCount][Data_H][Data_L]
-                // Значит байты данных лежат в rx_buf[3] и rx_buf[4]
-                out_telemetry->error_code = (uint16_t)((rx_buf[3] << 8) | rx_buf[4]);
-                out_telemetry->actual_position = 0; 
+                // Вытаскиваем регистры как чистые беззнаковые 16-битные числа
+                uint16_t low_word  = (rx_buf[3] << 8) | rx_buf[4];
+                uint16_t high_word = (rx_buf[5] << 8) | rx_buf[6];
+                
+                // ИСПРАВЛЕНИЕ: Склеиваем строго через uint32_t, чтобы избежать ложного расширения знака компилятором
+                uint32_t combined = ((uint32_t)high_word << 16) | low_word;
+                
+                // Теперь безопасно приводим к знаковому типу для поддержки реверса
+                out_telemetry->actual_position = (int32_t)combined;
+                out_telemetry->error_code = 0; 
                 return true;
             }
             break;

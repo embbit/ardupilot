@@ -45,7 +45,7 @@ if (available_bytes > 32) {
 
             // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Выводим текст в консоль НЕ ЧАЩЕ чем раз в 500 мс!
             static uint32_t last_gcs_text_ms = 0;
-            if (now - last_gcs_text_ms >= 500) {
+            if (now - last_gcs_text_ms >= 2000) {
                 last_gcs_text_ms = now;
                 gcs().send_text(MAV_SEVERITY_INFO, "FD: %u RPM | %.1fV | %.1fA | %dC", 
                                 telemetry_data.rpm, 
