@@ -12,37 +12,51 @@ AP_FarDriverThrottle::AP_FarDriverThrottle() {
     fardriver_protocol_init();
     AP_Param::setup_object_defaults(this, var_info);
 }
+
 void AP_FarDriverThrottle::init(AP_SerialManager &serial_manager) {
     _uart = serial_manager.find_serial((AP_SerialManager::SerialProtocol)100, 0);
     if (_uart != nullptr) {
         _uart->begin(57600); 
     }
 }
+
 void AP_FarDriverThrottle::update(float throttle_out) {
     if (_uart == nullptr || !_uart->is_initialized()) {
         return; 
     }
 
+    uint32_t now = AP_HAL::millis();
     uint32_t available_bytes = _uart->available();
     FardriverTelemetry telemetry_data;
+
+if (available_bytes > 32) {
+    available_bytes = 32;
+}
     
     for (uint32_t i = 0; i < available_bytes; i++) {
         uint8_t b = _uart->read();
         if (fardriver_parse_telemetry(b, &telemetry_data)) {
+            
+            // Отправляем именованные флоаты для графиков в Mission Planner
             gcs().send_named_float("FD_Volt", telemetry_data.voltage);
             gcs().send_named_float("FD_Curr", telemetry_data.current);
             gcs().send_named_float("FD_Temp", (float)telemetry_data.temperature);
             gcs().send_named_float("FD_RPM",  (float)telemetry_data.rpm);
 
-            gcs().send_text(MAV_SEVERITY_INFO, "FD: %u RPM | %.1fV | %.1fA | %dC", 
-                            telemetry_data.rpm, 
-                            (double)telemetry_data.voltage, 
-                            (double)telemetry_data.current, 
-                            telemetry_data.temperature);
+            // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Выводим текст в консоль НЕ ЧАЩЕ чем раз в 500 мс!
+            static uint32_t last_gcs_text_ms = 0;
+            if (now - last_gcs_text_ms >= 500) {
+                last_gcs_text_ms = now;
+                gcs().send_text(MAV_SEVERITY_INFO, "FD: %u RPM | %.1fV | %.1fA | %dC", 
+                                telemetry_data.rpm, 
+                                (double)telemetry_data.voltage, 
+                                (double)telemetry_data.current, 
+                                telemetry_data.temperature);
+            }
         }
     }
 
-    uint32_t now = AP_HAL::millis();
+    // Логика отправки команд управления на FarDriver (раз в SEND_INTERVAL_MS)
     if (now - _last_send_ms < SEND_INTERVAL_MS) {
         return;
     }

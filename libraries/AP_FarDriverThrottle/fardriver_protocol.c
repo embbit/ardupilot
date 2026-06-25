@@ -40,6 +40,7 @@ void fardriver_create_power_packet(uint8_t power, uint8_t is_reverse, uint8_t *o
     out_buffer[15] = (uint8_t)(sum & 0xFF);
 }
 
+// ИСПРАВЛЕННАЯ И БЕЗОПАСНАЯ ФУНКЦИЯ ПАРСИНГА
 bool fardriver_parse_telemetry(uint8_t byte, FardriverTelemetry *out_telemetry) 
 {
     switch (current_state) 
@@ -53,8 +54,19 @@ bool fardriver_parse_telemetry(uint8_t byte, FardriverTelemetry *out_telemetry)
             break;
 
         case STATE_READ_DATA:
-            rx_buffer[rx_index++] = byte;
-            if (rx_index >= 14) {
+            // ИСПРАВЛЕНИЕ 1: Аппаратная защита от Out-of-Bounds. 
+            // Не позволяем индексу выйти за пределы полезной нагрузки (14 байт)
+            if (rx_index < 14) {
+                rx_buffer[rx_index++] = byte;
+            } else {
+                // Если мы почему-то оказались тут с индексом >= 14, сбрасываем автомат
+                current_state = STATE_WAIT_MARKER;
+                rx_index = 0;
+                break;
+            }
+
+            // Переключаемся на чтение контрольной суммы строго тогда, когда собрали все 14 байт данных
+            if (rx_index == 14) {
                 current_state = STATE_READ_CRC_H;
             }
             break;
@@ -66,7 +78,8 @@ bool fardriver_parse_telemetry(uint8_t byte, FardriverTelemetry *out_telemetry)
 
         case STATE_READ_CRC_L: {
             uint16_t received_crc = (crc_high << 8) | byte;
-            current_state = STATE_WAIT_MARKER; 
+            current_state = STATE_WAIT_MARKER; // Всегда сбрасываем состояние для следующего пакета
+            rx_index = 0;
 
             uint16_t calculated_crc = 0;
             for (int i = 0; i < 14; i++)

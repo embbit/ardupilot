@@ -72,8 +72,8 @@ const AP_Scheduler::Task Rover::scheduler_tasks[] = {
     SCHED_TASK(ahrs_update,           400,    400,   6),
 #if AP_RANGEFINDER_ENABLED
     SCHED_TASK(read_rangefinders,      50,    200,   9),
-    SCHED_TASK(outboard_control_update,20,    100,   120),
 #endif
+
 #if AP_OPTICALFLOW_ENABLED
     SCHED_TASK_CLASS(AP_OpticalFlow,      &rover.optflow,          update,         200, 160,  11),
 #endif
@@ -131,6 +131,9 @@ const AP_Scheduler::Task Rover::scheduler_tasks[] = {
 #if HAL_BUTTON_ENABLED
     SCHED_TASK_CLASS(AP_Button,           &rover.button,           update,          5,  200, 117),
 #endif
+    SCHED_TASK(fardriver_throttle_update,20,    100,   120),
+    SCHED_TASK(modbus_steering_update,20,    100,   121),
+    
     SCHED_TASK(crash_check,            10,    200, 123),
     SCHED_TASK(cruise_learn_update,    50,    200, 126),
 #if AP_ROVER_ADVANCED_FAILSAFE_ENABLED
@@ -557,19 +560,21 @@ bool Rover::get_wp_crosstrack_error_m(float &xtrack_error) const
     return true;
 }
 
-void Rover::outboard_control_update() 
+// 1. Выделенная задача для управления газом (FarDriver)
+void Rover::fardriver_throttle_update() 
 {
-    float current_throttle = g2.motors.get_throttle() / 100.0f;
+    // Передаем чистый float от -1.0f до 1.0f
+    float current_throttle = g2.motors.get_throttle();
     fardriver_throttle.update(current_throttle);
-
-    float current_steering = 0.0f;
-    auto *chan = rc().channel(0); 
-    if (chan != nullptr) {
-        current_steering = chan->get_control_in() / 4500.0f;
-    }
-    modbus_steering.update(current_steering);
 }
 
+// 2. Выделенная задача для управления рулем (Modbus)
+void Rover::modbus_steering_update() 
+{
+    // Берем системный выход руля автопилота от -1.0f (лево) до 1.0f (право)
+    float current_steering = g2.motors.get_steering();
+    modbus_steering.update(current_steering);
+}
 
 
 Rover rover;
