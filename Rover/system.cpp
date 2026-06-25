@@ -151,7 +151,7 @@ void Rover::init_ardupilot()
     }
 
     fardriver_throttle.init(serial_manager);
-    modbus_steering.inint(serial_manager);
+    modbus_steering.init(serial_manager);
 
     // flag that initialisation has completed
     initialised = true;
