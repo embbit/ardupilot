@@ -1,0 +1,9 @@
+def bld(bld):
+    bld.ap_library(
+        name='AP_FarDriverThrottle',
+        src=[
+            'AP_FarDriverThrottle.cpp',
+            'fardriver_protocol.c',
+        ],
+        use=['AP_HAL', 'AP_Param', 'AP_Vehicle'],
+    )

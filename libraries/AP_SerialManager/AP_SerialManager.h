@@ -87,6 +87,10 @@ public:
         SerialProtocol_PPP = 48,
         SerialProtocol_IBUS_Telem = 49,                // i-BUS telemetry data, ie via sensor port of FS-iA6B
         SerialProtocol_IOMCU = 50,                     // IOMCU 
+
+        SerialProtocl_Fardriver = 100,
+        SerialProtocol_ModbusSteer = 101,
+
         SerialProtocol_NumProtocols                    // must be the last value
     };
 

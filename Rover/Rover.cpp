@@ -556,6 +556,20 @@ bool Rover::get_wp_crosstrack_error_m(float &xtrack_error) const
     return true;
 }
 
+void Rover::outboard_control_update() 
+{
+    float current_throttle = g2.motors.get_throttle() / 100.0f;
+    fardriver_throttle.update(current_throttle);
+
+    float current_steering = 0.0f;
+    auto *chan = rc().channel(0); 
+    if (chan != nullptr) {
+        current_steering = chan->get_control_in() / 4500.0f;
+    }
+    modbus_steering.update(current_steering);
+}
+
+
 
 Rover rover;
 AP_Vehicle& vehicle = rover;

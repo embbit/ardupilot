@@ -150,6 +150,9 @@ void Rover::init_ardupilot()
         rover.g2.mis_done_behave.set_default(uint8_t(ModeAuto::DoneBehaviour::LOITER));
     }
 
+    fardriver_throttle.init(serial_manager);
+    modbus_steering.inint(serial_manager);
+
     // flag that initialisation has completed
     initialised = true;
 }
