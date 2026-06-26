@@ -15,7 +15,9 @@ vehicle_state = {
     "rpm": 0,
     "voltage": 52.4,
     "current": 0.0,
-    "temperature": 35,
+    "temperature_mot": 35,
+    "temperature_ecu": 35,
+    "charge_state": 100,
     "stepper_pos": 0,
     "stepper_error": 0
 }
@@ -50,28 +52,36 @@ def fardriver_udp_simulator():
                         power_factor = vehicle_state["target_power"] / 100.0
                         vehicle_state["rpm"] = int(power_factor * 3000)
                         vehicle_state["current"] = power_factor * 25.5
-                        vehicle_state["temperature"] = 35 + int(power_factor * 15) if power_factor > 0 else 35
+                        vehicle_state["temperature_mot"] = 35 + int(power_factor * 15) if power_factor > 0 else 35
+                        vehicle_state["temperature_ecu"] = vehicle_state["temperature_mot"] + 20
                         
                         # Собираем ответный пакет телеметрии (17 байт)
                         tx_buf = bytearray(17)
                         tx_buf[0] = 0xAA  # Маркер начала
-                        
-                        # Обороты RPM (Байты 4 и 5)
-                        tx_buf[4] = (vehicle_state["rpm"] >> 8) & 0xFF
-                        tx_buf[5] = vehicle_state["rpm"] & 0xFF
+                        tx_buf[1] = 0x00
+                        # Обороты RPM (Байты 2 и 3)
+                        tx_buf[2] = (vehicle_state["rpm"] >> 8) & 0xFF
+                        tx_buf[3] = vehicle_state["rpm"] & 0xFF
+
+                        # Ток * 10 (Байты 4 и 5)
+                        raw_curr = int(vehicle_state["current"] * 10)
+                        tx_buf[4] = (raw_curr >> 8) & 0xFF
+                        tx_buf[5] = raw_curr & 0xFF
                         
                         # Напряжение * 10 (Байты 6 и 7)
                         raw_volt = int(vehicle_state["voltage"] * 10)
                         tx_buf[6] = (raw_volt >> 8) & 0xFF
                         tx_buf[7] = raw_volt & 0xFF
+                    
                         
-                        # Ток * 10 (Байты 8 и 9)
-                        raw_curr = int(vehicle_state["current"] * 10)
-                        tx_buf[8] = (raw_curr >> 8) & 0xFF
-                        tx_buf[9] = raw_curr & 0xFF
-                        
-                        # Температура (Байт 10)
-                        tx_buf[10] = vehicle_state["temperature"]
+                        # Температура мотора (Байт 8)
+                        tx_buf[8] = vehicle_state["temperature_mot"]
+
+                        # Температура инвертора мотора (Байт 9)
+                        tx_buf[9] = vehicle_state["temperature_ecu"]
+
+                        # Заряд АКБ (Байт 12)
+                        tx_buf[12] = vehicle_state["charge_state"]
                         
                         # Считаем CRC-16 (простая сумма первых 14 байт)
                         crc = sum(tx_buf[:14])
