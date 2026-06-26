@@ -112,8 +112,7 @@ def modbus_udp_simulator():
             
             if func_code == 0x06:
                 val = (req[4] << 8) | req[5]
-[25.06.2026 17:51] Boris Ivanov: if reg_addr == 0x0038 and val == 0x0001:
-                    print("[Modbus UDP] Обмотки рулевого привода заблокированы!")
+                print("[Modbus UDP] Обмотки рулевого привода заблокированы!")
                 response.extend(req[:6])
                 
             elif func_code == 0x10:
