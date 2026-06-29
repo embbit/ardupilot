@@ -44,7 +44,6 @@ void modbus_create_write_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t va
     out_buffer[7] = (uint8_t)((crc >> 8) & 0xFF);
 }
 
-// КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Порядок байт приведен к стандарту Leadshine CL57R (Low-Word FIRST)
 void modbus_create_write32_packet(uint8_t slave_id, uint16_t reg_addr, int32_t value, uint8_t *out_buffer) {
     out_buffer[0] = slave_id;
     out_buffer[1] = 0x10; 
@@ -54,13 +53,10 @@ void modbus_create_write32_packet(uint8_t slave_id, uint16_t reg_addr, int32_t v
     out_buffer[5] = 0x02; // Пишем 2 регистра (32 бита)
     out_buffer[6] = 0x04; // 4 байта данных
     
-    // Младшие 16 бит числа (Low Word) -> сначала High Byte, затем Low Byte
-    out_buffer[7] = (uint8_t)((value >> 8) & 0xFF);
-    out_buffer[8] = (uint8_t)(value & 0xFF);
-    
-    // Старшие 16 бит числа (High Word) -> сначала High Byte, затем Low Byte
-    out_buffer[9] = (uint8_t)((value >> 24) & 0xFF);
-    out_buffer[10] = (uint8_t)((value >> 16) & 0xFF);
+    out_buffer[7]  = (uint8_t)(value >> 24);
+    out_buffer[8]  = (uint8_t)(value >> 16);
+    out_buffer[9]  = (uint8_t)(value >> 8);
+    out_buffer[10] = (uint8_t)value;
     
     uint16_t crc = modbus_crc16(out_buffer, 11);
     out_buffer[11] = (uint8_t)(crc & 0xFF);
@@ -85,7 +81,6 @@ bool modbus_parse_read_response(uint8_t byte, uint8_t expected_bytes, StepperTel
 
     switch (parse_state) {
         case MB_STATE_IDLE:
-            // ИСПРАВЛЕНИЕ: Принимаем байт только если он похож на валидный Slave ID (обычно от 1 до 247)
             if (byte >= 1 && byte <= 247) {
                 rx_buf[0] = byte;
                 rx_idx = 1;
@@ -123,14 +118,10 @@ bool modbus_parse_read_response(uint8_t byte, uint8_t expected_bytes, StepperTel
 
             uint16_t calculated_crc = modbus_crc16(rx_buf, expected_len_global - 2);
             if (received_crc == calculated_crc) {
-                // Вытаскиваем регистры как чистые беззнаковые 16-битные числа
-                uint16_t low_word  = (rx_buf[3] << 8) | rx_buf[4];
-                uint16_t high_word = (rx_buf[5] << 8) | rx_buf[6];
-                
-                // ИСПРАВЛЕНИЕ: Склеиваем строго через uint32_t, чтобы избежать ложного расширения знака компилятором
-                uint32_t combined = ((uint32_t)high_word << 16) | low_word;
-                
-                // Теперь безопасно приводим к знаковому типу для поддержки реверса
+                uint32_t combined = ((uint32_t)rx_buf[3] << 24) |
+                                    ((uint32_t)rx_buf[4] << 16) |
+                                    ((uint32_t)rx_buf[5] << 8)  |
+                                    (uint32_t)rx_buf[6];
                 out_telemetry->actual_position = (int32_t)combined;
                 out_telemetry->error_code = 0; 
                 return true;

@@ -42,9 +42,9 @@ void AP_ModbusSteering::update(float steering_out) {
         READY           // Обмотки успешно заблокированы, переход к штатной работе
     } init_state = InitState::LOCK_COILS;
 
-    static bool lock_confirmed = false;
+   // static bool lock_confirmed = false;
 
-    // БРОНЕБОЙНЫЙ РАЗБОР: Читаем доступный буфер за один проход цикла update
+    // Читаем доступный буфер за один проход цикла update
     if (available_bytes > 0) {
         uint8_t local_buf[64];
         if (available_bytes > 64) {
@@ -64,7 +64,7 @@ void AP_ModbusSteering::update(float steering_out) {
                     uint16_t received_crc = (local_buf[i+7] << 8) | local_buf[i+6];
                     
                     if (reg == 0x0038 && val == 0x0001 && modbus_crc16(&local_buf[i], 6) == received_crc) {
-                        lock_confirmed = true;
+//                        lock_confirmed = true;
                         init_state = InitState::READY;
                         gcs().send_text(MAV_SEVERITY_INFO, "OUTB_STEER: Coils locked successfully!");
                         break;
@@ -140,6 +140,8 @@ void AP_ModbusSteering::update(float steering_out) {
         // Шаг Б: Триггер абсолютного движения (Регистр 0x0036 = 0x0003, 8 байт)
         modbus_create_write_packet((uint8_t)slave_id.get(), 0x0036, 0x0003, tx_packet);
         _uart->write(tx_packet, 8);
+
+  //     gcs().send_text(MAV_SEVERITY_INFO, "OUTB_STEER: TARGET_PULSES %li", target_pulses);
 
         query_toggle = 1; 
     } 
