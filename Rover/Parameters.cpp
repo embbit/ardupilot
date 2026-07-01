@@ -199,6 +199,14 @@ const AP_Param::Info Rover::var_info[] = {
     // @Path: ../libraries/AP_Compass/AP_Compass.cpp
     GOBJECT(compass,                "COMPASS_", Compass),
 
+
+
+    GOBJECT(modbus_steering, "OB_STR_", AP_ModbusSteering),
+    GOBJECT(fardriver_throttle, "OB_THR_", AP_FarDriverThrottle),
+
+
+
+
     // @Group: SCHED_
     // @Path: ../libraries/AP_Scheduler/AP_Scheduler.cpp
     GOBJECT(scheduler, "SCHED_", AP_Scheduler),

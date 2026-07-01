@@ -45,6 +45,8 @@
 #include <AC_PrecLand/AC_PrecLand_config.h>
 #include <AP_Follow/AP_Follow_config.h>
 #include <AP_ExternalControl/AP_ExternalControl_config.h>
+#include <AP_FarDriverThrottle/AP_FarDriverThrottle.h>
+#include <AP_ModbusSteering/AP_ModbusSteering.h>
 #if AP_EXTERNAL_CONTROL_ENABLED
 #include "AP_ExternalControl_Rover.h"
 #endif
@@ -138,6 +140,9 @@ private:
 
     // Arming/Disarming management class
     AP_Arming_Rover arming;
+
+    AP_FarDriverThrottle fardriver_throttle;
+    AP_ModbusSteering modbus_steering;
 
     // external control implementation
 #if AP_EXTERNAL_CONTROL_ENABLED
@@ -281,7 +286,8 @@ private:
     void update_logging2(void);
     void one_second_loop(void);
     void update_current_mode(void);
-
+    void modbus_steering_update(void);
+    void fardriver_throttle_update(void);
     // balance_bot.cpp
     void balancebot_pitch_control(float &throttle);
     bool is_balancebot() const;

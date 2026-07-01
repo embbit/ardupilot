@@ -224,9 +224,14 @@ public:
         k_param_osd,
         k_param_optflow,
 
+        k_param_modbus_steering,
+        k_param_fardriver_throttle,
+
         k_param_logger = 253,  // Logging Group
 
         // 254,255: reserved
+
+
 
         k_param_vehicle = 257, // vehicle common block of parameters
         k_param__gcs = 258,

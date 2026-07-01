@@ -73,6 +73,7 @@ const AP_Scheduler::Task Rover::scheduler_tasks[] = {
 #if AP_RANGEFINDER_ENABLED
     SCHED_TASK(read_rangefinders,      50,    200,   9),
 #endif
+
 #if AP_OPTICALFLOW_ENABLED
     SCHED_TASK_CLASS(AP_OpticalFlow,      &rover.optflow,          update,         200, 160,  11),
 #endif
@@ -127,6 +128,9 @@ const AP_Scheduler::Task Rover::scheduler_tasks[] = {
 #if HAL_BUTTON_ENABLED
     SCHED_TASK_CLASS(AP_Button,           &rover.button,           update,          5,  200, 117),
 #endif
+    SCHED_TASK(fardriver_throttle_update,20,    100,   120),
+    SCHED_TASK(modbus_steering_update,20,    100,   121),
+
     SCHED_TASK(crash_check,            10,    200, 123),
     SCHED_TASK(cruise_learn_update,    50,    200, 126),
 #if AP_ROVER_ADVANCED_FAILSAFE_ENABLED
@@ -551,6 +555,40 @@ bool Rover::get_wp_crosstrack_error_m(float &xtrack_error) const
     }
     xtrack_error = control_mode->crosstrack_error_m();
     return true;
+}
+
+// 1. Выделенная задача для управления газом (FarDriver)
+void Rover::fardriver_throttle_update() 
+{
+    // Передаем чистый float от -1.0f до 1.0f
+    float current_throttle = g2.motors.get_throttle();
+    fardriver_throttle.update(current_throttle);
+}
+
+void Rover::modbus_steering_update() 
+{
+    float current_steering = 0.0f;
+
+    // В ручном режиме MANUAL полностью обходим защитные фильтры ArduPilot
+    if (control_mode == &mode_manual) {
+        // Читаем сырой ШИМ напрямую из аппаратного слоя HAL (входной канал 0)
+        // Он содержит чистые микросекунды (1000...2000), которые прилетают из MAVProxy
+        uint16_t raw_pwm = hal.rcin->read(0);
+        
+        // Защита от мусора при первоначальном старте симулятора
+        if (raw_pwm < 900 || raw_pwm > 2100) {
+            raw_pwm = 1500;
+        }
+
+        // Нормализуем диапазон 1000...2000 мкс во float от -1.0f до 1.0f
+        current_steering = ((float)raw_pwm - 1500.0f) / 500.0f;
+    } else {
+        // В автоматических режимах (AUTO, GUIDED) возвращаем управление навигатору ArduPilot
+        current_steering = g2.motors.get_steering();
+    }
+
+    // Отправляем значение в ваш Modbus-драйвер руля
+    modbus_steering.update(current_steering);
 }
 
 
