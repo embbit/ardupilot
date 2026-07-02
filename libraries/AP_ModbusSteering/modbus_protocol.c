@@ -68,6 +68,7 @@ void modbus_create_write_multiple_packet(uint8_t slave_id, uint16_t start_reg, u
 }
 
 
+
 void modbus_create_read_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t reg_count, uint8_t *out_buffer) {
     out_buffer[0] = slave_id;
     out_buffer[1] = 0x03; 
