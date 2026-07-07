@@ -95,6 +95,8 @@ void AP_ModbusSteering::update(float steering_out)
     static DriveState current_state = DriveState::INIT_ENABLE;
     static uint32_t last_telemetry_rcvd_ms = 0;
     static bool response_received = false;
+    static int32_t debug_target_pulses = 0;
+    static int32_t debug_actual_pulses = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -156,7 +158,11 @@ void AP_ModbusSteering::update(float steering_out)
                         last_telemetry_rcvd_ms = now;
                         response_received = true;
 
-                        gcs().send_named_float("OUTB_STEER", (float)actual_position);
+                        debug_actual_pulses = actual_position;
+                        gcs().send_debug_vect("STEER",
+                                              (float)debug_actual_pulses,
+                                              (float)debug_target_pulses,
+                                              (float)(debug_target_pulses - debug_actual_pulses));
                         break;
                     }
                 }
@@ -258,6 +264,7 @@ void AP_ModbusSteering::update(float steering_out)
  
             // Масштабируем относительный руль в целевые шаги (до 16000 импульсов)
             int32_t target_pulses = (int32_t)(clean_steering * 16000.0);
+            debug_target_pulses = target_pulses;
  
             // ИСПРАВЛЕНО: Объявляем values строго как массив из 3-х элементов
             uint16_t values[3];
