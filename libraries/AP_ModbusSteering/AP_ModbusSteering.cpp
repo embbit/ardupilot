@@ -19,6 +19,29 @@ extern "C"
 
 extern const AP_HAL::HAL &hal;
 
+namespace {
+constexpr uint16_t REG_STATUS_WORD = 0x0003;
+constexpr uint16_t REG_ENCODER_POS = 0x0007;
+constexpr uint16_t REG_AUX_CONTROL = 0x0037;
+constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
+
+const char *cl57r_error_str(uint16_t code)
+{
+    switch (code) {
+    case 0:
+        return "OK";
+    case 1:
+        return "Overcurrent";
+    case 2:
+        return "Overvoltage";
+    case 4:
+        return "Tracking error";
+    default:
+        return "Unknown";
+    }
+}
+} // namespace
+
 // --- БЛОК РЕГИСТРАЦИИ ПАРАМЕТРОВ С ПРАВИЛЬНЫМИ ХЕШ-КОММЕНТАРИЯМИ ---
 // @Group: STEER_
 // @Path: AP_ModbusSteering.cpp
@@ -83,13 +106,15 @@ void AP_ModbusSteering::update(float steering_out)
     enum class DriveState
     {
         INIT_ENABLE,       // 0
-        INIT_SUBDIVISION,  // 1
-        INIT_START_SPD,    // 2
-        INIT_MAX_SPD,      // 3
-        INIT_ACCEL,        // 4
-        INIT_DECEL,        // 5
-        RUN_WRITE_POS,     // 6
-        RUN_READ_TELEMETRY // 7
+        INIT_CLEAR_ALARM,  // 1
+        INIT_SUBDIVISION,  // 2
+        INIT_START_SPD,    // 3
+        INIT_MAX_SPD,      // 4
+        INIT_ACCEL,        // 5
+        INIT_DECEL,        // 6
+        RUN_WRITE_POS,     // 7
+        RUN_READ_POS,      // 8
+        RUN_READ_STATUS,   // 9
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
@@ -97,6 +122,7 @@ void AP_ModbusSteering::update(float steering_out)
     static bool response_received = false;
     static int32_t debug_target_pulses = 0;
     static int32_t debug_actual_pulses = 0;
+    static uint16_t last_driver_error_code = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -124,6 +150,8 @@ void AP_ModbusSteering::update(float steering_out)
                     {
                         if (current_state == DriveState::INIT_ENABLE && reg == 0x0038)
                             response_received = true;
+                        if (current_state == DriveState::INIT_CLEAR_ALARM && reg == REG_AUX_CONTROL)
+                            response_received = true;
                         if (current_state == DriveState::INIT_SUBDIVISION && reg == 0x0023)
                             response_received = true;
                         if (current_state == DriveState::INIT_START_SPD && reg == 0x0030)
@@ -140,8 +168,8 @@ void AP_ModbusSteering::update(float steering_out)
             }
         }
 
-        // 2. Парсинг телеметрии энкодера (функция 0x03 возвращает строго 9 байт)
-        if (current_state == DriveState::RUN_READ_TELEMETRY && available_bytes >= 9)
+        // 2. Парсинг позиции энкодера (0x0007-0x0008, функция 0x03, 9 байт)
+        if (current_state == DriveState::RUN_READ_POS && available_bytes >= 9)
         {
             for (uint32_t i = 0; i <= available_bytes - 9; i++)
             {
@@ -168,12 +196,52 @@ void AP_ModbusSteering::update(float steering_out)
                 }
             }
         }
+
+        // 3. Парсинг статуса и кода ошибки драйвера (0x0003-0x0004)
+        if (current_state == DriveState::RUN_READ_STATUS && available_bytes >= 9)
+        {
+            for (uint32_t i = 0; i <= available_bytes - 9; i++)
+            {
+                if (local_buf[i] == (uint8_t)slave_id.get() && local_buf[i + 1] == 0x03 && local_buf[i + 2] == 0x04)
+                {
+                    uint16_t received_crc = (local_buf[i + 8] << 8) | local_buf[i + 7];
+                    if (modbus_crc16(&local_buf[i], 7) == received_crc)
+                    {
+                        const uint16_t status_word = (local_buf[i + 3] << 8) | local_buf[i + 4];
+                        const uint16_t error_code = (local_buf[i + 5] << 8) | local_buf[i + 6];
+
+                        last_telemetry_rcvd_ms = now;
+                        response_received = true;
+
+                        if (error_code != last_driver_error_code) {
+                            if (error_code != 0) {
+                                gcs().send_text(MAV_SEVERITY_WARNING,
+                                                "CL57R: error 0x%04X (%s) status=0x%04X",
+                                                error_code,
+                                                cl57r_error_str(error_code),
+                                                status_word);
+                            } else if (last_driver_error_code != 0) {
+                                gcs().send_text(MAV_SEVERITY_INFO, "CL57R: alarm cleared");
+                            }
+                            last_driver_error_code = error_code;
+                        }
+
+                        gcs().send_debug_vect("STDRV",
+                                              (float)status_word,
+                                              (float)error_code,
+                                              0.0f);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // Защита: Сброс автомата при потере связи в рабочем режиме (таймаут 2 секунды)
     if (current_state >= DriveState::RUN_WRITE_POS && (now - last_telemetry_rcvd_ms) > 2000)
     {
         current_state = DriveState::INIT_ENABLE;
+        last_driver_error_code = 0;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
@@ -196,6 +264,9 @@ void AP_ModbusSteering::update(float steering_out)
         switch (current_state)
         {
         case DriveState::INIT_ENABLE:
+            current_state = DriveState::INIT_CLEAR_ALARM;
+            break;
+        case DriveState::INIT_CLEAR_ALARM:
             current_state = DriveState::INIT_SUBDIVISION;
             break;
         case DriveState::INIT_SUBDIVISION:
@@ -216,9 +287,12 @@ void AP_ModbusSteering::update(float steering_out)
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
-            current_state = DriveState::RUN_READ_TELEMETRY;
+            current_state = DriveState::RUN_READ_POS;
             break;
-        case DriveState::RUN_READ_TELEMETRY:
+        case DriveState::RUN_READ_POS:
+            current_state = DriveState::RUN_READ_STATUS;
+            break;
+        case DriveState::RUN_READ_STATUS:
             current_state = DriveState::RUN_WRITE_POS;
             break;
         }
@@ -229,6 +303,11 @@ void AP_ModbusSteering::update(float steering_out)
     {
     case DriveState::INIT_ENABLE:
         modbus_create_write_packet((uint8_t)slave_id.get(), 0x0038, 0x0001, tx_packet);
+        _uart->write(tx_packet, 8);
+        break;
+
+    case DriveState::INIT_CLEAR_ALARM:
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_AUX_CONTROL, AUX_ALARM_CLEAR, tx_packet);
         _uart->write(tx_packet, 8);
         break;
 
@@ -278,15 +357,22 @@ void AP_ModbusSteering::update(float steering_out)
             // Длина пакета функции 0x10 при отправке 3 регистров всегда 15 байт
             _uart->write(tx_packet, 15);
 
-            // Явно переводим автомат в режим ожидания телеметрии
-            current_state = DriveState::RUN_READ_TELEMETRY;
+            // Явно переводим автомат в режим чтения позиции
+            current_state = DriveState::RUN_READ_POS;
             break;
         }
 
 
-    case DriveState::RUN_READ_TELEMETRY:
+    case DriveState::RUN_READ_POS:
     {
-        modbus_create_read_packet((uint8_t)slave_id.get(), 0x0007, 2, tx_packet);
+        modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+        _uart->write(tx_packet, 8);
+        break;
+    }
+
+    case DriveState::RUN_READ_STATUS:
+    {
+        modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
         _uart->write(tx_packet, 8);
         break;
     }
