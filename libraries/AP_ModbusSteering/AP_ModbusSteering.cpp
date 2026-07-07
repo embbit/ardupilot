@@ -25,6 +25,14 @@ constexpr uint16_t REG_ENCODER_POS = 0x0007;
 constexpr uint16_t REG_AUX_CONTROL = 0x0037;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 
+// Позиция: WRITE + READ_POS = 2 шага → 10 Гц при 50 мс на шаг.
+constexpr uint32_t POSITION_LOOP_HZ = 10;
+constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / (POSITION_LOOP_HZ * 2);
+
+// Статус/ошибки: раз в 10 циклов позиции → 1 Гц.
+constexpr uint32_t STATUS_READ_HZ = 1;
+constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
+
 const char *cl57r_error_str(uint16_t code)
 {
     switch (code) {
@@ -123,6 +131,7 @@ void AP_ModbusSteering::update(float steering_out)
     static int32_t debug_target_pulses = 0;
     static int32_t debug_actual_pulses = 0;
     static uint16_t last_driver_error_code = 0;
+    static uint8_t position_cycles_since_status = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -242,11 +251,12 @@ void AP_ModbusSteering::update(float steering_out)
     {
         current_state = DriveState::INIT_ENABLE;
         last_driver_error_code = 0;
+        position_cycles_since_status = 0;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
-    // --- БЛОК ОТПРАВКИ КОМАНД ПО ТАЙМЕРУ (10 Гц) ---
-    if ((now - _last_send_ms) < SEND_INTERVAL_MS)
+    // --- БЛОК ОТПРАВКИ КОМАНД ПО ТАЙМЕРУ (позиция 10 Гц, статус 1 Гц) ---
+    if ((now - _last_send_ms) < POSITION_SEND_INTERVAL_MS)
     {
         return;
     }
@@ -284,13 +294,20 @@ void AP_ModbusSteering::update(float steering_out)
         case DriveState::INIT_DECEL:
             current_state = DriveState::RUN_WRITE_POS;
             last_telemetry_rcvd_ms = now;
+            position_cycles_since_status = 0;
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
             current_state = DriveState::RUN_READ_POS;
             break;
         case DriveState::RUN_READ_POS:
-            current_state = DriveState::RUN_READ_STATUS;
+            position_cycles_since_status++;
+            if (position_cycles_since_status >= STATUS_READ_EVERY_N_CYCLES) {
+                position_cycles_since_status = 0;
+                current_state = DriveState::RUN_READ_STATUS;
+            } else {
+                current_state = DriveState::RUN_WRITE_POS;
+            }
             break;
         case DriveState::RUN_READ_STATUS:
             current_state = DriveState::RUN_WRITE_POS;

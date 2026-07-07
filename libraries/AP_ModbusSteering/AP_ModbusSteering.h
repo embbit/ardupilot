@@ -20,7 +20,6 @@ public:
 private:
     AP_HAL::UARTDriver *_uart = nullptr;
     uint32_t _last_send_ms = 0;
-    const uint32_t SEND_INTERVAL_MS = 100; // 10 Гц
 
     // Параметры Ardupilot
     AP_Int8  slave_id;     
