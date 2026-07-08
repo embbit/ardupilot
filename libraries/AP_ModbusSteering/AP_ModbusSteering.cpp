@@ -29,8 +29,11 @@ constexpr uint16_t REG_AUX_CONTROL = 0x0037;
 constexpr uint16_t REG_MOTOR_ENABLE = 0x0038;
 constexpr uint16_t REG_TRIGGER_MODE = 0x0039;
 constexpr uint16_t REG_POS_MODE = 0x003A;
+constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t MOTION_START_ABS = 0x0007;  // start + absolute + interrupt (needs 0x0039=1)
+constexpr uint16_t CL57R_TRACK_ERR_DEFAULT = 8000;
+constexpr uint32_t TRACK_ERR_PAUSE_MS = 300;
 
 // Позиция: WRITE + READ_POS = 2 шага → 20 Гц при 25 мс на шаг.
 constexpr uint32_t POSITION_LOOP_HZ = 20;
@@ -145,7 +148,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: RET_SLEW
     // @DisplayName: Return-To-Zero Slew Limit
-    // @Description: Макс. шаг уставки за цикл (25мс), только когда |стик|<5%. При активном руле уставка = стик напрямую. 0 = по MAX_SPD.
+    // @Description: Макс. шаг уставки за цикл при |стик|<5%. Активный руль: шаг от энкодера на MAX_SPD. 0 = по MAX_SPD.
     // @Units: pulses
     // @Range: 0 50000
     // @User: Standard
@@ -198,17 +201,19 @@ void AP_ModbusSteering::update(float steering_out)
         INIT_ENABLE,       // 0
         INIT_CLEAR_ALARM,  // 1
         INIT_SUBDIVISION,  // 2
-        INIT_START_SPD,    // 3
-        INIT_MAX_SPD,      // 4
-        INIT_ACCEL,        // 5
-        INIT_DECEL,        // 6
-        INIT_ABS_MODE,     // 7
-        INIT_TRIG_MODE,    // 8
-        RUN_WRITE_POS,     // 9
-        RUN_READ_POS,      // 10
-        RUN_READ_STATUS,   // 11
-        FAULT_RELEASE,     // 12
-        FAULT_LATCHED,     // 13
+        INIT_TRACK_ERR,    // 3
+        INIT_START_SPD,    // 4
+        INIT_MAX_SPD,      // 5
+        INIT_ACCEL,        // 6
+        INIT_DECEL,        // 7
+        INIT_ABS_MODE,     // 8
+        INIT_TRIG_MODE,    // 9
+        RUN_WRITE_POS,     // 10
+        RUN_READ_POS,      // 11
+        RUN_READ_STATUS,   // 12
+        TRACK_CLEAR,       // 13
+        FAULT_RELEASE,     // 14
+        FAULT_LATCHED,     // 15
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
@@ -222,6 +227,8 @@ void AP_ModbusSteering::update(float steering_out)
     static int32_t last_sent_target_pulses = 0;
     static bool have_sent_target = false;
     static bool encoder_fault_latched = false;
+    static bool pending_track_clear = false;
+    static uint32_t tracking_pause_until_ms = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -237,7 +244,8 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 1. Парсинг эха для шагов инициализации (строгая проверка регистров)
-        if ((current_state < DriveState::RUN_WRITE_POS || current_state == DriveState::FAULT_RELEASE) && available_bytes >= 8)
+        if ((current_state < DriveState::RUN_WRITE_POS || current_state == DriveState::FAULT_RELEASE ||
+             current_state == DriveState::TRACK_CLEAR) && available_bytes >= 8)
         {
             for (uint32_t i = 0; i <= available_bytes - 8; i++)
             {
@@ -251,9 +259,13 @@ void AP_ModbusSteering::update(float steering_out)
                             response_received = true;
                         if (current_state == DriveState::FAULT_RELEASE && reg == REG_MOTOR_ENABLE)
                             response_received = true;
+                        if (current_state == DriveState::TRACK_CLEAR && reg == REG_AUX_CONTROL)
+                            response_received = true;
                         if (current_state == DriveState::INIT_CLEAR_ALARM && reg == REG_AUX_CONTROL)
                             response_received = true;
                         if (current_state == DriveState::INIT_SUBDIVISION && reg == 0x0023)
+                            response_received = true;
+                        if (current_state == DriveState::INIT_TRACK_ERR && reg == REG_TRACK_ERR)
                             response_received = true;
                         if (current_state == DriveState::INIT_START_SPD && reg == 0x0030)
                             response_received = true;
@@ -341,6 +353,12 @@ void AP_ModbusSteering::update(float steering_out)
                                                 error_code,
                                                 cl57r_error_str(error_code),
                                                 status_word);
+                                if (error_code == 4) {
+                                    pending_track_clear = true;
+                                    tracking_pause_until_ms = now + TRACK_ERR_PAUSE_MS;
+                                    last_sent_target_pulses = debug_actual_pulses;
+                                    have_sent_target = true;
+                                }
                             } else if (last_driver_error_code != 0) {
                                 gcs().send_text(MAV_SEVERITY_INFO, "CL57R: alarm cleared");
                             }
@@ -402,6 +420,9 @@ void AP_ModbusSteering::update(float steering_out)
             current_state = DriveState::INIT_SUBDIVISION;
             break;
         case DriveState::INIT_SUBDIVISION:
+            current_state = DriveState::INIT_TRACK_ERR;
+            break;
+        case DriveState::INIT_TRACK_ERR:
             current_state = DriveState::INIT_START_SPD;
             break;
         case DriveState::INIT_START_SPD:
@@ -440,6 +461,14 @@ void AP_ModbusSteering::update(float steering_out)
             }
             break;
         case DriveState::RUN_READ_STATUS:
+            if (pending_track_clear) {
+                pending_track_clear = false;
+                current_state = DriveState::TRACK_CLEAR;
+            } else {
+                current_state = DriveState::RUN_WRITE_POS;
+            }
+            break;
+        case DriveState::TRACK_CLEAR:
             current_state = DriveState::RUN_WRITE_POS;
             break;
         case DriveState::FAULT_RELEASE:
@@ -470,6 +499,13 @@ void AP_ModbusSteering::update(float steering_out)
         _uart->write(tx_packet, 8);
         break;
 
+    case DriveState::TRACK_CLEAR:
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_AUX_CONTROL, AUX_ALARM_CLEAR, tx_packet);
+        _uart->write(tx_packet, 8);
+        last_sent_target_pulses = debug_actual_pulses;
+        have_sent_target = true;
+        break;
+
     case DriveState::INIT_CLEAR_ALARM:
         modbus_create_write_packet((uint8_t)slave_id.get(), REG_AUX_CONTROL, AUX_ALARM_CLEAR, tx_packet);
         _uart->write(tx_packet, 8);
@@ -477,6 +513,11 @@ void AP_ModbusSteering::update(float steering_out)
 
     case DriveState::INIT_SUBDIVISION:
         modbus_create_write_packet((uint8_t)slave_id.get(), 0x0023, 4000, tx_packet);
+        _uart->write(tx_packet, 8);
+        break;
+
+    case DriveState::INIT_TRACK_ERR:
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_TRACK_ERR, CL57R_TRACK_ERR_DEFAULT, tx_packet);
         _uart->write(tx_packet, 8);
         break;
 
@@ -515,6 +556,11 @@ void AP_ModbusSteering::update(float steering_out)
                 current_state = DriveState::FAULT_LATCHED;
                 break;
             }
+            if (now < tracking_pause_until_ms) {
+                debug_target_pulses = debug_actual_pulses;
+                current_state = DriveState::RUN_READ_POS;
+                break;
+            }
 
             float clean_steering = steering_out;
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
@@ -526,7 +572,8 @@ void AP_ModbusSteering::update(float steering_out)
                                                 -max_pulses, max_pulses);
 
             const uint32_t full_cycle_ms = POSITION_SEND_INTERVAL_MS * 2;
-            int32_t return_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
+            const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
+            int32_t return_limit = active_limit;
             const int32_t param_limit = ret_slew.get();
             if (param_limit > 0) {
                 return_limit = param_limit;
@@ -535,20 +582,21 @@ void AP_ModbusSteering::update(float steering_out)
             int32_t capped_desired = desired;
 
             // Упреждающее торможение у ±travel limit (до перелёта)
-            const int32_t brake_zone = return_limit * 2;
+            const int32_t brake_zone = active_limit * 2;
             if (debug_actual_pulses > max_pulses - brake_zone && capped_desired > debug_actual_pulses) {
-                capped_desired = MIN(capped_desired, max_pulses - return_limit);
+                capped_desired = MIN(capped_desired, max_pulses - active_limit);
             }
             if (debug_actual_pulses < -max_pulses + brake_zone && capped_desired < debug_actual_pulses) {
-                capped_desired = MAX(capped_desired, -max_pulses + return_limit);
+                capped_desired = MAX(capped_desired, -max_pulses + active_limit);
             }
 
             const int32_t follow_err = abs_int32(debug_actual_pulses - capped_desired);
             const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
+            const int32_t move_limit = returning ? return_limit : active_limit;
 
             int32_t commanded;
-            if (returning && follow_err > deadband) {
-                commanded = step_toward(debug_actual_pulses, capped_desired, return_limit);
+            if (follow_err > deadband) {
+                commanded = step_toward(debug_actual_pulses, capped_desired, move_limit);
             } else {
                 commanded = capped_desired;
             }
@@ -561,14 +609,14 @@ void AP_ModbusSteering::update(float steering_out)
                                         (debug_actual_pulses < 0 && commanded < debug_actual_pulses);
                 if (moving_out) {
                     if (debug_actual_pulses > 0) {
-                        commanded = debug_actual_pulses - return_limit;
+                        commanded = debug_actual_pulses - move_limit;
                     } else {
-                        commanded = debug_actual_pulses + return_limit;
+                        commanded = debug_actual_pulses + move_limit;
                     }
                     commanded = clamp_int32(commanded, -max_pulses, max_pulses);
                 }
                 const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                if (!soft_limit_warned && overshoot > return_limit) {
+                if (!soft_limit_warned && overshoot > active_limit) {
                     gcs().send_text(MAV_SEVERITY_WARNING,
                                     "CL57R: overshoot %ld imp, correcting",
                                     (long)overshoot);
