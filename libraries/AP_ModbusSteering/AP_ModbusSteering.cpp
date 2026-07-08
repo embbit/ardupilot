@@ -342,11 +342,14 @@ void AP_ModbusSteering::update(float steering_out)
                         }
 
                         if (status_word != last_driver_status_word) {
-                            gcs().send_text(MAV_SEVERITY_INFO,
-                                            "CL57R: status 0x%04X (alarm=%u enabled=%u)",
-                                            status_word,
-                                            (unsigned)((status_word >> 3) & 1),
-                                            (unsigned)((status_word >> 4) & 1));
+                            const bool alarm_now = (status_word >> 3) & 1;
+                            const bool alarm_was = (last_driver_status_word >> 3) & 1;
+                            if (alarm_now != alarm_was) {
+                                gcs().send_text(alarm_now ? MAV_SEVERITY_WARNING : MAV_SEVERITY_INFO,
+                                                "CL57R: alarm %s status=0x%04X",
+                                                alarm_now ? "ON" : "OFF",
+                                                status_word);
+                            }
                             last_driver_status_word = status_word;
                         }
                         break;
@@ -516,24 +519,29 @@ void AP_ModbusSteering::update(float steering_out)
                 move_limit = param_limit;
             }
 
-            const int32_t follow_err = abs_int32(debug_actual_pulses - desired);
+            int32_t capped_desired = desired;
+
+            // Упреждающее торможение у ±travel limit (до перелёта)
+            const int32_t brake_zone = move_limit * 2;
+            if (debug_actual_pulses > max_pulses - brake_zone && capped_desired > debug_actual_pulses) {
+                capped_desired = MIN(capped_desired, max_pulses - move_limit);
+            }
+            if (debug_actual_pulses < -max_pulses + brake_zone && capped_desired < debug_actual_pulses) {
+                capped_desired = MAX(capped_desired, -max_pulses + move_limit);
+            }
+
+            const int32_t follow_err = abs_int32(debug_actual_pulses - capped_desired);
             int32_t commanded;
             if (follow_err > deadband) {
-                commanded = step_toward(debug_actual_pulses, desired, move_limit);
+                commanded = step_toward(debug_actual_pulses, capped_desired, move_limit);
             } else {
-                commanded = desired;
+                commanded = capped_desired;
             }
 
             commanded = clamp_int32(commanded, -max_pulses, max_pulses);
 
             static bool soft_limit_warned = false;
             if (abs_int32(debug_actual_pulses) > max_pulses) {
-                if (!soft_limit_warned) {
-                    gcs().send_text(MAV_SEVERITY_WARNING,
-                                    "CL57R: travel limit exceeded (%ld), pulling back",
-                                    (long)debug_actual_pulses);
-                    soft_limit_warned = true;
-                }
                 const bool moving_out = (debug_actual_pulses > 0 && commanded > debug_actual_pulses) ||
                                         (debug_actual_pulses < 0 && commanded < debug_actual_pulses);
                 if (moving_out) {
@@ -543,6 +551,15 @@ void AP_ModbusSteering::update(float steering_out)
                         commanded = debug_actual_pulses + move_limit;
                     }
                     commanded = clamp_int32(commanded, -max_pulses, max_pulses);
+                }
+                const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
+                if (!soft_limit_warned && overshoot > move_limit) {
+                    gcs().send_text(MAV_SEVERITY_WARNING,
+                                    "CL57R: overshoot %ld imp, correcting",
+                                    (long)overshoot);
+                    soft_limit_warned = true;
+                } else if (overshoot <= deadband) {
+                    soft_limit_warned = false;
                 }
             } else {
                 soft_limit_warned = false;
