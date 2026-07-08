@@ -86,7 +86,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: POS_DB
     // @DisplayName: Position Deadband
-    // @Description: Не отправлять команду позиции, если цель совпадает с последней отправленной и ошибка слежения (импульсы) не превышает этот порог.
+    // @Description: Подавление дрожания: цель со стика привязывается к последней отправленной команде, если отличие меньше этого порога. Не блокирует движение при заметном сдвиге стика.
     // @Units: pulses
     // @Range: 0 8000
     // @User: Standard
@@ -380,21 +380,19 @@ void AP_ModbusSteering::update(float steering_out)
 
             const int32_t max_pulses = max_steps.get();
             int32_t target_pulses = (int32_t)(clean_steering * (float)max_pulses);
-            debug_target_pulses = target_pulses;
 
-            const int32_t tracking_error = target_pulses - debug_actual_pulses;
             const int32_t deadband = pos_db.get();
-            const int32_t abs_error = (tracking_error >= 0) ? tracking_error : -tracking_error;
-
-            bool should_send = false;
-            if (!have_sent_target) {
-                should_send = abs_error > deadband;
-            } else if (target_pulses != last_sent_target_pulses) {
-                should_send = abs_error > deadband;
-                if (!should_send) {
-                    last_sent_target_pulses = target_pulses;
+            if (have_sent_target && deadband > 0) {
+                const int32_t delta = target_pulses - last_sent_target_pulses;
+                const int32_t abs_delta = (delta >= 0) ? delta : -delta;
+                if (abs_delta <= deadband) {
+                    target_pulses = last_sent_target_pulses;
                 }
             }
+
+            debug_target_pulses = target_pulses;
+
+            const bool should_send = !have_sent_target || (target_pulses != last_sent_target_pulses);
 
             if (should_send) {
                 uint16_t values[3];
