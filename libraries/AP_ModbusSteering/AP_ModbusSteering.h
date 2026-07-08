@@ -26,5 +26,6 @@ private:
     AP_Int16 reg_address;   
     AP_Int32 max_steps;     
     AP_Int16 start_speed;   
-    AP_Int16 max_speed;     
+    AP_Int16 max_speed;
+    AP_Int32 pos_db;
 };

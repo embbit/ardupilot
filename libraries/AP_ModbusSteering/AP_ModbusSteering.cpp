@@ -84,6 +84,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("MAX_SPD", 5, AP_ModbusSteering, max_speed, 120),
 
+    // @Param: POS_DB
+    // @DisplayName: Position Deadband
+    // @Description: Не отправлять команду позиции, если цель совпадает с последней отправленной и ошибка слежения (импульсы) не превышает этот порог.
+    // @Units: pulses
+    // @Range: 0 8000
+    // @User: Standard
+    AP_GROUPINFO("POS_DB", 6, AP_ModbusSteering, pos_db, 200),
+
     AP_GROUPEND};
 
 AP_ModbusSteering::AP_ModbusSteering()
@@ -133,6 +141,8 @@ void AP_ModbusSteering::update(float steering_out)
     static uint16_t last_driver_error_code = 0;
     static uint16_t last_driver_status_word = 0;
     static uint8_t position_cycles_since_status = 0;
+    static int32_t last_sent_target_pulses = 0;
+    static bool have_sent_target = false;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -258,6 +268,8 @@ void AP_ModbusSteering::update(float steering_out)
         last_driver_error_code = 0;
         last_driver_status_word = 0;
         position_cycles_since_status = 0;
+        last_sent_target_pulses = 0;
+        have_sent_target = false;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
@@ -301,6 +313,8 @@ void AP_ModbusSteering::update(float steering_out)
             current_state = DriveState::RUN_WRITE_POS;
             last_telemetry_rcvd_ms = now;
             position_cycles_since_status = 0;
+            last_sent_target_pulses = 0;
+            have_sent_target = false;
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
@@ -363,24 +377,37 @@ void AP_ModbusSteering::update(float steering_out)
             float clean_steering = steering_out;
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
             if (clean_steering < -1.0f) clean_steering = -1.0f;
- 
-            // Масштабируем относительный руль в целевые шаги (до 16000 импульсов)
-            int32_t target_pulses = (int32_t)(clean_steering * 16000.0);
-            debug_target_pulses = target_pulses;
- 
-            // ИСПРАВЛЕНО: Объявляем values строго как массив из 3-х элементов
-            uint16_t values[3];
-            values[0] = (uint16_t)((target_pulses >> 16) & 0xFFFF); // 0x0034 Старшее слово позиции
-            values[1] = (uint16_t)(target_pulses & 0xFFFF);         // 0x0035 Младшее слово позиции
-            values[2] = 0x0007;                                     // 0x0036 Проверенный рабочий триггер
- 
-            // Теперь имя массива автоматически передастся как указатель (const uint16_t*)
-            modbus_create_write_multiple_packet((uint8_t)slave_id.get(), 0x0034, 3, values, tx_packet);
-            
-            // Длина пакета функции 0x10 при отправке 3 регистров всегда 15 байт
-            _uart->write(tx_packet, 15);
 
-            // Явно переводим автомат в режим чтения позиции
+            const int32_t max_pulses = max_steps.get();
+            int32_t target_pulses = (int32_t)(clean_steering * (float)max_pulses);
+            debug_target_pulses = target_pulses;
+
+            const int32_t tracking_error = target_pulses - debug_actual_pulses;
+            const int32_t deadband = pos_db.get();
+            const int32_t abs_error = (tracking_error >= 0) ? tracking_error : -tracking_error;
+
+            bool should_send = false;
+            if (!have_sent_target) {
+                should_send = abs_error > deadband;
+            } else if (target_pulses != last_sent_target_pulses) {
+                should_send = abs_error > deadband;
+                if (!should_send) {
+                    last_sent_target_pulses = target_pulses;
+                }
+            }
+
+            if (should_send) {
+                uint16_t values[3];
+                values[0] = (uint16_t)((target_pulses >> 16) & 0xFFFF);
+                values[1] = (uint16_t)(target_pulses & 0xFFFF);
+                values[2] = 0x0007;
+
+                modbus_create_write_multiple_packet((uint8_t)slave_id.get(), 0x0034, 3, values, tx_packet);
+                _uart->write(tx_packet, 15);
+                last_sent_target_pulses = target_pulses;
+                have_sent_target = true;
+            }
+
             current_state = DriveState::RUN_READ_POS;
             break;
         }
