@@ -356,6 +356,7 @@ void AP_ModbusSteering::update(float steering_out)
                         if (have_valid_actual &&
                             abs_int32(actual_position - last_valid_actual) > max_jump) {
                             modbus_note_link_rx(now, link_deadline_ms);
+                            pending_encoder_read = false;
                             break;
                         }
 
@@ -481,6 +482,7 @@ void AP_ModbusSteering::update(float steering_out)
     }
     if (_uart->txspace() < 22)
     {
+        _last_send_ms = now;
         return;
     }
     _last_send_ms = now;
@@ -732,7 +734,7 @@ void AP_ModbusSteering::update(float steering_out)
                     }
                     commanded = step_toward(last_sent_target_pulses, capped_desired, step);
                 } else if (returning && ret_slew.get() > 0) {
-                    commanded = step_toward(debug_actual_pulses, capped_desired,
+                    commanded = step_toward(last_sent_target_pulses, capped_desired,
                                             (int32_t)ret_slew.get());
                 } else {
                     commanded = step_toward(last_sent_target_pulses, capped_desired,
