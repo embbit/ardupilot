@@ -39,9 +39,8 @@ constexpr uint32_t TRACK_ERR_PAUSE_MS = 500;
 constexpr uint32_t POSITION_LOOP_HZ = 20;
 constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / POSITION_LOOP_HZ;
 
-// Статус/ошибки: раз в 10 циклов позиции → 1 Гц.
-constexpr uint32_t STATUS_READ_HZ = 1;
-constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
+// Статус/ошибки: раз в 10 опросов энкодера (~1 Гц при 10 Гц опроса).
+constexpr uint8_t STATUS_READ_EVERY_N_READS = 10;
 
 constexpr float STICK_CENTER_THRESHOLD = 0.05f;
 constexpr uint32_t MODBUS_LINK_TIMEOUT_MS = 2000;
@@ -252,6 +251,7 @@ void AP_ModbusSteering::update(float steering_out)
     static bool have_valid_actual = false;
     static uint8_t run_status_div = 0;
     static bool expecting_status_read = false;
+    static bool run_phase_write = true;
     static int8_t last_stick_sign = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
@@ -311,6 +311,23 @@ void AP_ModbusSteering::update(float steering_out)
             }
         }
 
+        // 1b. Эхо записи позиции в RUN (функция 0x10, 8 байт)
+        if (current_state == DriveState::RUN_ACTIVE && available_bytes >= 8)
+        {
+            for (uint32_t i = 0; i <= available_bytes - 8; i++)
+            {
+                if (local_buf[i] == (uint8_t)slave_id.get() && local_buf[i + 1] == 0x10)
+                {
+                    uint16_t received_crc = (local_buf[i + 7] << 8) | local_buf[i + 6];
+                    if (modbus_crc16(&local_buf[i], 6) == received_crc)
+                    {
+                        modbus_note_link_rx(now, link_deadline_ms);
+                        break;
+                    }
+                }
+            }
+        }
+
         // 2. Парсинг позиции энкодера (0x0007-0x0008, функция 0x03, 9 байт)
         if (((current_state == DriveState::RUN_ACTIVE && !expecting_status_read) ||
              current_state == DriveState::FAULT_LATCHED) && available_bytes >= 9)
@@ -327,10 +344,11 @@ void AP_ModbusSteering::update(float steering_out)
 
                         const int32_t actual_position = decode_encoder_position(high_word, low_word);
                         const int32_t max_jump = speed_move_limit_pulses((uint16_t)max_speed.get(),
-                                                                          POSITION_SEND_INTERVAL_MS) * 4;
+                                                                          POSITION_SEND_INTERVAL_MS * 2) * 4;
 
                         if (have_valid_actual &&
                             abs_int32(actual_position - last_valid_actual) > max_jump) {
+                            modbus_note_link_rx(now, link_deadline_ms);
                             break;
                         }
 
@@ -420,10 +438,9 @@ void AP_ModbusSteering::update(float steering_out)
         }
     }
 
-    // Защита: сброс автомата при потере связи (таймаут 2 с без валидного ответа)
+    // Таймаут связи только в рабочем режиме (init сам обновляет дедлайн эхо-ответами)
     if (!encoder_fault_latched &&
-        current_state != DriveState::FAULT_LATCHED &&
-        current_state != DriveState::FAULT_RELEASE &&
+        current_state == DriveState::RUN_ACTIVE &&
         link_deadline_ms != 0 &&
         now > link_deadline_ms)
     {
@@ -443,6 +460,7 @@ void AP_ModbusSteering::update(float steering_out)
         have_actual_position = false;
         need_position_sync = false;
         have_valid_actual = false;
+        run_phase_write = true;
         last_stick_sign = 0;
         link_deadline_ms = now + MODBUS_LINK_TIMEOUT_MS;
     }
@@ -452,7 +470,7 @@ void AP_ModbusSteering::update(float steering_out)
     {
         return;
     }
-    if (_uart->txspace() < 24)
+    if (_uart->txspace() < 22)
     {
         return;
     }
@@ -503,6 +521,7 @@ void AP_ModbusSteering::update(float steering_out)
             need_position_sync = true;
             have_valid_actual = false;
             run_status_div = 0;
+            run_phase_write = true;
             last_stick_sign = 0;
             modbus_note_link_rx(now, link_deadline_ms);
             if (!modbus_link_ok) {
@@ -611,13 +630,22 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
-            if (!have_actual_position) {
-                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-                _uart->write(tx_packet, 8);
-                break;
-            }
+            if (run_phase_write) {
+                run_phase_write = false;
 
-            if (now >= tracking_pause_until_ms) {
+                if (!have_actual_position) {
+                    run_phase_write = true;
+                    expecting_status_read = false;
+                    modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+                    _uart->write(tx_packet, 8);
+                    break;
+                }
+
+                if (now < tracking_pause_until_ms) {
+                    debug_target_pulses = debug_actual_pulses;
+                    break;
+                }
+
                 float clean_steering = steering_out;
                 if (clean_steering > 1.0f)  clean_steering = 1.0f;
                 if (clean_steering < -1.0f) clean_steering = -1.0f;
@@ -628,7 +656,7 @@ void AP_ModbusSteering::update(float steering_out)
                                                     -max_pulses, max_pulses);
 
                 const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
-                                                                     POSITION_SEND_INTERVAL_MS);
+                                                                     POSITION_SEND_INTERVAL_MS * 2);
 
                 bool just_synced = false;
                 int32_t commanded;
@@ -705,7 +733,7 @@ void AP_ModbusSteering::update(float steering_out)
                                          !have_sent_target ||
                                          commanded != last_sent_target_pulses;
 
-                if (should_send && _uart->txspace() >= 15) {
+                if (should_send) {
                     uint16_t values[3];
                     values[0] = (uint16_t)((commanded >> 16) & 0xFFFF);
                     values[1] = (uint16_t)(commanded & 0xFFFF);
@@ -717,19 +745,18 @@ void AP_ModbusSteering::update(float steering_out)
                     have_sent_target = true;
                 }
             } else {
-                debug_target_pulses = debug_actual_pulses;
+                run_phase_write = true;
+                run_status_div++;
+                if (run_status_div >= STATUS_READ_EVERY_N_READS) {
+                    run_status_div = 0;
+                    expecting_status_read = true;
+                    modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
+                } else {
+                    expecting_status_read = false;
+                    modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+                }
+                _uart->write(tx_packet, 8);
             }
-
-            run_status_div++;
-            if (run_status_div >= STATUS_READ_EVERY_N_CYCLES) {
-                run_status_div = 0;
-                expecting_status_read = true;
-                modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
-            } else {
-                expecting_status_read = false;
-                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-            }
-            _uart->write(tx_packet, 8);
             break;
         }
     }
