@@ -609,19 +609,24 @@ void Rover::modbus_steering_update()
 
     // В ручном режиме MANUAL полностью обходим защитные фильтры ArduPilot
     if (control_mode == &mode_manual) {
-        // Автоматически вытаскиваем ШИМ из нужного канала на основе карты RCMAP_ROLL
-        uint16_t raw_pwm = rc().channel(rcmap.roll() - 1)->get_radio_in();
+        RC_Channel *roll_ch = rc().channel(rcmap.roll() - 1);
+        const uint16_t raw_pwm = roll_ch->get_radio_in();
 
         // Защита от мусора при первоначальном старте симулятора
         if (raw_pwm < 900 || raw_pwm > 2100) {
-            raw_pwm = 1500;
+            current_steering = 0.0f;
+        } else {
+            const int16_t center = roll_ch->get_radio_trim();
+            const int16_t half_left = center - roll_ch->get_radio_min();
+            const int16_t half_right = roll_ch->get_radio_max() - center;
+            const int16_t half_range = MAX(half_left, half_right);
+            if (half_range > 0) {
+                current_steering = ((float)raw_pwm - (float)center) / (float)half_range;
+            }
         }
-
-        // Нормализуем диапазон 1000...2000 мкс во float от -1.0f до 1.0f
-        current_steering = ((float)raw_pwm - 1500.0f) / 500.0f;
     } else {
-        // В автоматических режимах (AUTO, GUIDED) возвращаем управление навигатору ArduPilot
-        current_steering = g2.motors.get_steering();
+        // В автоматических режимах (AUTO, GUIDED) — нормализованный руль ±1
+        current_steering = constrain_float(g2.motors.get_steering() / 4500.0f, -1.0f, 1.0f);
     }
 
     // Отправляем значение в ваш Modbus-драйвер руля

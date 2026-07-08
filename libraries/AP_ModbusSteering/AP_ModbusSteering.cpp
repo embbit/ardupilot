@@ -34,6 +34,8 @@ constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / (POSITION_LOOP_HZ * 2);
 constexpr uint32_t STATUS_READ_HZ = 1;
 constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
 
+constexpr float STICK_CENTER_THRESHOLD = 0.05f;
+
 static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
 {
     if (value < min_val) {
@@ -85,7 +87,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: MAX_STEPS
     // @DisplayName: Maximum Steering Steps
-    // @Description: Максимальный рабочий диапазон руля в импульсах. Для 4-х оборотов при микрошаге 4000 установите 16000.
+    // @Description: Импульсы на полный ход стика (±1). При микрошаге 4000: 8000 = 2 об мотора на сторону, 16000 = 4 об. На валу руля с редуктором 25:1 это 16000/25/4000 об.
     // @User: Standard
     AP_GROUPINFO("MAX_STEPS", 3, AP_ModbusSteering, max_steps, 16000),
 
@@ -103,11 +105,19 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: POS_DB
     // @DisplayName: Position Deadband
-    // @Description: Подавление дрожания: команда не отправляется повторно, если изменение меньше порога. Slew-rate: не больше MAX_STEPS/16 за цикл (~800 имп при 16000).
+    // @Description: Не повторять команду позиции, если изменение уставки меньше этого порога (импульсы).
     // @Units: pulses
     // @Range: 0 8000
     // @User: Standard
     AP_GROUPINFO("POS_DB", 6, AP_ModbusSteering, pos_db, 200),
+
+    // @Param: RET_SLEW
+    // @DisplayName: Return-To-Zero Slew Limit
+    // @Description: Макс. изменение уставки за цикл (50мс), только когда стик у центра (|руль|<5%). 0 = выкл. Активный поворот без ограничения скорости уставки.
+    // @Units: pulses
+    // @Range: 0 16000
+    // @User: Standard
+    AP_GROUPINFO("RET_SLEW", 7, AP_ModbusSteering, ret_slew, 2000),
 
     AP_GROUPEND};
 
@@ -177,7 +187,7 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 1. Парсинг эха для шагов инициализации (строгая проверка регистров)
-        if (current_state < DriveState::RUN_WRITE_POS && available_bytes >= 8)
+        if ((current_state < DriveState::RUN_WRITE_POS || current_state == DriveState::FAULT_RELEASE) && available_bytes >= 8)
         {
             for (uint32_t i = 0; i <= available_bytes - 8; i++)
             {
@@ -188,6 +198,8 @@ void AP_ModbusSteering::update(float steering_out)
                     if (modbus_crc16(&local_buf[i], 6) == received_crc)
                     {
                         if (current_state == DriveState::INIT_ENABLE && reg == REG_MOTOR_ENABLE)
+                            response_received = true;
+                        if (current_state == DriveState::FAULT_RELEASE && reg == REG_MOTOR_ENABLE)
                             response_received = true;
                         if (current_state == DriveState::INIT_CLEAR_ALARM && reg == REG_AUX_CONTROL)
                             response_received = true;
@@ -432,13 +444,13 @@ void AP_ModbusSteering::update(float steering_out)
                                                 -max_pulses, max_pulses);
 
             int32_t commanded = desired;
-            if (have_sent_target) {
-                const int32_t slew_limit = MAX(deadband, max_pulses / 16);
+            const int32_t ret_slew_limit = ret_slew.get();
+            if (have_sent_target && ret_slew_limit > 0 && fabsf(clean_steering) < STICK_CENTER_THRESHOLD) {
                 const int32_t delta = desired - last_sent_target_pulses;
-                if (delta > slew_limit) {
-                    commanded = last_sent_target_pulses + slew_limit;
-                } else if (delta < -slew_limit) {
-                    commanded = last_sent_target_pulses - slew_limit;
+                if (delta > ret_slew_limit) {
+                    commanded = last_sent_target_pulses + ret_slew_limit;
+                } else if (delta < -ret_slew_limit) {
+                    commanded = last_sent_target_pulses - ret_slew_limit;
                 }
             }
 
