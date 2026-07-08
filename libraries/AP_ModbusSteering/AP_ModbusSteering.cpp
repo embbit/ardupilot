@@ -35,9 +35,9 @@ constexpr uint16_t MOTION_START_ABS = 0x0003;  // start + absolute (interrupt vi
 constexpr uint16_t CL57R_TRACK_ERR_DEFAULT = 8000;
 constexpr uint32_t TRACK_ERR_PAUSE_MS = 500;
 
-// Позиция: WRITE + READ_POS = 2 шага → 20 Гц при 25 мс на шаг.
+// Позиция: уставка и чтение энкодера чередуются по таймеру (не ждём ответ для записи).
 constexpr uint32_t POSITION_LOOP_HZ = 20;
-constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / (POSITION_LOOP_HZ * 2);
+constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / POSITION_LOOP_HZ;
 
 // Статус/ошибки: раз в 10 циклов позиции → 1 Гц.
 constexpr uint32_t STATUS_READ_HZ = 1;
@@ -227,12 +227,10 @@ void AP_ModbusSteering::update(float steering_out)
         INIT_DECEL,        // 7
         INIT_ABS_MODE,     // 8
         INIT_TRIG_MODE,    // 9
-        RUN_WRITE_POS,     // 10
-        RUN_READ_POS,      // 11
-        RUN_READ_STATUS,   // 12
-        TRACK_CLEAR,       // 13
-        FAULT_RELEASE,     // 14
-        FAULT_LATCHED,     // 15
+        RUN_ACTIVE,        // 10
+        TRACK_CLEAR,       // 11
+        FAULT_RELEASE,     // 12
+        FAULT_LATCHED,     // 13
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
@@ -243,7 +241,6 @@ void AP_ModbusSteering::update(float steering_out)
     static int32_t debug_actual_pulses = 0;
     static uint16_t last_driver_error_code = 0;
     static uint16_t last_driver_status_word = 0;
-    static uint8_t position_cycles_since_status = 0;
     static int32_t last_sent_target_pulses = 0;
     static bool have_sent_target = false;
     static bool encoder_fault_latched = false;
@@ -253,6 +250,9 @@ void AP_ModbusSteering::update(float steering_out)
     static bool need_position_sync = false;
     static int32_t last_valid_actual = 0;
     static bool have_valid_actual = false;
+    static uint8_t run_status_div = 0;
+    static bool expecting_status_read = false;
+    static int8_t last_stick_sign = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -268,7 +268,7 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 1. Парсинг эха для шагов инициализации (строгая проверка регистров)
-        if ((current_state < DriveState::RUN_WRITE_POS || current_state == DriveState::FAULT_RELEASE ||
+        if ((current_state < DriveState::RUN_ACTIVE || current_state == DriveState::FAULT_RELEASE ||
              current_state == DriveState::TRACK_CLEAR) && available_bytes >= 8)
         {
             for (uint32_t i = 0; i <= available_bytes - 8; i++)
@@ -312,7 +312,8 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 2. Парсинг позиции энкодера (0x0007-0x0008, функция 0x03, 9 байт)
-        if ((current_state == DriveState::RUN_READ_POS || current_state == DriveState::FAULT_LATCHED) && available_bytes >= 9)
+        if (((current_state == DriveState::RUN_ACTIVE && !expecting_status_read) ||
+             current_state == DriveState::FAULT_LATCHED) && available_bytes >= 9)
         {
             for (uint32_t i = 0; i <= available_bytes - 9; i++)
             {
@@ -326,7 +327,7 @@ void AP_ModbusSteering::update(float steering_out)
 
                         const int32_t actual_position = decode_encoder_position(high_word, low_word);
                         const int32_t max_jump = speed_move_limit_pulses((uint16_t)max_speed.get(),
-                                                                          POSITION_SEND_INTERVAL_MS * 2) * 4;
+                                                                          POSITION_SEND_INTERVAL_MS) * 4;
 
                         if (have_valid_actual &&
                             abs_int32(actual_position - last_valid_actual) > max_jump) {
@@ -354,7 +355,7 @@ void AP_ModbusSteering::update(float steering_out)
                             break;
                         }
 
-                        response_received = (current_state == DriveState::RUN_READ_POS);
+                        response_received = false;
 
                         gcs().send_debug_vect("STEER",
                                               (float)debug_actual_pulses,
@@ -367,7 +368,7 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 3. Парсинг статуса и кода ошибки драйвера (0x0003-0x0004)
-        if (current_state == DriveState::RUN_READ_STATUS && available_bytes >= 9)
+        if (current_state == DriveState::RUN_ACTIVE && expecting_status_read && available_bytes >= 9)
         {
             for (uint32_t i = 0; i <= available_bytes - 9; i++)
             {
@@ -380,7 +381,8 @@ void AP_ModbusSteering::update(float steering_out)
                         const uint16_t error_code = (local_buf[i + 5] << 8) | local_buf[i + 6];
 
                         modbus_note_link_rx(now, link_deadline_ms);
-                        response_received = true;
+                        expecting_status_read = false;
+                        response_received = false;
 
                         if (error_code != last_driver_error_code) {
                             if (error_code != 0) {
@@ -392,8 +394,7 @@ void AP_ModbusSteering::update(float steering_out)
                                 if (error_code == 4) {
                                     pending_track_clear = true;
                                     tracking_pause_until_ms = now + TRACK_ERR_PAUSE_MS;
-                                    last_sent_target_pulses = debug_actual_pulses;
-                                    have_sent_target = true;
+                                    need_position_sync = true;
                                 }
                             } else if (last_driver_error_code != 0) {
                                 gcs().send_text(MAV_SEVERITY_INFO, "CL57R: alarm cleared");
@@ -435,21 +436,23 @@ void AP_ModbusSteering::update(float steering_out)
         response_received = false;
         last_driver_error_code = 0;
         last_driver_status_word = 0;
-        position_cycles_since_status = 0;
+        run_status_div = 0;
+        expecting_status_read = false;
         last_sent_target_pulses = 0;
         have_sent_target = false;
         have_actual_position = false;
         need_position_sync = false;
         have_valid_actual = false;
+        last_stick_sign = 0;
         link_deadline_ms = now + MODBUS_LINK_TIMEOUT_MS;
     }
 
-    // --- БЛОК ОТПРАВКИ КОМАНД ПО ТАЙМЕРУ (позиция 10 Гц, статус 1 Гц) ---
+    // --- БЛОК ОТПРАВКИ КОМАНД ПО ТАЙМЕРУ (уставка 20 Гц, статус 1 Гц) ---
     if ((now - _last_send_ms) < POSITION_SEND_INTERVAL_MS)
     {
         return;
     }
-    if (_uart->txspace() < 22)
+    if (_uart->txspace() < 24)
     {
         return;
     }
@@ -493,13 +496,14 @@ void AP_ModbusSteering::update(float steering_out)
             current_state = DriveState::INIT_TRIG_MODE;
             break;
         case DriveState::INIT_TRIG_MODE:
-            current_state = DriveState::RUN_READ_POS;
-            position_cycles_since_status = 0;
+            current_state = DriveState::RUN_ACTIVE;
             last_sent_target_pulses = 0;
             have_sent_target = false;
             have_actual_position = false;
             need_position_sync = true;
             have_valid_actual = false;
+            run_status_div = 0;
+            last_stick_sign = 0;
             modbus_note_link_rx(now, link_deadline_ms);
             if (!modbus_link_ok) {
                 gcs().send_text(MAV_SEVERITY_INFO,
@@ -509,28 +513,8 @@ void AP_ModbusSteering::update(float steering_out)
             }
             modbus_link_ok = true;
             break;
-        case DriveState::RUN_WRITE_POS:
-            current_state = DriveState::RUN_READ_POS;
-            break;
-        case DriveState::RUN_READ_POS:
-            position_cycles_since_status++;
-            if (position_cycles_since_status >= STATUS_READ_EVERY_N_CYCLES) {
-                position_cycles_since_status = 0;
-                current_state = DriveState::RUN_READ_STATUS;
-            } else {
-                current_state = DriveState::RUN_WRITE_POS;
-            }
-            break;
-        case DriveState::RUN_READ_STATUS:
-            if (pending_track_clear) {
-                pending_track_clear = false;
-                current_state = DriveState::TRACK_CLEAR;
-            } else {
-                current_state = DriveState::RUN_WRITE_POS;
-            }
-            break;
         case DriveState::TRACK_CLEAR:
-            current_state = DriveState::RUN_WRITE_POS;
+            current_state = DriveState::RUN_ACTIVE;
             break;
         case DriveState::FAULT_RELEASE:
             current_state = DriveState::FAULT_LATCHED;
@@ -563,8 +547,7 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::TRACK_CLEAR:
         modbus_create_write_packet((uint8_t)slave_id.get(), REG_AUX_CONTROL, AUX_ALARM_CLEAR, tx_packet);
         _uart->write(tx_packet, 8);
-        last_sent_target_pulses = debug_actual_pulses;
-        have_sent_target = true;
+        need_position_sync = true;
         break;
 
     case DriveState::INIT_CLEAR_ALARM:
@@ -612,127 +595,140 @@ void AP_ModbusSteering::update(float steering_out)
         _uart->write(tx_packet, 8);
         break;
 
-         case DriveState::RUN_WRITE_POS: {
+         case DriveState::RUN_ACTIVE: {
             if (encoder_fault_latched) {
                 current_state = DriveState::FAULT_LATCHED;
                 break;
             }
+
+            if (pending_track_clear) {
+                pending_track_clear = false;
+                current_state = DriveState::TRACK_CLEAR;
+                modbus_create_write_packet((uint8_t)slave_id.get(), REG_AUX_CONTROL, AUX_ALARM_CLEAR, tx_packet);
+                _uart->write(tx_packet, 8);
+                break;
+            }
+
             if (!have_actual_position) {
-                current_state = DriveState::RUN_READ_POS;
-                break;
-            }
-            if (now < tracking_pause_until_ms) {
-                debug_target_pulses = debug_actual_pulses;
-                current_state = DriveState::RUN_READ_POS;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+                _uart->write(tx_packet, 8);
                 break;
             }
 
-            float clean_steering = steering_out;
-            if (clean_steering > 1.0f)  clean_steering = 1.0f;
-            if (clean_steering < -1.0f) clean_steering = -1.0f;
+            if (now >= tracking_pause_until_ms) {
+                float clean_steering = steering_out;
+                if (clean_steering > 1.0f)  clean_steering = 1.0f;
+                if (clean_steering < -1.0f) clean_steering = -1.0f;
 
-            const int32_t max_pulses = travel_limit_pulses();
-            const int32_t deadband = pos_db.get();
-            const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
-                                                -max_pulses, max_pulses);
+                const int32_t max_pulses = travel_limit_pulses();
+                const int32_t deadband = pos_db.get();
+                const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
+                                                    -max_pulses, max_pulses);
 
-            const uint32_t full_cycle_ms = POSITION_SEND_INTERVAL_MS * 2;
-            const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
+                const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
+                                                                     POSITION_SEND_INTERVAL_MS);
 
-            bool just_synced = false;
-            int32_t commanded;
-            const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
+                bool just_synced = false;
+                int32_t commanded;
+                const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
 
-            if (need_position_sync) {
-                commanded = debug_actual_pulses;
-                need_position_sync = false;
-                just_synced = true;
-            } else {
-                int32_t capped_desired = desired;
-
-                const int32_t brake_zone = brake_zone_pulses((uint16_t)max_speed.get(),
-                                                             active_limit,
-                                                             max_pulses);
-                if (capped_desired > max_pulses - brake_zone) {
-                    capped_desired = MIN(capped_desired, max_pulses - active_limit);
-                }
-                if (capped_desired < -max_pulses + brake_zone) {
-                    capped_desired = MAX(capped_desired, -max_pulses + active_limit);
-                }
-
-                const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
-                const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
-                                        abs_int32(capped_desired) > max_pulses - brake_zone;
-
-                if (past_limit) {
-                    const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                    const int32_t pull_step = MIN(overshoot, active_limit * 4);
-                    const int32_t pull_target = (debug_actual_pulses > 0) ?
-                        (max_pulses - active_limit) : (-max_pulses + active_limit);
-                    commanded = step_toward(debug_actual_pulses, pull_target, pull_step);
+                if (need_position_sync) {
+                    commanded = debug_actual_pulses;
+                    need_position_sync = false;
+                    just_synced = true;
+                    last_stick_sign = 0;
                 } else {
+                    int32_t capped_desired = desired;
+
+                    const int32_t brake_zone = brake_zone_pulses((uint16_t)max_speed.get(),
+                                                                 active_limit,
+                                                                 max_pulses);
+                    if (capped_desired > max_pulses - brake_zone) {
+                        capped_desired = MIN(capped_desired, max_pulses - active_limit);
+                    }
+                    if (capped_desired < -max_pulses + brake_zone) {
+                        capped_desired = MAX(capped_desired, -max_pulses + active_limit);
+                    }
+
+                    const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
+                    const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
+                                            abs_int32(capped_desired) > max_pulses - brake_zone;
+
+                    const int8_t stick_sign = (capped_desired > deadband) ? 1 :
+                                              ((capped_desired < -deadband) ? -1 : 0);
+                    if (stick_sign != 0 && last_stick_sign != 0 && stick_sign != last_stick_sign) {
+                        last_sent_target_pulses = debug_actual_pulses;
+                        have_sent_target = true;
+                    }
+                    last_stick_sign = stick_sign;
+
+                    const int32_t stream_from = have_sent_target ?
+                        last_sent_target_pulses : debug_actual_pulses;
                     int32_t lead = near_limit ? MAX(active_limit / 2, 1) : active_limit;
                     if (returning && ret_slew.get() > 0) {
                         lead = MIN(lead, (int32_t)ret_slew.get());
                     }
-                    const int32_t stream_from = have_sent_target ?
-                        last_sent_target_pulses : debug_actual_pulses;
-                    commanded = step_toward(stream_from, capped_desired, lead);
+
+                    if (past_limit) {
+                        const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
+                        const int32_t pull_step = MIN(overshoot, active_limit * 4);
+                        const int32_t pull_target = (debug_actual_pulses > 0) ?
+                            (max_pulses - active_limit) : (-max_pulses + active_limit);
+                        commanded = step_toward(stream_from, pull_target, pull_step);
+                    } else {
+                        commanded = step_toward(stream_from, capped_desired, lead);
+                    }
                 }
-            }
 
-            commanded = clamp_int32(commanded, -max_pulses, max_pulses);
+                commanded = clamp_int32(commanded, -max_pulses, max_pulses);
 
-            static bool soft_limit_warned = false;
-            if (abs_int32(debug_actual_pulses) > max_pulses) {
-                const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                if (!soft_limit_warned && overshoot > active_limit) {
-                    gcs().send_text(MAV_SEVERITY_WARNING,
-                                    "CL57R: overshoot %ld imp, correcting",
-                                    (long)overshoot);
-                    soft_limit_warned = true;
-                } else if (overshoot <= deadband) {
+                static bool soft_limit_warned = false;
+                if (abs_int32(debug_actual_pulses) > max_pulses) {
+                    const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
+                    if (!soft_limit_warned && overshoot > active_limit) {
+                        gcs().send_text(MAV_SEVERITY_WARNING,
+                                        "CL57R: overshoot %ld imp, correcting",
+                                        (long)overshoot);
+                        soft_limit_warned = true;
+                    } else if (overshoot <= deadband) {
+                        soft_limit_warned = false;
+                    }
+                } else {
                     soft_limit_warned = false;
                 }
+
+                debug_target_pulses = commanded;
+
+                const bool should_send = just_synced ||
+                                         !have_sent_target ||
+                                         commanded != last_sent_target_pulses;
+
+                if (should_send && _uart->txspace() >= 15) {
+                    uint16_t values[3];
+                    values[0] = (uint16_t)((commanded >> 16) & 0xFFFF);
+                    values[1] = (uint16_t)(commanded & 0xFFFF);
+                    values[2] = MOTION_START_ABS;
+
+                    modbus_create_write_multiple_packet((uint8_t)slave_id.get(), 0x0034, 3, values, tx_packet);
+                    _uart->write(tx_packet, 15);
+                    last_sent_target_pulses = commanded;
+                    have_sent_target = true;
+                }
             } else {
-                soft_limit_warned = false;
+                debug_target_pulses = debug_actual_pulses;
             }
 
-            debug_target_pulses = commanded;
-
-            const bool should_send = just_synced ||
-                                     !have_sent_target ||
-                                     commanded != last_sent_target_pulses;
-
-            if (should_send) {
-                uint16_t values[3];
-                values[0] = (uint16_t)((commanded >> 16) & 0xFFFF);
-                values[1] = (uint16_t)(commanded & 0xFFFF);
-                values[2] = MOTION_START_ABS;
-
-                modbus_create_write_multiple_packet((uint8_t)slave_id.get(), 0x0034, 3, values, tx_packet);
-                _uart->write(tx_packet, 15);
-                last_sent_target_pulses = commanded;
-                have_sent_target = true;
+            run_status_div++;
+            if (run_status_div >= STATUS_READ_EVERY_N_CYCLES) {
+                run_status_div = 0;
+                expecting_status_read = true;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
+            } else {
+                expecting_status_read = false;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
             }
-
-            current_state = DriveState::RUN_READ_POS;
+            _uart->write(tx_packet, 8);
             break;
         }
-
-
-    case DriveState::RUN_READ_POS:
-    {
-        modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-        _uart->write(tx_packet, 8);
-        break;
-    }
-
-    case DriveState::RUN_READ_STATUS:
-    {
-        modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
-        _uart->write(tx_packet, 8);
-        break;
-    }
     }
 }
