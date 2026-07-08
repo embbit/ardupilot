@@ -131,6 +131,7 @@ void AP_ModbusSteering::update(float steering_out)
     static int32_t debug_target_pulses = 0;
     static int32_t debug_actual_pulses = 0;
     static uint16_t last_driver_error_code = 0;
+    static uint16_t last_driver_status_word = 0;
     static uint8_t position_cycles_since_status = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
