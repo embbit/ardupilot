@@ -19,6 +19,8 @@ extern "C"
 
 extern const AP_HAL::HAL &hal;
 
+constexpr int32_t STEPPER_MICROSTEP = 4000;
+
 namespace {
 constexpr uint16_t REG_STATUS_WORD = 0x0003;
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
@@ -35,6 +37,9 @@ constexpr uint32_t STATUS_READ_HZ = 1;
 constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
 
 constexpr float STICK_CENTER_THRESHOLD = 0.05f;
+
+// Должно совпадать с INIT_SUBDIVISION (регистр 0x0023)
+constexpr int32_t STEPPER_MICROSTEP = 4000;
 
 static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
 {
@@ -69,6 +74,14 @@ const char *cl57r_error_str(uint16_t code)
 }
 } // namespace
 
+int32_t AP_ModbusSteering::travel_limit_pulses() const
+{
+    if (out_rev.get() > 0 && ratio.get() > 0) {
+        return (int32_t)out_rev.get() * ratio.get() * STEPPER_MICROSTEP / 2;
+    }
+    return max_steps.get();
+}
+
 // --- БЛОК РЕГИСТРАЦИИ ПАРАМЕТРОВ С ПРАВИЛЬНЫМИ ХЕШ-КОММЕНТАРИЯМИ ---
 // @Group: STEER_
 // @Path: AP_ModbusSteering.cpp
@@ -87,9 +100,9 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: MAX_STEPS
     // @DisplayName: Maximum Steering Steps
-    // @Description: Импульсы на полный ход стика (±1). При микрошаге 4000: 8000 = 2 об мотора на сторону, 16000 = 4 об. На валу руля с редуктором 25:1 это 16000/25/4000 об.
+    // @Description: Импульсы на полный ход стика (±1), если OUT_REV=0. Иначе используется OUT_REV*RATIO*4000/2.
     // @User: Standard
-    AP_GROUPINFO("MAX_STEPS", 3, AP_ModbusSteering, max_steps, 16000),
+    AP_GROUPINFO("MAX_STEPS", 3, AP_ModbusSteering, max_steps, 200000),
 
     // @Param: START_SPD
     // @DisplayName: Start JOG Speed
@@ -107,17 +120,32 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @DisplayName: Position Deadband
     // @Description: Не повторять команду позиции, если изменение уставки меньше этого порога (импульсы).
     // @Units: pulses
-    // @Range: 0 8000
+    // @Range: 0 50000
     // @User: Standard
-    AP_GROUPINFO("POS_DB", 6, AP_ModbusSteering, pos_db, 200),
+    AP_GROUPINFO("POS_DB", 6, AP_ModbusSteering, pos_db, 500),
 
     // @Param: RET_SLEW
     // @DisplayName: Return-To-Zero Slew Limit
-    // @Description: Макс. изменение уставки за цикл (50мс), только когда стик у центра (|руль|<5%). 0 = выкл. Активный поворот без ограничения скорости уставки.
+    // @Description: Макс. изменение уставки за цикл (50мс), только когда стик у центра (|руль|<5%). 0 = выкл.
     // @Units: pulses
-    // @Range: 0 16000
+    // @Range: 0 50000
     // @User: Standard
-    AP_GROUPINFO("RET_SLEW", 7, AP_ModbusSteering, ret_slew, 2000),
+    AP_GROUPINFO("RET_SLEW", 7, AP_ModbusSteering, ret_slew, 8000),
+
+    // @Param: OUT_REV
+    // @DisplayName: Rudder Lock-to-Lock Turns
+    // @Description: Обороты на выходе редуктора упор-упор. При >0 лимит = OUT_REV*RATIO*4000/2 имп на стик.
+    // @Units: rev
+    // @Range: 0 20
+    // @User: Standard
+    AP_GROUPINFO("OUT_REV", 8, AP_ModbusSteering, out_rev, 4),
+
+    // @Param: RATIO
+    // @DisplayName: Gearbox Ratio
+    // @Description: Передаточное число редуктора (об мотора на 1 об выхода).
+    // @Range: 1 200
+    // @User: Standard
+    AP_GROUPINFO("RATIO", 9, AP_ModbusSteering, ratio, 25),
 
     AP_GROUPEND};
 
@@ -238,7 +266,7 @@ void AP_ModbusSteering::update(float steering_out)
 
                         debug_actual_pulses = actual_position;
 
-                        const int32_t max_pulses = max_steps.get();
+                        const int32_t max_pulses = travel_limit_pulses();
                         const int32_t fault_limit = max_pulses + (max_pulses / 2);
                         if (abs_int32(actual_position) > fault_limit) {
                             if (!position_fault) {
@@ -438,7 +466,7 @@ void AP_ModbusSteering::update(float steering_out)
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
             if (clean_steering < -1.0f) clean_steering = -1.0f;
 
-            const int32_t max_pulses = max_steps.get();
+            const int32_t max_pulses = travel_limit_pulses();
             const int32_t deadband = pos_db.get();
             const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                 -max_pulses, max_pulses);

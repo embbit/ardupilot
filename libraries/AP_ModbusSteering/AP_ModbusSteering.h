@@ -29,4 +29,8 @@ private:
     AP_Int16 max_speed;
     AP_Int32 pos_db;
     AP_Int32 ret_slew;
+    AP_Int8  out_rev;
+    AP_Int16 ratio;
+
+    int32_t travel_limit_pulses() const;
 };
