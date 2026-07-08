@@ -600,11 +600,11 @@ void AP_ModbusSteering::update(float steering_out)
             } else {
                 int32_t capped_desired = desired;
 
-                const int32_t brake_zone = active_limit * 2;
-                if (debug_actual_pulses > max_pulses - brake_zone && capped_desired > debug_actual_pulses) {
+                const int32_t brake_zone = MAX(active_limit * 6, max_pulses / 10);
+                if (capped_desired > max_pulses - brake_zone) {
                     capped_desired = MIN(capped_desired, max_pulses - active_limit);
                 }
-                if (debug_actual_pulses < -max_pulses + brake_zone && capped_desired < debug_actual_pulses) {
+                if (capped_desired < -max_pulses + brake_zone) {
                     capped_desired = MAX(capped_desired, -max_pulses + active_limit);
                 }
 
@@ -612,6 +612,9 @@ void AP_ModbusSteering::update(float steering_out)
                 const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
                 const int32_t move_limit = returning ? return_limit : active_limit;
                 const int32_t settle_zone = deadband * 8;
+                const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
+                const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
+                                        abs_int32(capped_desired) > max_pulses - brake_zone;
 
                 static int8_t last_desired_sign = 0;
                 const int8_t desired_sign = (capped_desired > deadband) ? 1 :
@@ -620,7 +623,11 @@ void AP_ModbusSteering::update(float steering_out)
                                       desired_sign != last_desired_sign;
                 last_desired_sign = desired_sign;
 
-                if (returning || reversed) {
+                if (past_limit) {
+                    const int32_t pull_target = (debug_actual_pulses > 0) ?
+                        (max_pulses - active_limit) : (-max_pulses + active_limit);
+                    commanded = step_toward(debug_actual_pulses, pull_target, active_limit);
+                } else if (returning || reversed || near_limit) {
                     commanded = step_toward(debug_actual_pulses, capped_desired, move_limit);
                 } else if (follow_err_inner > settle_zone) {
                     commanded = capped_desired;
@@ -635,20 +642,9 @@ void AP_ModbusSteering::update(float steering_out)
             commanded = clamp_int32(commanded, -max_pulses, max_pulses);
 
             const int32_t follow_err = abs_int32(debug_actual_pulses - desired);
-            const int32_t move_limit = active_limit;
 
             static bool soft_limit_warned = false;
             if (abs_int32(debug_actual_pulses) > max_pulses) {
-                const bool moving_out = (debug_actual_pulses > 0 && commanded > debug_actual_pulses) ||
-                                        (debug_actual_pulses < 0 && commanded < debug_actual_pulses);
-                if (moving_out) {
-                    if (debug_actual_pulses > 0) {
-                        commanded = debug_actual_pulses - move_limit;
-                    } else {
-                        commanded = debug_actual_pulses + move_limit;
-                    }
-                    commanded = clamp_int32(commanded, -max_pulses, max_pulses);
-                }
                 const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
                 if (!soft_limit_warned && overshoot > active_limit) {
                     gcs().send_text(MAV_SEVERITY_WARNING,
