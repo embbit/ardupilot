@@ -23,6 +23,7 @@ namespace {
 constexpr uint16_t REG_STATUS_WORD = 0x0003;
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
 constexpr uint16_t REG_AUX_CONTROL = 0x0037;
+constexpr uint16_t REG_MOTOR_ENABLE = 0x0038;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 
 // Позиция: WRITE + READ_POS = 2 шага → 10 Гц при 50 мс на шаг.
@@ -102,7 +103,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: POS_DB
     // @DisplayName: Position Deadband
-    // @Description: Подавление дрожания: команда не отправляется повторно, если изменение меньше порога. Также задаёт минимальный шаг slew-rate (не меньше MAX_STEPS/8 за цикл).
+    // @Description: Подавление дрожания: команда не отправляется повторно, если изменение меньше порога. Slew-rate: не больше MAX_STEPS/16 за цикл (~800 имп при 16000).
     // @Units: pulses
     // @Range: 0 8000
     // @User: Standard
@@ -147,6 +148,7 @@ void AP_ModbusSteering::update(float steering_out)
         RUN_WRITE_POS,     // 7
         RUN_READ_POS,      // 8
         RUN_READ_STATUS,   // 9
+        FAULT_RELEASE,     // 10
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
@@ -185,7 +187,7 @@ void AP_ModbusSteering::update(float steering_out)
                     uint16_t received_crc = (local_buf[i + 7] << 8) | local_buf[i + 6];
                     if (modbus_crc16(&local_buf[i], 6) == received_crc)
                     {
-                        if (current_state == DriveState::INIT_ENABLE && reg == 0x0038)
+                        if (current_state == DriveState::INIT_ENABLE && reg == REG_MOTOR_ENABLE)
                             response_received = true;
                         if (current_state == DriveState::INIT_CLEAR_ALARM && reg == REG_AUX_CONTROL)
                             response_received = true;
@@ -221,7 +223,6 @@ void AP_ModbusSteering::update(float steering_out)
                         int32_t actual_position = static_cast<int32_t>(((uint32_t)high_word << 16) | low_word);
 
                         last_telemetry_rcvd_ms = now;
-                        response_received = true;
 
                         debug_actual_pulses = actual_position;
 
@@ -230,12 +231,16 @@ void AP_ModbusSteering::update(float steering_out)
                         if (abs_int32(actual_position) > fault_limit) {
                             if (!position_fault) {
                                 position_fault = true;
+                                current_state = DriveState::FAULT_RELEASE;
                                 gcs().send_text(MAV_SEVERITY_CRITICAL,
-                                                "CL57R: encoder %ld out of range (+/-%ld), hold commands",
+                                                "CL57R: encoder %ld out of range (+/-%ld), reinit",
                                                 (long)actual_position,
                                                 (long)fault_limit);
                             }
+                            break;
                         }
+
+                        response_received = true;
 
                         gcs().send_debug_vect("STEER",
                                               (float)debug_actual_pulses,
@@ -364,6 +369,9 @@ void AP_ModbusSteering::update(float steering_out)
         case DriveState::RUN_READ_STATUS:
             current_state = DriveState::RUN_WRITE_POS;
             break;
+        case DriveState::FAULT_RELEASE:
+            current_state = DriveState::INIT_ENABLE;
+            break;
         }
     }
 
@@ -371,8 +379,16 @@ void AP_ModbusSteering::update(float steering_out)
     switch (current_state)
     {
     case DriveState::INIT_ENABLE:
-        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0038, 0x0001, tx_packet);
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_MOTOR_ENABLE, 0x0001, tx_packet);
         _uart->write(tx_packet, 8);
+        break;
+
+    case DriveState::FAULT_RELEASE:
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_MOTOR_ENABLE, 0x0000, tx_packet);
+        _uart->write(tx_packet, 8);
+        have_sent_target = false;
+        last_sent_target_pulses = 0;
+        position_fault = false;
         break;
 
     case DriveState::INIT_CLEAR_ALARM:
@@ -406,11 +422,6 @@ void AP_ModbusSteering::update(float steering_out)
         break;
 
          case DriveState::RUN_WRITE_POS: {
-            if (position_fault) {
-                current_state = DriveState::RUN_READ_POS;
-                break;
-            }
-
             float clean_steering = steering_out;
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
             if (clean_steering < -1.0f) clean_steering = -1.0f;
@@ -422,7 +433,7 @@ void AP_ModbusSteering::update(float steering_out)
 
             int32_t commanded = desired;
             if (have_sent_target) {
-                const int32_t slew_limit = MAX(deadband, max_pulses / 8);
+                const int32_t slew_limit = MAX(deadband, max_pulses / 16);
                 const int32_t delta = desired - last_sent_target_pulses;
                 if (delta > slew_limit) {
                     commanded = last_sent_target_pulses + slew_limit;
