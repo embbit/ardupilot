@@ -155,6 +155,9 @@ sim_state = {
     "link_active": True,
     "link_drop_at": None,
     "link_restore_at": None,
+    "link_schedule": [],
+    "inject_schedule": [],
+    "start_time": 0.0,
     "last_rx_hex": "WAITING...",
     "init_count": 0,
     "packets_rx": 0,
@@ -203,7 +206,43 @@ def _log_telemetry(now, cmd_target):
                  f"{motor.error_code}\n")
 
 
+def schedule_link_drops(drop_specs):
+    """drop_specs: list of (delay_s, down_duration_s) from sim start."""
+    sim_state["link_schedule"] = list(drop_specs)
+
+
+def schedule_position_injections(inject_specs):
+    """inject_specs: list of (delay_s, position_pulses)."""
+    sim_state["inject_schedule"] = list(inject_specs)
+
+
+def _inject_position(pos):
+    motor.position = float(pos)
+    motor.reported_position = float(pos)
+    motor.driver_target = int(pos)
+    motor.velocity = 0.0
+    print(f"[CL57R Modbus Sim] INJECT position={int(pos)}")
+
+
 def check_link_schedule(now):
+    start = sim_state["start_time"]
+
+    while sim_state["inject_schedule"]:
+        delay_s, pos = sim_state["inject_schedule"][0]
+        if now - start < delay_s:
+            break
+        sim_state["inject_schedule"].pop(0)
+        _inject_position(pos)
+
+    while sim_state["link_schedule"]:
+        delay_s, down_duration = sim_state["link_schedule"][0]
+        if now - start < delay_s:
+            break
+        sim_state["link_schedule"].pop(0)
+        sim_state["link_drop_at"] = now
+        sim_state["link_restore_at"] = now + down_duration
+        print(f"[CL57R Modbus Sim] Scheduled link drop for {down_duration}s")
+
     if sim_state["link_drop_at"] is not None and now >= sim_state["link_drop_at"]:
         if sim_state["link_active"]:
             sim_state["link_active"] = False
@@ -230,6 +269,7 @@ def handle_write_single(reg_addr, val):
         motor.motor_enabled = (val == 0x0001)
         if not motor.motor_enabled:
             motor.velocity = 0.0
+            print("[CL57R Modbus Sim] MOTOR DISABLE")
     elif reg_addr == 0x0037 and val == 0x0004:
         motor.error_code = 0
         motor.status_word &= ~(1 << 3)
@@ -240,13 +280,22 @@ def handle_write_single(reg_addr, val):
 
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
-                         telemetry_file=None):
+                         telemetry_file=None, link_drops=None, inject_positions=None):
     motor.encoder_lag_s = encoder_lag_ms / 1000.0
     motor.reported_position = motor.position
     sim_state["telemetry_file"] = telemetry_file
+    sim_state["start_time"] = time.time()
+    sim_state["link_schedule"] = []
+    sim_state["inject_schedule"] = []
     if telemetry_file:
         with open(telemetry_file, "w", encoding="ascii") as fh:
             fh.write("t,cmd_target,actual,encoder,vel,follow,err\n")
+    if link_drops:
+        schedule_link_drops(link_drops)
+        print(f"[CL57R Modbus Sim] Link drop schedule: {link_drops}")
+    if inject_positions:
+        schedule_position_injections(inject_positions)
+        print(f"[CL57R Modbus Sim] Position inject schedule: {inject_positions}")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((HOST, MODBUS_UDP_PORT))
@@ -388,13 +437,36 @@ def parse_args():
                         help="Encoder read lag in milliseconds (simulates stale feedback)")
     parser.add_argument("--telemetry-file", type=str, default=None,
                         help="CSV log of position commands and motor state")
+    parser.add_argument("--link-drops", type=str, default=None,
+                        help="Comma-separated drop:duration pairs in seconds, e.g. 10:5,30:5")
+    parser.add_argument("--inject-positions", type=str, default=None,
+                        help="Comma-separated delay:position pairs, e.g. 8:-310000")
     return parser.parse_args()
+
+
+def _parse_pairs(spec, names):
+    if spec is None:
+        return None
+    result = []
+    for item in spec.split(","):
+        parts = item.strip().split(":")
+        if len(parts) != 2:
+            raise SystemExit(f"Invalid {names} spec: {item}")
+        result.append((float(parts[0]), float(parts[1]) if names == "link" else int(float(parts[1]))))
+    return result
 
 
 if __name__ == "__main__":
     args = parse_args()
     drop_delay = args.link_drop_delay
     down_duration = args.link_down_duration
+    link_drops = _parse_pairs(args.link_drops, "link")
+    inject_positions = _parse_pairs(args.inject_positions, "inject")
     if (drop_delay is None) != (down_duration is None):
         raise SystemExit("Both --link-drop-delay and --link-down-duration are required together")
-    run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file)
+    if drop_delay is not None and link_drops is not None:
+        raise SystemExit("Use either --link-drop-delay or --link-drops, not both")
+    if drop_delay is not None:
+        link_drops = [(drop_delay, down_duration)]
+    run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file,
+                         link_drops, inject_positions)
