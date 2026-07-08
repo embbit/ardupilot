@@ -235,10 +235,8 @@ void AP_ModbusSteering::update(float steering_out)
                             last_driver_error_code = error_code;
                         }
 
-                        gcs().send_debug_vect("STDRV",
-                                              (float)status_word,
-                                              (float)error_code,
-                                              0.0f);
+                        gcs().send_named_float("STR_STA", (float)status_word);
+                        gcs().send_named_float("STR_ERR", (float)error_code);
                         break;
                     }
                 }
