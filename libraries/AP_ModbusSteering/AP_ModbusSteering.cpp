@@ -93,17 +93,6 @@ static int32_t brake_zone_pulses(uint16_t rpm, int32_t active_limit, int32_t max
     return MAX(brake_distance, MAX(active_limit * 8, max_pulses / 8));
 }
 
-static int32_t apply_lead_limit(int32_t commanded, int32_t actual, int32_t move_limit)
-{
-    if (commanded > actual) {
-        return MIN(commanded, actual + move_limit);
-    }
-    if (commanded < actual) {
-        return MAX(commanded, actual - move_limit);
-    }
-    return commanded;
-}
-
 static int32_t decode_encoder_position(uint16_t high_word, uint16_t low_word)
 {
     return (int32_t)(((int32_t)(int16_t)high_word << 16) | low_word);
@@ -674,7 +663,6 @@ void AP_ModbusSteering::update(float steering_out)
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
                 const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
                                         abs_int32(capped_desired) > max_pulses - brake_zone;
-                const int32_t stick_err = abs_int32(debug_actual_pulses - capped_desired);
 
                 if (past_limit) {
                     const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
@@ -687,11 +675,9 @@ void AP_ModbusSteering::update(float steering_out)
                     if (returning && ret_slew.get() > 0) {
                         lead = MIN(lead, (int32_t)ret_slew.get());
                     }
-                    if (stick_err > deadband) {
-                        commanded = apply_lead_limit(capped_desired, debug_actual_pulses, lead);
-                    } else {
-                        commanded = capped_desired;
-                    }
+                    const int32_t stream_from = have_sent_target ?
+                        last_sent_target_pulses : debug_actual_pulses;
+                    commanded = step_toward(stream_from, capped_desired, lead);
                 }
             }
 
