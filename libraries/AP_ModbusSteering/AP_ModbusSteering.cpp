@@ -29,11 +29,12 @@ constexpr uint16_t REG_AUX_CONTROL = 0x0037;
 constexpr uint16_t REG_MOTOR_ENABLE = 0x0038;
 constexpr uint16_t REG_TRIGGER_MODE = 0x0039;
 constexpr uint16_t REG_POS_MODE = 0x003A;
+constexpr uint16_t REG_LOOP_MODE = 0x0050;
 constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
-constexpr uint16_t MOTION_START_ABS = 0x0007;  // start + absolute + interrupt (needs 0x0039=1)
-constexpr uint16_t CL57R_TRACK_ERR_DEFAULT = 8000;
-constexpr uint32_t TRACK_ERR_PAUSE_MS = 300;
+constexpr uint16_t MOTION_START_ABS = 0x0003;  // start + absolute (interrupt via 0x0039)
+constexpr uint16_t CL57R_TRACK_ERR_DEFAULT = 12000;
+constexpr uint32_t TRACK_ERR_PAUSE_MS = 500;
 
 // Позиция: WRITE + READ_POS = 2 шага → 20 Гц при 25 мс на шаг.
 constexpr uint32_t POSITION_LOOP_HZ = 20;
@@ -202,18 +203,19 @@ void AP_ModbusSteering::update(float steering_out)
         INIT_CLEAR_ALARM,  // 1
         INIT_SUBDIVISION,  // 2
         INIT_TRACK_ERR,    // 3
-        INIT_START_SPD,    // 4
-        INIT_MAX_SPD,      // 5
-        INIT_ACCEL,        // 6
-        INIT_DECEL,        // 7
-        INIT_ABS_MODE,     // 8
-        INIT_TRIG_MODE,    // 9
-        RUN_WRITE_POS,     // 10
-        RUN_READ_POS,      // 11
-        RUN_READ_STATUS,   // 12
-        TRACK_CLEAR,       // 13
-        FAULT_RELEASE,     // 14
-        FAULT_LATCHED,     // 15
+        INIT_LOOP_MODE,    // 4
+        INIT_START_SPD,    // 5
+        INIT_MAX_SPD,      // 6
+        INIT_ACCEL,        // 7
+        INIT_DECEL,        // 8
+        INIT_ABS_MODE,     // 9
+        INIT_TRIG_MODE,    // 10
+        RUN_WRITE_POS,     // 11
+        RUN_READ_POS,      // 12
+        RUN_READ_STATUS,   // 13
+        TRACK_CLEAR,       // 14
+        FAULT_RELEASE,     // 15
+        FAULT_LATCHED,     // 16
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
@@ -266,6 +268,8 @@ void AP_ModbusSteering::update(float steering_out)
                         if (current_state == DriveState::INIT_SUBDIVISION && reg == 0x0023)
                             response_received = true;
                         if (current_state == DriveState::INIT_TRACK_ERR && reg == REG_TRACK_ERR)
+                            response_received = true;
+                        if (current_state == DriveState::INIT_LOOP_MODE && reg == REG_LOOP_MODE)
                             response_received = true;
                         if (current_state == DriveState::INIT_START_SPD && reg == 0x0030)
                             response_received = true;
@@ -423,6 +427,9 @@ void AP_ModbusSteering::update(float steering_out)
             current_state = DriveState::INIT_TRACK_ERR;
             break;
         case DriveState::INIT_TRACK_ERR:
+            current_state = DriveState::INIT_LOOP_MODE;
+            break;
+        case DriveState::INIT_LOOP_MODE:
             current_state = DriveState::INIT_START_SPD;
             break;
         case DriveState::INIT_START_SPD:
@@ -521,6 +528,11 @@ void AP_ModbusSteering::update(float steering_out)
         _uart->write(tx_packet, 8);
         break;
 
+    case DriveState::INIT_LOOP_MODE:
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_LOOP_MODE, 0x0001, tx_packet);
+        _uart->write(tx_packet, 8);
+        break;
+
     case DriveState::INIT_START_SPD:
         modbus_create_write_packet((uint8_t)slave_id.get(), 0x0030, (uint16_t)start_speed.get(), tx_packet);
         _uart->write(tx_packet, 8);
@@ -532,12 +544,12 @@ void AP_ModbusSteering::update(float steering_out)
         break;
 
     case DriveState::INIT_ACCEL:
-        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0031, 200, tx_packet);
+        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0031, 400, tx_packet);
         _uart->write(tx_packet, 8);
         break;
 
     case DriveState::INIT_DECEL:
-        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0032, 200, tx_packet);
+        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0032, 400, tx_packet);
         _uart->write(tx_packet, 8);
         break;
 
@@ -572,7 +584,8 @@ void AP_ModbusSteering::update(float steering_out)
                                                 -max_pulses, max_pulses);
 
             const uint32_t full_cycle_ms = POSITION_SEND_INTERVAL_MS * 2;
-            const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
+            int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
+            active_limit = active_limit * 2 / 3;
             int32_t return_limit = active_limit;
             const int32_t param_limit = ret_slew.get();
             if (param_limit > 0) {
@@ -592,7 +605,14 @@ void AP_ModbusSteering::update(float steering_out)
 
             const int32_t follow_err = abs_int32(debug_actual_pulses - capped_desired);
             const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
-            const int32_t move_limit = returning ? return_limit : active_limit;
+            int32_t move_limit = returning ? return_limit : active_limit;
+
+            static int8_t last_stick_sign = 0;
+            const int8_t stick_sign = (capped_desired > deadband) ? 1 : ((capped_desired < -deadband) ? -1 : 0);
+            if (!returning && last_stick_sign != 0 && stick_sign != 0 && stick_sign != last_stick_sign) {
+                move_limit = move_limit / 2;
+            }
+            last_stick_sign = stick_sign;
 
             int32_t commanded;
             if (follow_err > deadband) {
