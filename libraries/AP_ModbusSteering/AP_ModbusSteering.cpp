@@ -44,6 +44,12 @@ constexpr uint32_t STATUS_READ_HZ = 1;
 constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
 
 constexpr float STICK_CENTER_THRESHOLD = 0.05f;
+constexpr uint32_t MODBUS_LINK_TIMEOUT_MS = 2000;
+
+static void modbus_note_link_rx(uint32_t now_ms, uint32_t &link_deadline_ms)
+{
+    link_deadline_ms = now_ms + MODBUS_LINK_TIMEOUT_MS;
+}
 
 static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
 {
@@ -241,7 +247,8 @@ void AP_ModbusSteering::update(float steering_out)
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
-    static uint32_t last_telemetry_rcvd_ms = 0;
+    static uint32_t link_deadline_ms = 0;
+    static bool modbus_link_ok = false;
     static bool response_received = false;
     static int32_t debug_target_pulses = 0;
     static int32_t debug_actual_pulses = 0;
@@ -283,6 +290,8 @@ void AP_ModbusSteering::update(float steering_out)
                     uint16_t received_crc = (local_buf[i + 7] << 8) | local_buf[i + 6];
                     if (modbus_crc16(&local_buf[i], 6) == received_crc)
                     {
+                        modbus_note_link_rx(now, link_deadline_ms);
+
                         if (current_state == DriveState::INIT_ENABLE && reg == REG_MOTOR_ENABLE)
                             response_received = true;
                         if (current_state == DriveState::FAULT_RELEASE && reg == REG_MOTOR_ENABLE)
@@ -332,13 +341,12 @@ void AP_ModbusSteering::update(float steering_out)
 
                         if (have_valid_actual &&
                             abs_int32(actual_position - last_valid_actual) > max_jump) {
-                            response_received = (current_state == DriveState::RUN_READ_POS);
                             break;
                         }
 
                         last_valid_actual = actual_position;
                         have_valid_actual = true;
-                        last_telemetry_rcvd_ms = now;
+                        modbus_note_link_rx(now, link_deadline_ms);
 
                         debug_actual_pulses = actual_position;
                         have_actual_position = true;
@@ -382,7 +390,7 @@ void AP_ModbusSteering::update(float steering_out)
                         const uint16_t status_word = (local_buf[i + 3] << 8) | local_buf[i + 4];
                         const uint16_t error_code = (local_buf[i + 5] << 8) | local_buf[i + 6];
 
-                        last_telemetry_rcvd_ms = now;
+                        modbus_note_link_rx(now, link_deadline_ms);
                         response_received = true;
 
                         if (error_code != last_driver_error_code) {
@@ -422,10 +430,20 @@ void AP_ModbusSteering::update(float steering_out)
         }
     }
 
-    // Защита: Сброс автомата при потере связи в рабочем режиме (таймаут 2 секунды)
-    if (!encoder_fault_latched && current_state >= DriveState::RUN_WRITE_POS && (now - last_telemetry_rcvd_ms) > 2000)
+    // Защита: сброс автомата при потере связи (таймаут 2 с без валидного ответа)
+    if (!encoder_fault_latched &&
+        current_state != DriveState::FAULT_LATCHED &&
+        current_state != DriveState::FAULT_RELEASE &&
+        link_deadline_ms != 0 &&
+        now > link_deadline_ms)
     {
+        if (modbus_link_ok) {
+            gcs().send_text(MAV_SEVERITY_WARNING,
+                            "CL57R: Modbus link lost, re-initializing...");
+            modbus_link_ok = false;
+        }
         current_state = DriveState::INIT_ENABLE;
+        response_received = false;
         last_driver_error_code = 0;
         last_driver_status_word = 0;
         position_cycles_since_status = 0;
@@ -434,7 +452,7 @@ void AP_ModbusSteering::update(float steering_out)
         have_actual_position = false;
         need_position_sync = false;
         have_valid_actual = false;
-        gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
+        link_deadline_ms = now + MODBUS_LINK_TIMEOUT_MS;
     }
 
     // --- БЛОК ОТПРАВКИ КОМАНД ПО ТАЙМЕРУ (позиция 10 Гц, статус 1 Гц) ---
@@ -447,6 +465,9 @@ void AP_ModbusSteering::update(float steering_out)
         return;
     }
     _last_send_ms = now;
+    if (link_deadline_ms == 0) {
+        link_deadline_ms = now + MODBUS_LINK_TIMEOUT_MS;
+    }
     uint8_t tx_packet[16]; // Задан фиксированный размер массива на стеке
 
     // Продвигаем конечный автомат вперед
@@ -484,14 +505,20 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         case DriveState::INIT_TRIG_MODE:
             current_state = DriveState::RUN_READ_POS;
-            last_telemetry_rcvd_ms = now;
             position_cycles_since_status = 0;
             last_sent_target_pulses = 0;
             have_sent_target = false;
             have_actual_position = false;
             need_position_sync = true;
             have_valid_actual = false;
-            gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
+            modbus_note_link_rx(now, link_deadline_ms);
+            if (!modbus_link_ok) {
+                gcs().send_text(MAV_SEVERITY_INFO,
+                                "CL57R: Modbus link restored, driver ready");
+            } else {
+                gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
+            }
+            modbus_link_ok = true;
             break;
         case DriveState::RUN_WRITE_POS:
             current_state = DriveState::RUN_READ_POS;
