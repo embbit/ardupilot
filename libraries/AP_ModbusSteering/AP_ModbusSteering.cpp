@@ -679,32 +679,25 @@ void AP_ModbusSteering::update(float steering_out)
                                               debug_actual_pulses > max_pulses - brake_zone;
                     const bool approach_neg = capped_desired < debug_actual_pulses &&
                                               debug_actual_pulses < -max_pulses + brake_zone;
-
-                    if (approach_pos) {
-                        int32_t step = active_limit;
-                        if (debug_actual_pulses > max_pulses - active_limit * 3) {
-                            step = MAX(active_limit / 2, 1);
-                        }
-                        capped_desired = MIN(capped_desired, debug_actual_pulses + step);
-                    } else if (approach_neg) {
-                        int32_t step = active_limit;
-                        if (debug_actual_pulses < -max_pulses + active_limit * 3) {
-                            step = MAX(active_limit / 2, 1);
-                        }
-                        capped_desired = MAX(capped_desired, debug_actual_pulses - step);
-                    }
-
                     const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
+                    const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - active_limit * 4;
+
                     if (past_limit) {
                         const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                        const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 4);
+                        const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 8);
                         if (debug_actual_pulses > 0) {
                             commanded = debug_actual_pulses - pull;
-                            commanded = MIN(commanded, max_pulses - active_limit);
+                            commanded = MAX(commanded, max_pulses - active_limit);
                         } else {
                             commanded = debug_actual_pulses + pull;
-                            commanded = MAX(commanded, -max_pulses + active_limit);
+                            commanded = MIN(commanded, -max_pulses + active_limit);
                         }
+                    } else if (near_limit || approach_pos || approach_neg) {
+                        int32_t step = active_limit;
+                        if (abs_int32(debug_actual_pulses) > max_pulses - active_limit * 3) {
+                            step = MAX(active_limit / 2, 1);
+                        }
+                        commanded = step_toward(debug_actual_pulses, capped_desired, step);
                     } else if (returning && ret_slew.get() > 0) {
                         commanded = step_toward(debug_actual_pulses, capped_desired,
                                                 (int32_t)ret_slew.get());
@@ -713,7 +706,15 @@ void AP_ModbusSteering::update(float steering_out)
                     }
                 }
 
-                commanded = clamp_int32(commanded, -max_pulses, max_pulses);
+                if (abs_int32(debug_actual_pulses) <= max_pulses) {
+                    commanded = clamp_int32(commanded, -max_pulses, max_pulses);
+                } else if (debug_actual_pulses > max_pulses) {
+                    commanded = MIN(commanded, debug_actual_pulses);
+                    commanded = MAX(commanded, max_pulses - active_limit);
+                } else {
+                    commanded = MAX(commanded, debug_actual_pulses);
+                    commanded = MIN(commanded, -max_pulses + active_limit);
+                }
 
                 static bool soft_limit_warned = false;
                 if (abs_int32(debug_actual_pulses) > max_pulses) {
@@ -733,10 +734,13 @@ void AP_ModbusSteering::update(float steering_out)
                 debug_target_pulses = commanded;
 
                 const bool past_limit_now = abs_int32(debug_actual_pulses) > max_pulses;
+                const bool near_limit_now = abs_int32(debug_actual_pulses) >
+                    max_pulses - active_limit * 4;
                 const bool should_send = just_synced ||
                                          !have_sent_target ||
                                          commanded != last_sent_target_pulses ||
                                          past_limit_now ||
+                                         near_limit_now ||
                                          (!returning &&
                                           abs_int32(debug_actual_pulses - commanded) > deadband);
 
