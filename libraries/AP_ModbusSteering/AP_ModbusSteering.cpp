@@ -33,6 +33,22 @@ constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / (POSITION_LOOP_HZ * 2);
 constexpr uint32_t STATUS_READ_HZ = 1;
 constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
 
+static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
+{
+    if (value < min_val) {
+        return min_val;
+    }
+    if (value > max_val) {
+        return max_val;
+    }
+    return value;
+}
+
+static int32_t abs_int32(int32_t value)
+{
+    return (value >= 0) ? value : -value;
+}
+
 const char *cl57r_error_str(uint16_t code)
 {
     switch (code) {
@@ -86,7 +102,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: POS_DB
     // @DisplayName: Position Deadband
-    // @Description: Подавление дрожания: цель со стика привязывается к последней отправленной команде, если отличие меньше этого порога. Не блокирует движение при заметном сдвиге стика.
+    // @Description: Подавление дрожания: команда не отправляется повторно, если изменение меньше порога. Также задаёт минимальный шаг slew-rate (не меньше MAX_STEPS/8 за цикл).
     // @Units: pulses
     // @Range: 0 8000
     // @User: Standard
@@ -143,6 +159,7 @@ void AP_ModbusSteering::update(float steering_out)
     static uint8_t position_cycles_since_status = 0;
     static int32_t last_sent_target_pulses = 0;
     static bool have_sent_target = false;
+    static bool position_fault = false;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -207,6 +224,19 @@ void AP_ModbusSteering::update(float steering_out)
                         response_received = true;
 
                         debug_actual_pulses = actual_position;
+
+                        const int32_t max_pulses = max_steps.get();
+                        const int32_t fault_limit = max_pulses + (max_pulses / 2);
+                        if (abs_int32(actual_position) > fault_limit) {
+                            if (!position_fault) {
+                                position_fault = true;
+                                gcs().send_text(MAV_SEVERITY_CRITICAL,
+                                                "CL57R: encoder %ld out of range (+/-%ld), hold commands",
+                                                (long)actual_position,
+                                                (long)fault_limit);
+                            }
+                        }
+
                         gcs().send_debug_vect("STEER",
                                               (float)debug_actual_pulses,
                                               (float)debug_target_pulses,
@@ -270,6 +300,7 @@ void AP_ModbusSteering::update(float steering_out)
         position_cycles_since_status = 0;
         last_sent_target_pulses = 0;
         have_sent_target = false;
+        position_fault = false;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
@@ -315,6 +346,7 @@ void AP_ModbusSteering::update(float steering_out)
             position_cycles_since_status = 0;
             last_sent_target_pulses = 0;
             have_sent_target = false;
+            position_fault = false;
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
@@ -374,35 +406,45 @@ void AP_ModbusSteering::update(float steering_out)
         break;
 
          case DriveState::RUN_WRITE_POS: {
+            if (position_fault) {
+                current_state = DriveState::RUN_READ_POS;
+                break;
+            }
+
             float clean_steering = steering_out;
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
             if (clean_steering < -1.0f) clean_steering = -1.0f;
 
             const int32_t max_pulses = max_steps.get();
-            int32_t target_pulses = (int32_t)(clean_steering * (float)max_pulses);
-
             const int32_t deadband = pos_db.get();
-            if (have_sent_target && deadband > 0) {
-                const int32_t delta = target_pulses - last_sent_target_pulses;
-                const int32_t abs_delta = (delta >= 0) ? delta : -delta;
-                if (abs_delta <= deadband) {
-                    target_pulses = last_sent_target_pulses;
+            const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
+                                                -max_pulses, max_pulses);
+
+            int32_t commanded = desired;
+            if (have_sent_target) {
+                const int32_t slew_limit = MAX(deadband, max_pulses / 8);
+                const int32_t delta = desired - last_sent_target_pulses;
+                if (delta > slew_limit) {
+                    commanded = last_sent_target_pulses + slew_limit;
+                } else if (delta < -slew_limit) {
+                    commanded = last_sent_target_pulses - slew_limit;
                 }
             }
 
-            debug_target_pulses = target_pulses;
+            debug_target_pulses = commanded;
 
-            const bool should_send = !have_sent_target || (target_pulses != last_sent_target_pulses);
+            const bool should_send = !have_sent_target ||
+                                     (abs_int32(commanded - last_sent_target_pulses) > deadband);
 
             if (should_send) {
                 uint16_t values[3];
-                values[0] = (uint16_t)((target_pulses >> 16) & 0xFFFF);
-                values[1] = (uint16_t)(target_pulses & 0xFFFF);
+                values[0] = (uint16_t)((commanded >> 16) & 0xFFFF);
+                values[1] = (uint16_t)(commanded & 0xFFFF);
                 values[2] = 0x0007;
 
                 modbus_create_write_multiple_packet((uint8_t)slave_id.get(), 0x0034, 3, values, tx_packet);
                 _uart->write(tx_packet, 15);
-                last_sent_target_pulses = target_pulses;
+                last_sent_target_pulses = commanded;
                 have_sent_target = true;
             }
 
