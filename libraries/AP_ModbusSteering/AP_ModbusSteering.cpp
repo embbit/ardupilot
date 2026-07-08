@@ -676,30 +676,9 @@ void AP_ModbusSteering::update(float steering_out)
                     capped_desired = MAX(capped_desired, -max_pulses + active_limit);
                 }
 
-                const int32_t approach_margin = active_limit * 3;
-                if (capped_desired > max_pulses - approach_margin) {
-                    capped_desired = MIN(capped_desired, max_pulses - approach_margin);
-                }
-                if (capped_desired < -max_pulses + approach_margin) {
-                    capped_desired = MAX(capped_desired, -max_pulses + approach_margin);
-                }
-
-                const int32_t follow_err_inner = abs_int32(debug_actual_pulses - capped_desired);
-                const int32_t settle_zone = deadband * 8;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
                 const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
                                         abs_int32(capped_desired) > max_pulses - brake_zone;
-                const bool approaching_limit = (capped_desired > 0 &&
-                                                capped_desired >= max_pulses - brake_zone) ||
-                                               (capped_desired < 0 &&
-                                                capped_desired <= -max_pulses + brake_zone);
-
-                static int8_t last_desired_sign = 0;
-                const int8_t desired_sign = (capped_desired > deadband) ? 1 :
-                                            ((capped_desired < -deadband) ? -1 : 0);
-                const bool reversed = !returning && last_desired_sign != 0 && desired_sign != 0 &&
-                                      desired_sign != last_desired_sign;
-                last_desired_sign = desired_sign;
 
                 if (past_limit) {
                     const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
@@ -708,20 +687,10 @@ void AP_ModbusSteering::update(float steering_out)
                         (max_pulses - active_limit) : (-max_pulses + active_limit);
                     commanded = step_toward(debug_actual_pulses, pull_target, pull_step);
                 } else if (returning) {
-                    if (follow_err_inner > settle_zone) {
-                        commanded = step_toward(debug_actual_pulses, capped_desired, return_limit);
-                    } else if (follow_err_inner > deadband) {
-                        const int32_t fine_limit = MAX(follow_err_inner / 2, deadband);
-                        commanded = step_toward(debug_actual_pulses, capped_desired, fine_limit);
-                    } else {
-                        commanded = capped_desired;
-                    }
-                } else if (reversed || near_limit || approaching_limit) {
-                    const int32_t brake_move_limit = MAX(active_limit / 2, 1);
-                    commanded = step_toward(debug_actual_pulses, capped_desired, brake_move_limit);
-                    commanded = apply_lead_limit(commanded, debug_actual_pulses, brake_move_limit);
+                    commanded = step_toward(debug_actual_pulses, capped_desired, return_limit);
                 } else {
-                    commanded = capped_desired;
+                    const int32_t lead = near_limit ? MAX(active_limit / 2, 1) : active_limit;
+                    commanded = apply_lead_limit(capped_desired, debug_actual_pulses, lead);
                 }
             }
 
