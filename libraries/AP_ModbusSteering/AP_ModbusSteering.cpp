@@ -19,7 +19,7 @@ extern "C"
 
 extern const AP_HAL::HAL &hal;
 
-constexpr int32_t STEPPER_MICROSTEP = 4000;
+constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 
 namespace {
 constexpr uint16_t REG_STATUS_WORD = 0x0003;
@@ -37,9 +37,6 @@ constexpr uint32_t STATUS_READ_HZ = 1;
 constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
 
 constexpr float STICK_CENTER_THRESHOLD = 0.05f;
-
-// Должно совпадать с INIT_SUBDIVISION (регистр 0x0023)
-constexpr int32_t STEPPER_MICROSTEP = 4000;
 
 static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
 {
@@ -77,7 +74,7 @@ const char *cl57r_error_str(uint16_t code)
 int32_t AP_ModbusSteering::travel_limit_pulses() const
 {
     if (out_rev.get() > 0 && ratio.get() > 0) {
-        return (int32_t)out_rev.get() * ratio.get() * STEPPER_MICROSTEP / 2;
+        return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV / 2;
     }
     return max_steps.get();
 }
