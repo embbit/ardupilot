@@ -236,8 +236,14 @@ void AP_ModbusSteering::update(float steering_out)
                             last_driver_error_code = error_code;
                         }
 
-                        gcs().send_named_float("STR_STA", (float)status_word);
-                        gcs().send_named_float("STR_ERR", (float)error_code);
+                        if (status_word != last_driver_status_word) {
+                            gcs().send_text(MAV_SEVERITY_INFO,
+                                            "CL57R: status 0x%04X (alarm=%u enabled=%u)",
+                                            status_word,
+                                            (unsigned)((status_word >> 3) & 1),
+                                            (unsigned)((status_word >> 4) & 1));
+                            last_driver_status_word = status_word;
+                        }
                         break;
                     }
                 }
@@ -250,6 +256,7 @@ void AP_ModbusSteering::update(float steering_out)
     {
         current_state = DriveState::INIT_ENABLE;
         last_driver_error_code = 0;
+        last_driver_status_word = 0;
         position_cycles_since_status = 0;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
