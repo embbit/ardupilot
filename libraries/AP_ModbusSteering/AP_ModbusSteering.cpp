@@ -43,7 +43,7 @@ constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / POSITION_LOOP_HZ;
 constexpr uint8_t STATUS_READ_EVERY_N_READS = 10;
 
 constexpr float STICK_CENTER_THRESHOLD = 0.05f;
-constexpr uint32_t MODBUS_LINK_TIMEOUT_MS = 2000;
+constexpr uint32_t MODBUS_LINK_TIMEOUT_MS = 3000;
 
 static void modbus_note_link_rx(uint32_t now_ms, uint32_t &link_deadline_ms)
 {
@@ -252,7 +252,6 @@ void AP_ModbusSteering::update(float steering_out)
     static uint8_t run_status_div = 0;
     static bool expecting_status_read = false;
     static bool run_phase_write = true;
-    static int8_t last_stick_sign = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -461,7 +460,6 @@ void AP_ModbusSteering::update(float steering_out)
         need_position_sync = false;
         have_valid_actual = false;
         run_phase_write = true;
-        last_stick_sign = 0;
         link_deadline_ms = now + MODBUS_LINK_TIMEOUT_MS;
     }
 
@@ -522,7 +520,6 @@ void AP_ModbusSteering::update(float steering_out)
             have_valid_actual = false;
             run_status_div = 0;
             run_phase_write = true;
-            last_stick_sign = 0;
             modbus_note_link_rx(now, link_deadline_ms);
             if (!modbus_link_ok) {
                 gcs().send_text(MAV_SEVERITY_INFO,
@@ -650,6 +647,12 @@ void AP_ModbusSteering::update(float steering_out)
                 if (clean_steering > 1.0f)  clean_steering = 1.0f;
                 if (clean_steering < -1.0f) clean_steering = -1.0f;
 
+                if (fabsf(clean_steering) > STICK_CENTER_THRESHOLD &&
+                    now < tracking_pause_until_ms) {
+                    tracking_pause_until_ms = 0;
+                    need_position_sync = true;
+                }
+
                 const int32_t max_pulses = travel_limit_pulses();
                 const int32_t deadband = pos_db.get();
                 const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
@@ -666,47 +669,41 @@ void AP_ModbusSteering::update(float steering_out)
                     commanded = debug_actual_pulses;
                     need_position_sync = false;
                     just_synced = true;
-                    last_stick_sign = 0;
                 } else {
                     int32_t capped_desired = desired;
 
                     const int32_t brake_zone = brake_zone_pulses((uint16_t)max_speed.get(),
                                                                  active_limit,
                                                                  max_pulses);
-                    if (capped_desired > max_pulses - brake_zone) {
+                    if (debug_actual_pulses > max_pulses - brake_zone &&
+                        capped_desired > debug_actual_pulses) {
                         capped_desired = MIN(capped_desired, max_pulses - active_limit);
                     }
-                    if (capped_desired < -max_pulses + brake_zone) {
+                    if (debug_actual_pulses < -max_pulses + brake_zone &&
+                        capped_desired < debug_actual_pulses) {
                         capped_desired = MAX(capped_desired, -max_pulses + active_limit);
                     }
 
                     const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
-                    const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
-                                            abs_int32(capped_desired) > max_pulses - brake_zone;
-
-                    const int8_t stick_sign = (capped_desired > deadband) ? 1 :
-                                              ((capped_desired < -deadband) ? -1 : 0);
-                    if (stick_sign != 0 && last_stick_sign != 0 && stick_sign != last_stick_sign) {
-                        last_sent_target_pulses = debug_actual_pulses;
-                        have_sent_target = true;
-                    }
-                    last_stick_sign = stick_sign;
-
-                    const int32_t stream_from = have_sent_target ?
-                        last_sent_target_pulses : debug_actual_pulses;
-                    int32_t lead = near_limit ? MAX(active_limit / 2, 1) : active_limit;
-                    if (returning && ret_slew.get() > 0) {
-                        lead = MIN(lead, (int32_t)ret_slew.get());
-                    }
-
                     if (past_limit) {
-                        const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                        const int32_t pull_step = MIN(overshoot, active_limit * 4);
-                        const int32_t pull_target = (debug_actual_pulses > 0) ?
-                            (max_pulses - active_limit) : (-max_pulses + active_limit);
-                        commanded = step_toward(stream_from, pull_target, pull_step);
+                        const bool moving_out = (debug_actual_pulses > 0 &&
+                                                 capped_desired > debug_actual_pulses) ||
+                                                (debug_actual_pulses < 0 &&
+                                                 capped_desired < debug_actual_pulses);
+                        if (moving_out) {
+                            if (debug_actual_pulses > 0) {
+                                commanded = debug_actual_pulses - active_limit;
+                            } else {
+                                commanded = debug_actual_pulses + active_limit;
+                            }
+                        } else {
+                            commanded = capped_desired;
+                        }
+                    } else if (returning && ret_slew.get() > 0) {
+                        commanded = step_toward(debug_actual_pulses, capped_desired,
+                                                (int32_t)ret_slew.get());
                     } else {
-                        commanded = step_toward(stream_from, capped_desired, lead);
+                        commanded = capped_desired;
                     }
                 }
 
@@ -731,7 +728,9 @@ void AP_ModbusSteering::update(float steering_out)
 
                 const bool should_send = just_synced ||
                                          !have_sent_target ||
-                                         commanded != last_sent_target_pulses;
+                                         commanded != last_sent_target_pulses ||
+                                         (!returning &&
+                                          abs_int32(debug_actual_pulses - commanded) > deadband);
 
                 if (should_send) {
                     uint16_t values[3];
