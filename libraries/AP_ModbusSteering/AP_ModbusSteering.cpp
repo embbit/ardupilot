@@ -516,6 +516,8 @@ void AP_ModbusSteering::update(float steering_out)
         case DriveState::TRACK_CLEAR:
             current_state = DriveState::RUN_ACTIVE;
             break;
+        case DriveState::RUN_ACTIVE:
+            break;
         case DriveState::FAULT_RELEASE:
             current_state = DriveState::FAULT_LATCHED;
             break;
