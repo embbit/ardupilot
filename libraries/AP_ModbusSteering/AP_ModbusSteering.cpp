@@ -39,8 +39,6 @@ constexpr uint32_t POSITION_SEND_INTERVAL_MS = 1000 / (POSITION_LOOP_HZ * 2);
 constexpr uint32_t STATUS_READ_HZ = 1;
 constexpr uint8_t STATUS_READ_EVERY_N_CYCLES = POSITION_LOOP_HZ / STATUS_READ_HZ;
 
-constexpr float STICK_CENTER_THRESHOLD = 0.05f;
-
 static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
 {
     if (value < min_val) {
@@ -55,6 +53,24 @@ static int32_t clamp_int32(int32_t value, int32_t min_val, int32_t max_val)
 static int32_t abs_int32(int32_t value)
 {
     return (value >= 0) ? value : -value;
+}
+
+static int32_t speed_move_limit_pulses(uint16_t rpm, uint32_t cycle_ms)
+{
+    const int32_t pulses_per_sec = (int32_t)rpm * CL57R_STEPS_PER_REV / 60;
+    return MAX(pulses_per_sec * (int32_t)cycle_ms / 1000, 1);
+}
+
+static int32_t step_toward(int32_t actual, int32_t target, int32_t max_step)
+{
+    const int32_t delta = target - actual;
+    if (delta > max_step) {
+        return actual + max_step;
+    }
+    if (delta < -max_step) {
+        return actual - max_step;
+    }
+    return target;
 }
 
 const char *cl57r_error_str(uint16_t code)
@@ -492,23 +508,20 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                 -max_pulses, max_pulses);
 
-            int32_t commanded = desired;
-            const int32_t ret_slew_limit = ret_slew.get();
-            const int32_t move_limit = (ret_slew_limit > 0) ? ret_slew_limit : (max_pulses / 32);
+            const uint32_t full_cycle_ms = POSITION_SEND_INTERVAL_MS * 2;
+            int32_t move_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
+            move_limit = move_limit * 3 / 4;
+            const int32_t param_limit = ret_slew.get();
+            if (param_limit > 0 && param_limit < move_limit) {
+                move_limit = param_limit;
+            }
 
-            if (have_sent_target) {
-                int32_t delta = desired - last_sent_target_pulses;
-                const bool far_from_center = abs_int32(debug_actual_pulses) > max_pulses;
-                const bool large_move = abs_int32(delta) > move_limit;
-                const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
-
-                if (far_from_center || large_move || returning) {
-                    if (delta > move_limit) {
-                        commanded = last_sent_target_pulses + move_limit;
-                    } else if (delta < -move_limit) {
-                        commanded = last_sent_target_pulses - move_limit;
-                    }
-                }
+            const int32_t follow_err = abs_int32(debug_actual_pulses - desired);
+            int32_t commanded;
+            if (follow_err > deadband) {
+                commanded = step_toward(debug_actual_pulses, desired, move_limit);
+            } else {
+                commanded = desired;
             }
 
             commanded = clamp_int32(commanded, -max_pulses, max_pulses);
@@ -538,7 +551,8 @@ void AP_ModbusSteering::update(float steering_out)
             debug_target_pulses = commanded;
 
             const bool should_send = !have_sent_target ||
-                                     (abs_int32(commanded - last_sent_target_pulses) > deadband);
+                                     (abs_int32(commanded - last_sent_target_pulses) > deadband) ||
+                                     (follow_err > deadband);
 
             if (should_send) {
                 uint16_t values[3];
