@@ -187,6 +187,13 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("RATIO", 9, AP_ModbusSteering, ratio, 25),
 
+    // @Param: INV
+    // @DisplayName: Invert Stick Sign
+    // @Description: Инвертировать знак стика относительно энкодера. 1 = стик влево уменьшает импульсы.
+    // @Values: 0:Normal,1:Inverted
+    // @User: Standard
+    AP_GROUPINFO("INV", 10, AP_ModbusSteering, invert, 1),
+
     AP_GROUPEND};
 
 AP_ModbusSteering::AP_ModbusSteering()
@@ -251,6 +258,7 @@ void AP_ModbusSteering::update(float steering_out)
     static bool have_valid_actual = false;
     static uint8_t run_status_div = 0;
     static bool expecting_status_read = false;
+    static bool pending_encoder_read = false;
     static bool run_phase_write = true;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
@@ -328,7 +336,7 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 2. Парсинг позиции энкодера (0x0007-0x0008, функция 0x03, 9 байт)
-        if (((current_state == DriveState::RUN_ACTIVE && !expecting_status_read) ||
+        if (((current_state == DriveState::RUN_ACTIVE && pending_encoder_read) ||
              current_state == DriveState::FAULT_LATCHED) && available_bytes >= 9)
         {
             for (uint32_t i = 0; i <= available_bytes - 9; i++)
@@ -373,6 +381,7 @@ void AP_ModbusSteering::update(float steering_out)
                         }
 
                         response_received = false;
+                        pending_encoder_read = false;
 
                         gcs().send_debug_vect("STEER",
                                               (float)debug_actual_pulses,
@@ -399,6 +408,7 @@ void AP_ModbusSteering::update(float steering_out)
 
                         modbus_note_link_rx(now, link_deadline_ms);
                         expecting_status_read = false;
+                        pending_encoder_read = false;
                         response_received = false;
 
                         if (error_code != last_driver_error_code) {
@@ -454,6 +464,7 @@ void AP_ModbusSteering::update(float steering_out)
         last_driver_status_word = 0;
         run_status_div = 0;
         expecting_status_read = false;
+        pending_encoder_read = false;
         last_sent_target_pulses = 0;
         have_sent_target = false;
         have_actual_position = false;
@@ -520,6 +531,7 @@ void AP_ModbusSteering::update(float steering_out)
             have_valid_actual = false;
             run_status_div = 0;
             run_phase_write = true;
+            pending_encoder_read = false;
             modbus_note_link_rx(now, link_deadline_ms);
             if (!modbus_link_ok) {
                 gcs().send_text(MAV_SEVERITY_INFO,
@@ -633,6 +645,7 @@ void AP_ModbusSteering::update(float steering_out)
                 if (!have_actual_position) {
                     run_phase_write = true;
                     expecting_status_read = false;
+                    pending_encoder_read = true;
                     modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
                     _uart->write(tx_packet, 8);
                     break;
@@ -646,6 +659,16 @@ void AP_ModbusSteering::update(float steering_out)
                 float clean_steering = steering_out;
                 if (clean_steering > 1.0f)  clean_steering = 1.0f;
                 if (clean_steering < -1.0f) clean_steering = -1.0f;
+                if (invert.get() != 0) {
+                    clean_steering = -clean_steering;
+                }
+
+                static bool was_returning = true;
+                const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
+                if (was_returning && !returning) {
+                    need_position_sync = true;
+                }
+                was_returning = returning;
 
                 if (fabsf(clean_steering) > STICK_CENTER_THRESHOLD &&
                     now < tracking_pause_until_ms) {
@@ -663,7 +686,6 @@ void AP_ModbusSteering::update(float steering_out)
 
                 bool just_synced = false;
                 int32_t commanded;
-                const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
 
                 if (need_position_sync) {
                     commanded = debug_actual_pulses;
@@ -681,8 +703,18 @@ void AP_ModbusSteering::update(float steering_out)
                                               debug_actual_pulses < -max_pulses + brake_zone;
                     const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
                     const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - active_limit * 4;
+                    const int32_t emergency_limit = max_pulses + max_pulses / 4;
 
-                    if (past_limit) {
+                    if (abs_int32(debug_actual_pulses) > emergency_limit) {
+                        const int32_t pull = active_limit * 8;
+                        if (debug_actual_pulses > 0) {
+                            commanded = debug_actual_pulses - pull;
+                            commanded = MAX(commanded, max_pulses - active_limit);
+                        } else {
+                            commanded = debug_actual_pulses + pull;
+                            commanded = MIN(commanded, -max_pulses + active_limit);
+                        }
+                    } else if (past_limit) {
                         const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
                         const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 8);
                         if (debug_actual_pulses > 0) {
@@ -761,9 +793,11 @@ void AP_ModbusSteering::update(float steering_out)
                 if (run_status_div >= STATUS_READ_EVERY_N_READS) {
                     run_status_div = 0;
                     expecting_status_read = true;
+                    pending_encoder_read = false;
                     modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
                 } else {
                     expecting_status_read = false;
+                    pending_encoder_read = true;
                     modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
                 }
                 _uart->write(tx_packet, 8);

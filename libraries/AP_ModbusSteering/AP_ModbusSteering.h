@@ -31,6 +31,7 @@ private:
     AP_Int32 ret_slew;
     AP_Int8  out_rev;
     AP_Int16 ratio;
+    AP_Int8  invert;
 
     int32_t travel_limit_pulses() const;
 };
