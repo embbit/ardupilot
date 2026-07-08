@@ -24,9 +24,12 @@ constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 namespace {
 constexpr uint16_t REG_STATUS_WORD = 0x0003;
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
+constexpr uint16_t REG_MOTION_CTRL = 0x0036;
 constexpr uint16_t REG_AUX_CONTROL = 0x0037;
 constexpr uint16_t REG_MOTOR_ENABLE = 0x0038;
+constexpr uint16_t REG_POS_MODE = 0x003A;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
+constexpr uint16_t MOTION_START_ABS = 0x0003;  // bit0=start, bit1=absolute (no interrupt)
 
 // Позиция: WRITE + READ_POS = 2 шага → 10 Гц при 50 мс на шаг.
 constexpr uint32_t POSITION_LOOP_HZ = 10;
@@ -180,10 +183,12 @@ void AP_ModbusSteering::update(float steering_out)
         INIT_MAX_SPD,      // 4
         INIT_ACCEL,        // 5
         INIT_DECEL,        // 6
-        RUN_WRITE_POS,     // 7
-        RUN_READ_POS,      // 8
-        RUN_READ_STATUS,   // 9
-        FAULT_RELEASE,     // 10
+        INIT_ABS_MODE,     // 7
+        RUN_WRITE_POS,     // 8
+        RUN_READ_POS,      // 9
+        RUN_READ_STATUS,   // 10
+        FAULT_RELEASE,     // 11
+        FAULT_LATCHED,     // 12
     };
 
     static DriveState current_state = DriveState::INIT_ENABLE;
@@ -196,7 +201,7 @@ void AP_ModbusSteering::update(float steering_out)
     static uint8_t position_cycles_since_status = 0;
     static int32_t last_sent_target_pulses = 0;
     static bool have_sent_target = false;
-    static bool position_fault = false;
+    static bool encoder_fault_latched = false;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -238,6 +243,8 @@ void AP_ModbusSteering::update(float steering_out)
                             response_received = true;
                         if (current_state == DriveState::INIT_DECEL && reg == 0x0032)
                             response_received = true;
+                        if (current_state == DriveState::INIT_ABS_MODE && reg == REG_POS_MODE)
+                            response_received = true;
                         break;
                     }
                 }
@@ -245,7 +252,7 @@ void AP_ModbusSteering::update(float steering_out)
         }
 
         // 2. Парсинг позиции энкодера (0x0007-0x0008, функция 0x03, 9 байт)
-        if (current_state == DriveState::RUN_READ_POS && available_bytes >= 9)
+        if ((current_state == DriveState::RUN_READ_POS || current_state == DriveState::FAULT_LATCHED) && available_bytes >= 9)
         {
             for (uint32_t i = 0; i <= available_bytes - 9; i++)
             {
@@ -266,18 +273,18 @@ void AP_ModbusSteering::update(float steering_out)
                         const int32_t max_pulses = travel_limit_pulses();
                         const int32_t fault_limit = max_pulses + (max_pulses / 2);
                         if (abs_int32(actual_position) > fault_limit) {
-                            if (!position_fault) {
-                                position_fault = true;
+                            if (!encoder_fault_latched) {
+                                encoder_fault_latched = true;
                                 current_state = DriveState::FAULT_RELEASE;
                                 gcs().send_text(MAV_SEVERITY_CRITICAL,
-                                                "CL57R: encoder %ld out of range (+/-%ld), reinit",
+                                                "CL57R: encoder %ld out of range (+/-%ld), latched",
                                                 (long)actual_position,
                                                 (long)fault_limit);
                             }
                             break;
                         }
 
-                        response_received = true;
+                        response_received = (current_state == DriveState::RUN_READ_POS);
 
                         gcs().send_debug_vect("STEER",
                                               (float)debug_actual_pulses,
@@ -334,7 +341,7 @@ void AP_ModbusSteering::update(float steering_out)
     }
 
     // Защита: Сброс автомата при потере связи в рабочем режиме (таймаут 2 секунды)
-    if (current_state >= DriveState::RUN_WRITE_POS && (now - last_telemetry_rcvd_ms) > 2000)
+    if (!encoder_fault_latched && current_state >= DriveState::RUN_WRITE_POS && (now - last_telemetry_rcvd_ms) > 2000)
     {
         current_state = DriveState::INIT_ENABLE;
         last_driver_error_code = 0;
@@ -342,7 +349,6 @@ void AP_ModbusSteering::update(float steering_out)
         position_cycles_since_status = 0;
         last_sent_target_pulses = 0;
         have_sent_target = false;
-        position_fault = false;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
@@ -383,12 +389,14 @@ void AP_ModbusSteering::update(float steering_out)
             current_state = DriveState::INIT_DECEL;
             break;
         case DriveState::INIT_DECEL:
+            current_state = DriveState::INIT_ABS_MODE;
+            break;
+        case DriveState::INIT_ABS_MODE:
             current_state = DriveState::RUN_WRITE_POS;
             last_telemetry_rcvd_ms = now;
             position_cycles_since_status = 0;
             last_sent_target_pulses = 0;
             have_sent_target = false;
-            position_fault = false;
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
@@ -407,7 +415,9 @@ void AP_ModbusSteering::update(float steering_out)
             current_state = DriveState::RUN_WRITE_POS;
             break;
         case DriveState::FAULT_RELEASE:
-            current_state = DriveState::INIT_ENABLE;
+            current_state = DriveState::FAULT_LATCHED;
+            break;
+        case DriveState::FAULT_LATCHED:
             break;
         }
     }
@@ -425,7 +435,11 @@ void AP_ModbusSteering::update(float steering_out)
         _uart->write(tx_packet, 8);
         have_sent_target = false;
         last_sent_target_pulses = 0;
-        position_fault = false;
+        break;
+
+    case DriveState::FAULT_LATCHED:
+        modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+        _uart->write(tx_packet, 8);
         break;
 
     case DriveState::INIT_CLEAR_ALARM:
@@ -458,7 +472,17 @@ void AP_ModbusSteering::update(float steering_out)
         _uart->write(tx_packet, 8);
         break;
 
+    case DriveState::INIT_ABS_MODE:
+        modbus_create_write_packet((uint8_t)slave_id.get(), REG_POS_MODE, 0x0001, tx_packet);
+        _uart->write(tx_packet, 8);
+        break;
+
          case DriveState::RUN_WRITE_POS: {
+            if (encoder_fault_latched) {
+                current_state = DriveState::FAULT_LATCHED;
+                break;
+            }
+
             float clean_steering = steering_out;
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
             if (clean_steering < -1.0f) clean_steering = -1.0f;
@@ -470,13 +494,45 @@ void AP_ModbusSteering::update(float steering_out)
 
             int32_t commanded = desired;
             const int32_t ret_slew_limit = ret_slew.get();
-            if (have_sent_target && ret_slew_limit > 0 && fabsf(clean_steering) < STICK_CENTER_THRESHOLD) {
-                const int32_t delta = desired - last_sent_target_pulses;
-                if (delta > ret_slew_limit) {
-                    commanded = last_sent_target_pulses + ret_slew_limit;
-                } else if (delta < -ret_slew_limit) {
-                    commanded = last_sent_target_pulses - ret_slew_limit;
+            const int32_t move_limit = (ret_slew_limit > 0) ? ret_slew_limit : (max_pulses / 32);
+
+            if (have_sent_target) {
+                int32_t delta = desired - last_sent_target_pulses;
+                const bool far_from_center = abs_int32(debug_actual_pulses) > max_pulses;
+                const bool large_move = abs_int32(delta) > move_limit;
+                const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
+
+                if (far_from_center || large_move || returning) {
+                    if (delta > move_limit) {
+                        commanded = last_sent_target_pulses + move_limit;
+                    } else if (delta < -move_limit) {
+                        commanded = last_sent_target_pulses - move_limit;
+                    }
                 }
+            }
+
+            commanded = clamp_int32(commanded, -max_pulses, max_pulses);
+
+            static bool soft_limit_warned = false;
+            if (abs_int32(debug_actual_pulses) > max_pulses) {
+                if (!soft_limit_warned) {
+                    gcs().send_text(MAV_SEVERITY_WARNING,
+                                    "CL57R: travel limit exceeded (%ld), pulling back",
+                                    (long)debug_actual_pulses);
+                    soft_limit_warned = true;
+                }
+                const bool moving_out = (debug_actual_pulses > 0 && commanded > debug_actual_pulses) ||
+                                        (debug_actual_pulses < 0 && commanded < debug_actual_pulses);
+                if (moving_out) {
+                    if (debug_actual_pulses > 0) {
+                        commanded = debug_actual_pulses - move_limit;
+                    } else {
+                        commanded = debug_actual_pulses + move_limit;
+                    }
+                    commanded = clamp_int32(commanded, -max_pulses, max_pulses);
+                }
+            } else {
+                soft_limit_warned = false;
             }
 
             debug_target_pulses = commanded;
@@ -488,7 +544,7 @@ void AP_ModbusSteering::update(float steering_out)
                 uint16_t values[3];
                 values[0] = (uint16_t)((commanded >> 16) & 0xFFFF);
                 values[1] = (uint16_t)(commanded & 0xFFFF);
-                values[2] = 0x0007;
+                values[2] = MOTION_START_ABS;
 
                 modbus_create_write_multiple_packet((uint8_t)slave_id.get(), 0x0034, 3, values, tx_packet);
                 _uart->write(tx_packet, 15);
