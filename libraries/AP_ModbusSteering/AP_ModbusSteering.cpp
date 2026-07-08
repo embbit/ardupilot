@@ -688,54 +688,55 @@ void AP_ModbusSteering::update(float steering_out)
                 int32_t commanded;
 
                 if (need_position_sync) {
-                    commanded = debug_actual_pulses;
+                    last_sent_target_pulses = debug_actual_pulses;
                     need_position_sync = false;
                     just_synced = true;
-                } else {
-                    int32_t capped_desired = desired;
+                }
 
-                    const int32_t brake_zone = brake_zone_pulses((uint16_t)max_speed.get(),
-                                                                 active_limit,
-                                                                 max_pulses);
-                    const bool approach_pos = capped_desired > debug_actual_pulses &&
-                                              debug_actual_pulses > max_pulses - brake_zone;
-                    const bool approach_neg = capped_desired < debug_actual_pulses &&
-                                              debug_actual_pulses < -max_pulses + brake_zone;
-                    const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
-                    const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - active_limit * 4;
-                    const int32_t emergency_limit = max_pulses + max_pulses / 4;
+                int32_t capped_desired = desired;
 
-                    if (abs_int32(debug_actual_pulses) > emergency_limit) {
-                        const int32_t pull = active_limit * 8;
-                        if (debug_actual_pulses > 0) {
-                            commanded = debug_actual_pulses - pull;
-                            commanded = MAX(commanded, max_pulses - active_limit);
-                        } else {
-                            commanded = debug_actual_pulses + pull;
-                            commanded = MIN(commanded, -max_pulses + active_limit);
-                        }
-                    } else if (past_limit) {
-                        const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                        const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 8);
-                        if (debug_actual_pulses > 0) {
-                            commanded = debug_actual_pulses - pull;
-                            commanded = MAX(commanded, max_pulses - active_limit);
-                        } else {
-                            commanded = debug_actual_pulses + pull;
-                            commanded = MIN(commanded, -max_pulses + active_limit);
-                        }
-                    } else if (near_limit || approach_pos || approach_neg) {
-                        int32_t step = active_limit;
-                        if (abs_int32(debug_actual_pulses) > max_pulses - active_limit * 3) {
-                            step = MAX(active_limit / 2, 1);
-                        }
-                        commanded = step_toward(debug_actual_pulses, capped_desired, step);
-                    } else if (returning && ret_slew.get() > 0) {
-                        commanded = step_toward(debug_actual_pulses, capped_desired,
-                                                (int32_t)ret_slew.get());
+                const int32_t brake_zone = brake_zone_pulses((uint16_t)max_speed.get(),
+                                                             active_limit,
+                                                             max_pulses);
+                const bool approach_pos = capped_desired > debug_actual_pulses &&
+                                          debug_actual_pulses > max_pulses - brake_zone;
+                const bool approach_neg = capped_desired < debug_actual_pulses &&
+                                          debug_actual_pulses < -max_pulses + brake_zone;
+                const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
+                const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - active_limit * 4;
+                const int32_t emergency_limit = max_pulses + max_pulses / 4;
+
+                if (abs_int32(debug_actual_pulses) > emergency_limit) {
+                    const int32_t pull = active_limit * 8;
+                    if (debug_actual_pulses > 0) {
+                        commanded = debug_actual_pulses - pull;
+                        commanded = MAX(commanded, max_pulses - active_limit);
                     } else {
-                        commanded = capped_desired;
+                        commanded = debug_actual_pulses + pull;
+                        commanded = MIN(commanded, -max_pulses + active_limit);
                     }
+                } else if (past_limit) {
+                    const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
+                    const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 8);
+                    if (debug_actual_pulses > 0) {
+                        commanded = debug_actual_pulses - pull;
+                        commanded = MAX(commanded, max_pulses - active_limit);
+                    } else {
+                        commanded = debug_actual_pulses + pull;
+                        commanded = MIN(commanded, -max_pulses + active_limit);
+                    }
+                } else if (near_limit || approach_pos || approach_neg) {
+                    int32_t step = active_limit;
+                    if (abs_int32(debug_actual_pulses) > max_pulses - active_limit * 3) {
+                        step = MAX(active_limit / 2, 1);
+                    }
+                    commanded = step_toward(last_sent_target_pulses, capped_desired, step);
+                } else if (returning && ret_slew.get() > 0) {
+                    commanded = step_toward(debug_actual_pulses, capped_desired,
+                                            (int32_t)ret_slew.get());
+                } else {
+                    commanded = step_toward(last_sent_target_pulses, capped_desired,
+                                            active_limit);
                 }
 
                 if (abs_int32(debug_actual_pulses) <= max_pulses) {

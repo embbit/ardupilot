@@ -34,6 +34,9 @@ class Nema23Motor:
         self.coast_decel = NEMA23_COAST_DECEL_PPS2
         self.status_word = 0
         self.error_code = 0
+        self.track_err_limit = 8000
+        self.encoder_lag_s = 0.0
+        self.reported_position = 0.0
 
     @property
     def max_vel(self):
@@ -55,8 +58,21 @@ class Nema23Motor:
     def actual_pos(self):
         return int(round(self.position))
 
+    @property
+    def encoder_pos(self):
+        return int(round(self.reported_position))
+
     def set_driver_target(self, pos):
         self.driver_target = pos
+
+    def _update_tracking_error(self):
+        following = abs(self.driver_target - self.position)
+        if self.motor_enabled and following > self.track_err_limit:
+            self.error_code = 4
+            self.status_word |= (1 << 3)
+        else:
+            self.error_code = 0
+            self.status_word &= ~(1 << 3)
 
     def update(self, dt_s, link_active):
         if dt_s <= 0:
@@ -65,6 +81,13 @@ class Nema23Motor:
         if not self.motor_enabled:
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
+            self._update_tracking_error()
+            lag = max(self.encoder_lag_s, 0.0)
+            if lag > 0.0:
+                alpha = min(dt_s / lag, 1.0)
+                self.reported_position += (self.position - self.reported_position) * alpha
+            else:
+                self.reported_position = self.position
             return
 
         if link_active:
@@ -73,6 +96,13 @@ class Nema23Motor:
             self._coast(dt_s)
 
         self.position += self.velocity * dt_s
+        self._update_tracking_error()
+        lag = max(self.encoder_lag_s, 0.0)
+        if lag > 0.0:
+            alpha = min(dt_s / lag, 1.0)
+            self.reported_position += (self.position - self.reported_position) * alpha
+        else:
+            self.reported_position = self.position
 
     def _decay_velocity(self, dt_s, decel):
         if abs(self.velocity) < 0.5:
@@ -129,6 +159,8 @@ sim_state = {
     "init_count": 0,
     "packets_rx": 0,
     "packets_dropped": 0,
+    "telemetry_file": None,
+    "last_cmd_target": 0,
 }
 
 
@@ -161,6 +193,16 @@ def encode_position(pos):
     return high_word, low_word
 
 
+def _log_telemetry(now, cmd_target):
+    path = sim_state.get("telemetry_file")
+    if path is None:
+        return
+    with open(path, "a", encoding="ascii") as fh:
+        fh.write(f"{now:.3f},{cmd_target},{motor.actual_pos},{motor.encoder_pos},"
+                 f"{motor.velocity:.1f},{abs(motor.driver_target - motor.position):.0f},"
+                 f"{motor.error_code}\n")
+
+
 def check_link_schedule(now):
     if sim_state["link_drop_at"] is not None and now >= sim_state["link_drop_at"]:
         if sim_state["link_active"]:
@@ -190,12 +232,23 @@ def handle_write_single(reg_addr, val):
             motor.velocity = 0.0
     elif reg_addr == 0x0037 and val == 0x0004:
         motor.error_code = 0
+        motor.status_word &= ~(1 << 3)
+    elif reg_addr == 0x0052:
+        motor.track_err_limit = val
     elif reg_addr == 0x0036:
         pass  # motion trigger handled via 0x10 position write
 
 
-def run_modbus_simulator(link_drop_delay=None, link_down_duration=None):
+def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
+                         telemetry_file=None):
+    motor.encoder_lag_s = encoder_lag_ms / 1000.0
+    motor.reported_position = motor.position
+    sim_state["telemetry_file"] = telemetry_file
+    if telemetry_file:
+        with open(telemetry_file, "w", encoding="ascii") as fh:
+            fh.write("t,cmd_target,actual,encoder,vel,follow,err\n")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((HOST, MODBUS_UDP_PORT))
     print(f"[CL57R Modbus Sim] NEMA23 inertia model, UDP {MODBUS_UDP_PORT}")
     if link_drop_delay is not None and link_down_duration is not None:
@@ -274,14 +327,17 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None):
 
                     elif func_code == 0x10:
                         if reg_addr == 0x0034 and len(req) >= 13:
-                            motor.set_driver_target(decode_position_write(req))
+                            cmd = decode_position_write(req)
+                            motor.set_driver_target(cmd)
+                            sim_state["last_cmd_target"] = cmd
+                            _log_telemetry(now, cmd)
                         response.append(slave_id)
                         response.append(0x10)
                         response.extend(req[2:6])
 
                     elif func_code == 0x03:
                         if reg_addr == 0x0007:
-                            high_word, low_word = encode_position(motor.actual_pos)
+                            high_word, low_word = encode_position(motor.encoder_pos)
                             response.append(slave_id)
                             response.append(0x03)
                             response.append(0x04)
@@ -308,10 +364,12 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None):
 
             if now - last_log_time >= 2.0:
                 link = "UP" if sim_state["link_active"] else "DOWN"
-                err = motor.actual_pos - motor.driver_target
-                print(f"[STEER] link={link} pos={motor.actual_pos:7d} "
+                follow = int(abs(motor.driver_target - motor.position))
+                enc_lag = motor.actual_pos - motor.encoder_pos
+                print(f"[STEER] link={link} pos={motor.actual_pos:7d} enc={motor.encoder_pos:7d} "
                       f"target={motor.driver_target:7d} vel={motor.velocity:+7.0f}pps "
-                      f"err={err:+6d} inits={sim_state['init_count']}")
+                      f"follow={follow:6d} enc_lag={enc_lag:+5d} err={motor.error_code} "
+                      f"inits={sim_state['init_count']}")
                 last_log_time = now
 
         except Exception as e:
@@ -326,6 +384,10 @@ def parse_args():
                         help="Seconds after start to drop Modbus link")
     parser.add_argument("--link-down-duration", type=float, default=None,
                         help="Seconds to keep link down before restore")
+    parser.add_argument("--encoder-lag-ms", type=float, default=0.0,
+                        help="Encoder read lag in milliseconds (simulates stale feedback)")
+    parser.add_argument("--telemetry-file", type=str, default=None,
+                        help="CSV log of position commands and motor state")
     return parser.parse_args()
 
 
@@ -335,4 +397,4 @@ if __name__ == "__main__":
     down_duration = args.link_down_duration
     if (drop_delay is None) != (down_duration is None):
         raise SystemExit("Both --link-drop-delay and --link-down-duration are required together")
-    run_modbus_simulator(drop_delay, down_duration)
+    run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file)
