@@ -582,9 +582,6 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                 -max_pulses, max_pulses);
 
-            const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
-                                                -max_pulses, max_pulses);
-
             const uint32_t full_cycle_ms = POSITION_SEND_INTERVAL_MS * 2;
             const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
             int32_t return_limit = active_limit;
