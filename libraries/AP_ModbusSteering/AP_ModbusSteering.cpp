@@ -178,7 +178,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: RET_SLEW
     // @DisplayName: Return-To-Zero Slew Limit
-    // @Description: Макс. шаг при |стик|<5% (возврат в ноль). Активный руль: полная уставка стика на MAX_SPD.
+    // @Description: Макс. шаг при |стик|<5% (возврат в ноль). 0 = та же скорость, что активный ход (MAX_SPD).
     // @Units: pulses
     // @Range: 0 50000
     // @User: Standard
@@ -649,11 +649,6 @@ void AP_ModbusSteering::update(float steering_out)
 
             const uint32_t full_cycle_ms = POSITION_SEND_INTERVAL_MS * 2;
             const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(), full_cycle_ms);
-            int32_t return_limit = active_limit;
-            const int32_t param_limit = ret_slew.get();
-            if (param_limit > 0) {
-                return_limit = param_limit;
-            }
 
             bool just_synced = false;
             int32_t commanded;
@@ -679,6 +674,7 @@ void AP_ModbusSteering::update(float steering_out)
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
                 const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
                                         abs_int32(capped_desired) > max_pulses - brake_zone;
+                const int32_t stick_err = abs_int32(debug_actual_pulses - capped_desired);
 
                 if (past_limit) {
                     const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
@@ -686,11 +682,16 @@ void AP_ModbusSteering::update(float steering_out)
                     const int32_t pull_target = (debug_actual_pulses > 0) ?
                         (max_pulses - active_limit) : (-max_pulses + active_limit);
                     commanded = step_toward(debug_actual_pulses, pull_target, pull_step);
-                } else if (returning) {
-                    commanded = step_toward(debug_actual_pulses, capped_desired, return_limit);
                 } else {
-                    const int32_t lead = near_limit ? MAX(active_limit / 2, 1) : active_limit;
-                    commanded = apply_lead_limit(capped_desired, debug_actual_pulses, lead);
+                    int32_t lead = near_limit ? MAX(active_limit / 2, 1) : active_limit;
+                    if (returning && ret_slew.get() > 0) {
+                        lead = MIN(lead, (int32_t)ret_slew.get());
+                    }
+                    if (stick_err > deadband) {
+                        commanded = apply_lead_limit(capped_desired, debug_actual_pulses, lead);
+                    } else {
+                        commanded = capped_desired;
+                    }
                 }
             }
 
@@ -715,8 +716,7 @@ void AP_ModbusSteering::update(float steering_out)
 
             const bool should_send = just_synced ||
                                      !have_sent_target ||
-                                     (abs_int32(commanded - last_sent_target_pulses) > deadband) ||
-                                     (returning && abs_int32(debug_actual_pulses - commanded) > deadband);
+                                     commanded != last_sent_target_pulses;
 
             if (should_send) {
                 uint16_t values[3];
