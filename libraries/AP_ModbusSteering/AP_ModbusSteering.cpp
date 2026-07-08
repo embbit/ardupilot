@@ -98,6 +98,11 @@ static int32_t apply_lead_limit(int32_t commanded, int32_t actual, int32_t move_
     return commanded;
 }
 
+static int32_t decode_encoder_position(uint16_t high_word, uint16_t low_word)
+{
+    return (int32_t)(((int32_t)(int16_t)high_word << 16) | low_word);
+}
+
 const char *cl57r_error_str(uint16_t code)
 {
     switch (code) {
@@ -250,6 +255,8 @@ void AP_ModbusSteering::update(float steering_out)
     static uint32_t tracking_pause_until_ms = 0;
     static bool have_actual_position = false;
     static bool need_position_sync = false;
+    static int32_t last_valid_actual = 0;
+    static bool have_valid_actual = false;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -319,8 +326,18 @@ void AP_ModbusSteering::update(float steering_out)
                         uint16_t high_word = (local_buf[i + 3] << 8) | local_buf[i + 4];
                         uint16_t low_word = (local_buf[i + 5] << 8) | local_buf[i + 6];
 
-                        int32_t actual_position = static_cast<int32_t>(((uint32_t)high_word << 16) | low_word);
+                        const int32_t actual_position = decode_encoder_position(high_word, low_word);
+                        const int32_t max_jump = speed_move_limit_pulses((uint16_t)max_speed.get(),
+                                                                          POSITION_SEND_INTERVAL_MS * 2) * 4;
 
+                        if (have_valid_actual &&
+                            abs_int32(actual_position - last_valid_actual) > max_jump) {
+                            response_received = (current_state == DriveState::RUN_READ_POS);
+                            break;
+                        }
+
+                        last_valid_actual = actual_position;
+                        have_valid_actual = true;
                         last_telemetry_rcvd_ms = now;
 
                         debug_actual_pulses = actual_position;
@@ -416,6 +433,7 @@ void AP_ModbusSteering::update(float steering_out)
         have_sent_target = false;
         have_actual_position = false;
         need_position_sync = false;
+        have_valid_actual = false;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
@@ -472,6 +490,7 @@ void AP_ModbusSteering::update(float steering_out)
             have_sent_target = false;
             have_actual_position = false;
             need_position_sync = true;
+            have_valid_actual = false;
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
@@ -630,6 +649,14 @@ void AP_ModbusSteering::update(float steering_out)
                     capped_desired = MAX(capped_desired, -max_pulses + active_limit);
                 }
 
+                const int32_t approach_margin = active_limit * 3;
+                if (capped_desired > max_pulses - approach_margin) {
+                    capped_desired = MIN(capped_desired, max_pulses - approach_margin);
+                }
+                if (capped_desired < -max_pulses + approach_margin) {
+                    capped_desired = MAX(capped_desired, -max_pulses + approach_margin);
+                }
+
                 const int32_t follow_err_inner = abs_int32(debug_actual_pulses - capped_desired);
                 const int32_t settle_zone = deadband * 8;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
@@ -663,8 +690,9 @@ void AP_ModbusSteering::update(float steering_out)
                         commanded = capped_desired;
                     }
                 } else if (reversed || near_limit || approaching_limit) {
-                    commanded = step_toward(debug_actual_pulses, capped_desired, active_limit);
-                    commanded = apply_lead_limit(commanded, debug_actual_pulses, active_limit);
+                    const int32_t brake_move_limit = MAX(active_limit / 2, 1);
+                    commanded = step_toward(debug_actual_pulses, capped_desired, brake_move_limit);
+                    commanded = apply_lead_limit(commanded, debug_actual_pulses, brake_move_limit);
                 } else {
                     commanded = capped_desired;
                 }
