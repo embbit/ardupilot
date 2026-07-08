@@ -148,7 +148,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: RET_SLEW
     // @DisplayName: Return-To-Zero Slew Limit
-    // @Description: Макс. шаг уставки за цикл при |стик|<5%. Активный руль: шаг от энкодера на MAX_SPD. 0 = по MAX_SPD.
+    // @Description: Макс. шаг при |стик|<5% (возврат в ноль). Активный руль: полная уставка стика на MAX_SPD.
     // @Units: pulses
     // @Range: 0 50000
     // @User: Standard
@@ -611,9 +611,22 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t follow_err_inner = abs_int32(debug_actual_pulses - capped_desired);
                 const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
                 const int32_t move_limit = returning ? return_limit : active_limit;
+                const int32_t settle_zone = deadband * 8;
 
-                if (follow_err_inner > deadband) {
+                static int8_t last_desired_sign = 0;
+                const int8_t desired_sign = (capped_desired > deadband) ? 1 :
+                                            ((capped_desired < -deadband) ? -1 : 0);
+                const bool reversed = !returning && last_desired_sign != 0 && desired_sign != 0 &&
+                                      desired_sign != last_desired_sign;
+                last_desired_sign = desired_sign;
+
+                if (returning || reversed) {
                     commanded = step_toward(debug_actual_pulses, capped_desired, move_limit);
+                } else if (follow_err_inner > settle_zone) {
+                    commanded = capped_desired;
+                } else if (follow_err_inner > deadband) {
+                    const int32_t fine_limit = MAX(follow_err_inner / 2, deadband);
+                    commanded = step_toward(debug_actual_pulses, capped_desired, fine_limit);
                 } else {
                     commanded = capped_desired;
                 }
