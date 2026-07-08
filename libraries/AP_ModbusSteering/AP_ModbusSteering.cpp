@@ -611,6 +611,7 @@ void AP_ModbusSteering::update(float steering_out)
 
             bool just_synced = false;
             int32_t commanded;
+            const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
 
             if (need_position_sync) {
                 commanded = debug_actual_pulses;
@@ -630,7 +631,6 @@ void AP_ModbusSteering::update(float steering_out)
                 }
 
                 const int32_t follow_err_inner = abs_int32(debug_actual_pulses - capped_desired);
-                const bool returning = fabsf(clean_steering) < STICK_CENTER_THRESHOLD;
                 const int32_t settle_zone = deadband * 8;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
                 const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - brake_zone ||
