@@ -702,16 +702,9 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                     -max_pulses, max_pulses);
 
-                // Шаг за 1 такт и тормозной путь.
+                // Шаг за 1 такт при MAX_SPD.
                 const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
                                                                      POSITION_SEND_INTERVAL_MS * 2);
-                // stop_dist = v * DECEL_MS/2000 (расстояние при торможении с полной скорости)
-                const int32_t stop_dist = speed_move_limit_pulses((uint16_t)max_speed.get(),
-                                                                   (uint32_t)decel_ms.get());
-
-                // Brake zone: начинается за stop_dist*3 до упора.
-                // С запасом 3x: на неточность DECEL + инерцию нагрузки.
-                const int32_t brake_zone_start = MAX(max_pulses - stop_dist * 3, max_pulses / 2);
 
                 bool just_synced = false;
                 int32_t commanded;
@@ -722,61 +715,28 @@ void AP_ModbusSteering::update(float steering_out)
                     just_synced = true;
                 }
 
-                // emergency_limit: если мотор залетел глубоко за лимит — максимальный откат
-                const int32_t emergency_limit = max_pulses + stop_dist;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
-                const bool in_brake_zone_pos = (debug_actual_pulses > brake_zone_start);
-                const bool in_brake_zone_neg = (debug_actual_pulses < -brake_zone_start);
-
-                if (abs_int32(debug_actual_pulses) > emergency_limit) {
-                    // Аварийный откат: тянуть к soft limit от текущей позиции
-                    const int32_t pull = stop_dist * 4;
+                if (past_limit) {
+                    // Мотор за лимитом: держать цель у края (не дальше actual),
+                    // CL57R тормозит и возвращается.
                     if (debug_actual_pulses > 0) {
-                        commanded = debug_actual_pulses - pull;
+                        commanded = max_pulses - active_limit;
                     } else {
-                        commanded = debug_actual_pulses + pull;
-                    }
-                } else if (past_limit) {
-                    // За лимитом: откат на stop_dist от actual
-                    const int32_t pull = MAX(stop_dist, active_limit);
-                    if (debug_actual_pulses > 0) {
-                        commanded = debug_actual_pulses - pull;
-                    } else {
-                        commanded = debug_actual_pulses + pull;
-                    }
-                } else if (in_brake_zone_pos) {
-                    // В brake zone (+): фиксированная цель max_pulses.
-                    // CL57R получает постоянную цель — тормозит и останавливается у упора.
-                    // Если стик в центре (desired < actual) — даём desired (уйти от упора).
-                    if (desired < debug_actual_pulses) {
-                        commanded = desired;
-                    } else {
-                        commanded = max_pulses;
-                    }
-                } else if (in_brake_zone_neg) {
-                    if (desired > debug_actual_pulses) {
-                        commanded = desired;
-                    } else {
-                        commanded = -max_pulses;
+                        commanded = -max_pulses + active_limit;
                     }
                 } else if (returning && ret_slew.get() > 0) {
                     // Возврат в центр с ограниченной скоростью
                     commanded = step_toward(last_sent_target_pulses, desired,
                                             (int32_t)ret_slew.get());
                 } else {
-                    // Средний ход: прямая цель, CL57R тормозит своими рампами
+                    // Прямое управление: стик = абсолютная позиция.
+                    // CL57R тормозит у цели своими рампами ACCEL/DECEL.
+                    // При перелёте упора уменьшите OB_STR_DECEL_MS.
                     commanded = desired;
                 }
 
-                // Финальный clamp
-                if (!past_limit) {
-                    commanded = clamp_int32(commanded, -max_pulses, max_pulses);
-                } else if (debug_actual_pulses > 0) {
-                    commanded = clamp_int32(commanded, -max_pulses, debug_actual_pulses);
-                } else {
-                    commanded = clamp_int32(commanded, debug_actual_pulses, max_pulses);
-                }
+                commanded = clamp_int32(commanded, -max_pulses, max_pulses);
 
                 static bool soft_limit_warned = false;
                 if (abs_int32(debug_actual_pulses) > max_pulses) {
