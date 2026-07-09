@@ -699,8 +699,13 @@ void AP_ModbusSteering::update(float steering_out)
 
                 const int32_t max_pulses = travel_limit_pulses();
                 const int32_t deadband = pos_db.get();
-                const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
-                                                    -max_pulses, max_pulses);
+
+                // Если стик в мёртвой зоне центра — форсируем desired=0.
+                // Это обеспечивает возврат в ноль при отпускании стика даже при неточном triм.
+                const int32_t desired = returning
+                    ? 0
+                    : clamp_int32((int32_t)(clean_steering * (float)max_pulses),
+                                  -max_pulses, max_pulses);
 
                 // Шаг за 1 такт при MAX_SPD.
                 const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
@@ -718,9 +723,14 @@ void AP_ModbusSteering::update(float steering_out)
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
                 if (past_limit) {
-                    // Мотор за лимитом: держать цель у края (не дальше actual),
-                    // CL57R тормозит и возвращается.
-                    if (debug_actual_pulses > 0) {
+                    // Мотор за лимитом. Если стик ведёт к центру — следовать стику.
+                    // Если стик держит у упора — фиксироваться у края.
+                    const bool going_back = (debug_actual_pulses > 0)
+                        ? (desired < debug_actual_pulses)
+                        : (desired > debug_actual_pulses);
+                    if (going_back) {
+                        commanded = desired;
+                    } else if (debug_actual_pulses > 0) {
                         commanded = max_pulses - active_limit;
                     } else {
                         commanded = -max_pulses + active_limit;
