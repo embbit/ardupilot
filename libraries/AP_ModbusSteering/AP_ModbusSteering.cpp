@@ -683,14 +683,16 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                     -max_pulses, max_pulses);
 
-                // active_limit: расстояние, которое мотор проходит за 2 такта при MAX_SPD.
-                // Используется как единица шага в тормозной зоне у упора.
+                // active_limit: расстояние за 2 такта при MAX_SPD.
                 const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
                                                                      POSITION_SEND_INTERVAL_MS * 2);
 
-                // stop_dist: оценка тормозного пути при полной скорости (DECEL=400ms).
-                // stop_dist = v * t/2 = active_limit * 2
+                // stop_dist: тормозной путь при полной скорости и DECEL=400ms.
+                // v * decel/2 = (rpm*4000/60) * 0.4/2 = active_limit * 2
                 const int32_t stop_dist = active_limit * 2;
+
+                // brake_zone: начало зоны торможения (за stop_dist*4 до упора, ~2 тормозных пути)
+                const int32_t brake_zone_start = max_pulses - stop_dist * 4;
 
                 bool just_synced = false;
                 int32_t commanded;
@@ -704,40 +706,39 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t emergency_limit = max_pulses + max_pulses / 4;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
-                // Тормозная зона: за stop_dist*3 до упора, при движении К упору,
-                // ограничиваем цель до (actual + active_limit) чтобы мотор успел остановиться.
-                const bool heading_to_pos = (desired > debug_actual_pulses) &&
-                                            (debug_actual_pulses > max_pulses - stop_dist * 3);
-                const bool heading_to_neg = (desired < debug_actual_pulses) &&
-                                            (debug_actual_pulses < -max_pulses + stop_dist * 3);
+                // Тормозная зона активна, если actual в опасной зоне ИЛИ уже за лимитом.
+                // Условие не зависит от направления стика — работает и при отпускании.
+                const bool in_brake_zone_pos = (debug_actual_pulses > brake_zone_start);
+                const bool in_brake_zone_neg = (debug_actual_pulses < -brake_zone_start);
 
                 if (abs_int32(debug_actual_pulses) > emergency_limit) {
-                    // Аварийный откат
-                    const int32_t pull = active_limit * 8;
+                    // Аварийный откат: сильная тяга от actual, нет нижнего пола
+                    const int32_t pull = stop_dist * 4;
                     if (debug_actual_pulses > 0) {
                         commanded = debug_actual_pulses - pull;
-                        commanded = MAX(commanded, max_pulses - active_limit);
                     } else {
                         commanded = debug_actual_pulses + pull;
-                        commanded = MIN(commanded, -max_pulses + active_limit);
                     }
                 } else if (past_limit) {
-                    // Откат пропорционально перелёту
+                    // За лимитом: откат с ускоренной тягой, без пола
                     const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                    const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 8);
+                    const int32_t pull = MIN(MAX(overshoot * 2, stop_dist), stop_dist * 4);
                     if (debug_actual_pulses > 0) {
                         commanded = debug_actual_pulses - pull;
-                        commanded = MAX(commanded, max_pulses - active_limit);
                     } else {
                         commanded = debug_actual_pulses + pull;
-                        commanded = MIN(commanded, -max_pulses + active_limit);
                     }
-                } else if (heading_to_pos) {
-                    // Плавное торможение у правого упора: цель не более active_limit впереди actual
-                    commanded = MIN(desired, debug_actual_pulses + active_limit);
-                } else if (heading_to_neg) {
-                    // Плавное торможение у левого упора
-                    commanded = MAX(desired, debug_actual_pulses - active_limit);
+                } else if (in_brake_zone_pos) {
+                    // В тормозной зоне (+): цель ограничена actual + active_limit
+                    // При stik=0 (desired<actual) — это уводит цель к 0, мотор тормозит
+                    commanded = clamp_int32(desired,
+                                           debug_actual_pulses - stop_dist * 2,
+                                           debug_actual_pulses + active_limit);
+                } else if (in_brake_zone_neg) {
+                    // В тормозной зоне (-): симметрично
+                    commanded = clamp_int32(desired,
+                                           debug_actual_pulses - active_limit,
+                                           debug_actual_pulses + stop_dist * 2);
                 } else if (returning && ret_slew.get() > 0) {
                     // Возврат в центр с ограниченной скоростью
                     commanded = step_toward(last_sent_target_pulses, desired,
@@ -747,14 +748,13 @@ void AP_ModbusSteering::update(float steering_out)
                     commanded = desired;
                 }
 
-                if (abs_int32(debug_actual_pulses) <= max_pulses) {
+                // Финальный clamp: в норме — в пределах лимита; за лимитом — не дальше actual
+                if (!past_limit) {
                     commanded = clamp_int32(commanded, -max_pulses, max_pulses);
-                } else if (debug_actual_pulses > max_pulses) {
-                    commanded = MIN(commanded, debug_actual_pulses);
-                    commanded = MAX(commanded, max_pulses - active_limit);
+                } else if (debug_actual_pulses > 0) {
+                    commanded = clamp_int32(commanded, -max_pulses, debug_actual_pulses);
                 } else {
-                    commanded = MAX(commanded, debug_actual_pulses);
-                    commanded = MIN(commanded, -max_pulses + active_limit);
+                    commanded = clamp_int32(commanded, debug_actual_pulses, max_pulses);
                 }
 
                 static bool soft_limit_warned = false;

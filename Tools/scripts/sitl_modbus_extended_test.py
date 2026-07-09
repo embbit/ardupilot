@@ -190,21 +190,28 @@ def test_fault_latched(mavlink, sim_lines, events, timeout_s):
         return 1
     print("PASS: out-of-range position reached")
 
+    # Снимок состояния на момент latch
+    inits_at_latch = sum(1 for line in sim_lines if "INIT #" in line)
+    events_at_latch = len(events)
+
     mavlink.mav.rc_channels_override_send(
         mavlink.target_system, mavlink.target_component,
         1900, 0, 1500, 1500, 1500, 1500, 1500, 1500,
     )
     time.sleep(3)
-    pump(time.time() + 2)
+    pump(time.time() + 3)
 
-    reinit = sum(1 for line in sim_lines if "INIT #" in line)
-    if reinit > 1:
-        print(f"FAIL: unexpected re-init after fault latch (inits={reinit})")
+    inits_after = sum(1 for line in sim_lines if "INIT #" in line) - inits_at_latch
+    if inits_after > 0:
+        print(f"FAIL: {inits_after} unexpected re-init(s) after fault latch")
         return 1
     print("PASS: no re-init after fault latch")
 
-    if any("Modbus link restored" in t for t in events):
-        print("FAIL: unexpected auto recovery after fault latch")
+    # Только события ПОСЛЕ latch
+    events_post = events[events_at_latch:]
+    restored_after = [t for t in events_post if "Modbus link restored" in t]
+    if restored_after:
+        print(f"FAIL: unexpected link restored after fault latch: {restored_after[-1]}")
         return 1
     print("PASS: driver stays latched (no auto recovery)")
     return 0
