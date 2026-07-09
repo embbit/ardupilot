@@ -559,11 +559,14 @@ void AP_ModbusSteering::update(float steering_out)
 
             debug_target_pulses = commanded;
 
-            // Переотправка цели при расхождении: если фактическая позиция ушла от
-            // уставки больше чем на deadband (проскок, сваливание, back-drive) —
-            // повторяем команду, чтобы мотор догнал цель. Ограничено 500мс, чтобы
-            // не сбрасывать профиль движения CL57R каждый цикл.
-            const bool actual_diverged = have_sent_target &&
+            // Переотправка при расхождении ТОЛЬКО когда уставка стабильна (не меняется),
+            // а мотор всё равно не на цели — т.е. реальное сваливание/дрейф/back-drive.
+            // Во время активного хода commanded меняется каждый цикл (обрабатывается ниже),
+            // и actual естественно отстаёт — тогда переотправку НЕ делаем, иначе перезапуск
+            // профиля CL57R вызывает перерегулирование.
+            const bool target_stable = have_sent_target &&
+                                       (commanded == last_sent_target_pulses);
+            const bool actual_diverged = target_stable &&
                                          (abs_int32(commanded - debug_actual_pulses) > deadband) &&
                                          (now - last_divergence_send_ms) > 500;
             const bool should_send = !have_sent_target ||
