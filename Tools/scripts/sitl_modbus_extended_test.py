@@ -217,13 +217,12 @@ def test_fault_latched(mavlink, sim_lines, events, timeout_s):
     return 0
 
 
-def test_invert(mavlink, sim_lines, events, timeout_s, inv_value, expect_sign):
-    print(f"Testing OB_STR_INV={inv_value}, expect sign {'+' if expect_sign > 0 else '-'}")
+def _steer_peak(mavlink, sim_lines, pwm, hold_s=8):
     mavlink.mav.rc_channels_override_send(
         mavlink.target_system, mavlink.target_component,
-        1900, 0, 1500, 1500, 1500, 1500, 1500, 1500,
+        pwm, 0, 1500, 1500, 1500, 1500, 1500, 1500,
     )
-    deadline = time.time() + 8
+    deadline = time.time() + hold_s
     while time.time() < deadline:
         msg = mavlink.recv_match(blocking=False)
         while msg is not None:
@@ -231,20 +230,26 @@ def test_invert(mavlink, sim_lines, events, timeout_s, inv_value, expect_sign):
                 print(f"[MAV] {msg.text}")
             msg = mavlink.recv_match(blocking=False)
         time.sleep(0.05)
-
     targets = [t for t in parse_targets_from_sim(sim_lines) if abs(t) > 5000]
-    if not targets:
-        print("FAIL: no significant steering targets observed")
+    return max(targets, key=abs) if targets else 0
+
+
+def test_direction(mavlink, sim_lines, events, timeout_s):
+    """ac8ab00113 has no invert param: stick right -> positive target."""
+    peak_right = _steer_peak(mavlink, sim_lines, 1900)
+    print(f"  stick RIGHT peak target={peak_right}")
+    if peak_right <= 0:
+        print("FAIL: stick right should give positive target")
         return 1
-    peak = max(targets, key=abs)
-    print(f"  peak target={peak}")
-    if expect_sign > 0 and peak < 0:
-        print("FAIL: expected positive target with OB_STR_INV=0")
+    # return to center then left
+    _steer_peak(mavlink, sim_lines, 1500, hold_s=6)
+    sim_lines.clear()
+    peak_left = _steer_peak(mavlink, sim_lines, 1100)
+    print(f"  stick LEFT peak target={peak_left}")
+    if peak_left >= 0:
+        print("FAIL: stick left should give negative target")
         return 1
-    if expect_sign < 0 and peak > 0:
-        print("FAIL: expected negative target with OB_STR_INV=1")
-        return 1
-    print(f"PASS: OB_STR_INV={inv_value} direction correct")
+    print("PASS: steering direction correct (right=+, left=-)")
     return 0
 
 
@@ -265,9 +270,9 @@ def test_multi_link_loss(mavlink, sim_lines, events, timeout_s):
                 text = msg.text
                 print(f"[MAV] {text}")
                 events.append(text)
-                if "Modbus link lost" in text:
+                if "Modbus link lost" in text or "Modbus Timeout" in text:
                     link_lost += 1
-                if "Modbus link restored" in text:
+                if "Modbus link restored" in text or "Modbus Driver READY" in text:
                     link_restored += 1
             msg = mavlink.recv_match(blocking=False)
         if link_lost >= 3 and link_restored >= 3:
@@ -327,22 +332,9 @@ def run_fault_test():
 
 
 def run_invert_tests():
-    print("\n=== OB_STR_INV TEST (INV=1) ===")
-    rc1, _, _ = run_session(
-        [], {"OB_STR_INV": 1},
-        lambda m, s, e, t: test_invert(m, s, e, t, 1, -1),
-        timeout_s=15,
-    )
-    if rc1 != 0:
-        return rc1
-
-    print("\n=== OB_STR_INV TEST (INV=0) ===")
-    rc0, _, _ = run_session(
-        [], {"OB_STR_INV": 0},
-        lambda m, s, e, t: test_invert(m, s, e, t, 0, 1),
-        timeout_s=15,
-    )
-    return rc0
+    print("\n=== STEERING DIRECTION TEST ===")
+    rc, _, _ = run_session([], {}, test_direction, timeout_s=20)
+    return rc
 
 
 def run_multi_link_test():

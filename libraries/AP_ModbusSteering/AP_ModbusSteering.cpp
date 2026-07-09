@@ -202,6 +202,8 @@ void AP_ModbusSteering::update(float steering_out)
     static int32_t last_sent_target_pulses = 0;
     static bool have_sent_target = false;
     static bool encoder_fault_latched = false;
+    static bool pending_alarm_clear = false;
+    static uint32_t last_divergence_send_ms = 0;
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -323,6 +325,14 @@ void AP_ModbusSteering::update(float steering_out)
                                 gcs().send_text(MAV_SEVERITY_INFO, "CL57R: alarm cleared");
                             }
                             last_driver_error_code = error_code;
+                        }
+
+                        // Tracking error (код 4) или бит alarm в статусе:
+                        // мотор встал и не исполняет команды позиции. Запрашиваем
+                        // сброс alarm, чтобы восстановить слежение за целью.
+                        const bool alarm_bit = (status_word >> 3) & 1;
+                        if (error_code == 4 || alarm_bit) {
+                            pending_alarm_clear = true;
                         }
 
                         if (status_word != last_driver_status_word) {
@@ -483,6 +493,18 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
+            // Сброс alarm при tracking error: мотор не движется, пока alarm активен.
+            // Шлём 0x0037=0x0004, форсируем переотправку позиции — мотор возобновит слежение.
+            if (pending_alarm_clear) {
+                pending_alarm_clear = false;
+                modbus_create_write_packet((uint8_t)slave_id.get(), REG_AUX_CONTROL,
+                                           AUX_ALARM_CLEAR, tx_packet);
+                _uart->write(tx_packet, 8);
+                have_sent_target = false;
+                current_state = DriveState::RUN_READ_POS;
+                break;
+            }
+
             float clean_steering = steering_out;
             if (clean_steering > 1.0f)  clean_steering = 1.0f;
             if (clean_steering < -1.0f) clean_steering = -1.0f;
@@ -537,8 +559,16 @@ void AP_ModbusSteering::update(float steering_out)
 
             debug_target_pulses = commanded;
 
+            // Переотправка цели при расхождении: если фактическая позиция ушла от
+            // уставки больше чем на deadband (проскок, сваливание, back-drive) —
+            // повторяем команду, чтобы мотор догнал цель. Ограничено 500мс, чтобы
+            // не сбрасывать профиль движения CL57R каждый цикл.
+            const bool actual_diverged = have_sent_target &&
+                                         (abs_int32(commanded - debug_actual_pulses) > deadband) &&
+                                         (now - last_divergence_send_ms) > 500;
             const bool should_send = !have_sent_target ||
-                                     (abs_int32(commanded - last_sent_target_pulses) > deadband);
+                                     (abs_int32(commanded - last_sent_target_pulses) > deadband) ||
+                                     actual_diverged;
 
             if (should_send) {
                 uint16_t values[3];
@@ -550,6 +580,7 @@ void AP_ModbusSteering::update(float steering_out)
                 _uart->write(tx_packet, 15);
                 last_sent_target_pulses = commanded;
                 have_sent_target = true;
+                last_divergence_send_ms = now;
             }
 
             current_state = DriveState::RUN_READ_POS;

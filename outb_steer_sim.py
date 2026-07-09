@@ -37,6 +37,9 @@ class Nema23Motor:
         self.track_err_limit = 8000
         self.encoder_lag_s = 0.0
         self.reported_position = 0.0
+        # Alarm/stall: когда True, мотор НЕ исполняет команды позиции,
+        # пока не придёт alarm-clear (0x0037=0x0004). Моделирует tracking error.
+        self.alarmed = False
 
     @property
     def max_vel(self):
@@ -65,38 +68,34 @@ class Nema23Motor:
     def set_driver_target(self, pos):
         self.driver_target = pos
 
-    def _update_tracking_error(self):
-        following = abs(self.driver_target - self.position)
-        if self.motor_enabled and following > self.track_err_limit:
-            self.error_code = 4
-            self.status_word |= (1 << 3)
-        else:
-            self.error_code = 0
-            self.status_word &= ~(1 << 3)
+    def clear_alarm(self):
+        self.alarmed = False
+        self.error_code = 0
+        self.status_word &= ~(1 << 3)
+
+    def raise_alarm(self):
+        self.alarmed = True
+        self.error_code = 4
+        self.status_word |= (1 << 3)
+        self.velocity = 0.0
 
     def update(self, dt_s, link_active):
         if dt_s <= 0:
             return
 
-        if not self.motor_enabled:
+        if self.alarmed:
+            # Мотор в alarm: не двигается, ждёт alarm-clear. Позиция заморожена.
+            self.velocity = 0.0
+        elif not self.motor_enabled:
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
-            self._update_tracking_error()
-            lag = max(self.encoder_lag_s, 0.0)
-            if lag > 0.0:
-                alpha = min(dt_s / lag, 1.0)
-                self.reported_position += (self.position - self.reported_position) * alpha
-            else:
-                self.reported_position = self.position
-            return
-
-        if link_active:
+        elif link_active:
             self._track_target(dt_s)
+            self.position += self.velocity * dt_s
         else:
             self._coast(dt_s)
+            self.position += self.velocity * dt_s
 
-        self.position += self.velocity * dt_s
-        self._update_tracking_error()
         lag = max(self.encoder_lag_s, 0.0)
         if lag > 0.0:
             alpha = min(dt_s / lag, 1.0)
@@ -157,6 +156,7 @@ sim_state = {
     "link_restore_at": None,
     "link_schedule": [],
     "inject_schedule": [],
+    "alarm_schedule": [],
     "start_time": 0.0,
     "last_rx_hex": "WAITING...",
     "init_count": 0,
@@ -224,6 +224,14 @@ def _inject_position(pos):
     print(f"[CL57R Modbus Sim] INJECT position={int(pos)}")
 
 
+def _raise_alarm_at(pos):
+    """Заморозить мотор в позиции pos и выставить tracking-error alarm."""
+    motor.position = float(pos)
+    motor.reported_position = float(pos)
+    motor.raise_alarm()
+    print(f"[CL57R Modbus Sim] ALARM raised at position={int(pos)}")
+
+
 def check_link_schedule(now):
     start = sim_state["start_time"]
 
@@ -233,6 +241,13 @@ def check_link_schedule(now):
             break
         sim_state["inject_schedule"].pop(0)
         _inject_position(pos)
+
+    while sim_state["alarm_schedule"]:
+        delay_s, pos = sim_state["alarm_schedule"][0]
+        if now - start < delay_s:
+            break
+        sim_state["alarm_schedule"].pop(0)
+        _raise_alarm_at(pos)
 
     while sim_state["link_schedule"]:
         delay_s, down_duration = sim_state["link_schedule"][0]
@@ -271,8 +286,9 @@ def handle_write_single(reg_addr, val):
             motor.velocity = 0.0
             print("[CL57R Modbus Sim] MOTOR DISABLE")
     elif reg_addr == 0x0037 and val == 0x0004:
-        motor.error_code = 0
-        motor.status_word &= ~(1 << 3)
+        if motor.alarmed:
+            print("[CL57R Modbus Sim] ALARM CLEARED by driver")
+        motor.clear_alarm()
     elif reg_addr == 0x0052:
         motor.track_err_limit = val
     elif reg_addr == 0x0036:
@@ -280,13 +296,15 @@ def handle_write_single(reg_addr, val):
 
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
-                         telemetry_file=None, link_drops=None, inject_positions=None):
+                         telemetry_file=None, link_drops=None, inject_positions=None,
+                         alarm_events=None):
     motor.encoder_lag_s = encoder_lag_ms / 1000.0
     motor.reported_position = motor.position
     sim_state["telemetry_file"] = telemetry_file
     sim_state["start_time"] = time.time()
     sim_state["link_schedule"] = []
     sim_state["inject_schedule"] = []
+    sim_state["alarm_schedule"] = list(alarm_events) if alarm_events else []
     if telemetry_file:
         with open(telemetry_file, "w", encoding="ascii") as fh:
             fh.write("t,cmd_target,actual,encoder,vel,follow,err\n")
@@ -296,6 +314,8 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
     if inject_positions:
         schedule_position_injections(inject_positions)
         print(f"[CL57R Modbus Sim] Position inject schedule: {inject_positions}")
+    if alarm_events:
+        print(f"[CL57R Modbus Sim] Alarm schedule: {alarm_events}")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((HOST, MODBUS_UDP_PORT))
@@ -415,10 +435,11 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                 link = "UP" if sim_state["link_active"] else "DOWN"
                 follow = int(abs(motor.driver_target - motor.position))
                 enc_lag = motor.actual_pos - motor.encoder_pos
+                alarm = "ALARM" if motor.alarmed else "ok"
                 print(f"[STEER] link={link} pos={motor.actual_pos:7d} enc={motor.encoder_pos:7d} "
                       f"target={motor.driver_target:7d} vel={motor.velocity:+7.0f}pps "
                       f"follow={follow:6d} enc_lag={enc_lag:+5d} err={motor.error_code} "
-                      f"inits={sim_state['init_count']}")
+                      f"{alarm} inits={sim_state['init_count']}")
                 last_log_time = now
 
         except Exception as e:
@@ -441,6 +462,8 @@ def parse_args():
                         help="Comma-separated drop:duration pairs in seconds, e.g. 10:5,30:5")
     parser.add_argument("--inject-positions", type=str, default=None,
                         help="Comma-separated delay:position pairs, e.g. 8:-310000")
+    parser.add_argument("--alarm-events", type=str, default=None,
+                        help="Comma-separated delay:position pairs to raise tracking-error alarm")
     return parser.parse_args()
 
 
@@ -462,6 +485,7 @@ if __name__ == "__main__":
     down_duration = args.link_down_duration
     link_drops = _parse_pairs(args.link_drops, "link")
     inject_positions = _parse_pairs(args.inject_positions, "inject")
+    alarm_events = _parse_pairs(args.alarm_events, "alarm")
     if (drop_delay is None) != (down_duration is None):
         raise SystemExit("Both --link-drop-delay and --link-down-duration are required together")
     if drop_delay is not None and link_drops is not None:
@@ -469,4 +493,4 @@ if __name__ == "__main__":
     if drop_delay is not None:
         link_drops = [(drop_delay, down_duration)]
     run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file,
-                         link_drops, inject_positions)
+                         link_drops, inject_positions, alarm_events)

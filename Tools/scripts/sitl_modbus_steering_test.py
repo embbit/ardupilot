@@ -181,9 +181,10 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
                     text = msg.text
                     print(f"[MAV] {text}")
                     events.append(text)
-                    if "Modbus link lost" in text:
+                    if "Modbus link lost" in text or "Modbus Timeout" in text:
                         link_lost = True
-                    if not link_restored and "Modbus link restored" in text:
+                    if not link_restored and ("Modbus link restored" in text or
+                                              "Modbus Driver READY" in text):
                         link_restored = True
                 msg = mavlink.recv_match(blocking=False)
 
