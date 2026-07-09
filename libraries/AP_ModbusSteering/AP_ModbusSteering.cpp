@@ -384,15 +384,14 @@ void AP_ModbusSteering::update(float steering_out)
                         have_actual_position = true;
 
                         const int32_t max_pulses = travel_limit_pulses();
-                        const int32_t fault_limit = max_pulses + (max_pulses / 2);
-                        if (abs_int32(actual_position) > fault_limit) {
+                        if (abs_int32(actual_position) > max_pulses) {
                             if (!encoder_fault_latched) {
                                 encoder_fault_latched = true;
                                 current_state = DriveState::FAULT_RELEASE;
                                 gcs().send_text(MAV_SEVERITY_CRITICAL,
                                                 "CL57R: encoder %ld out of range (+/-%ld), latched",
                                                 (long)actual_position,
-                                                (long)fault_limit);
+                                                (long)max_pulses);
                             }
                             break;
                         }
@@ -719,7 +718,8 @@ void AP_ModbusSteering::update(float steering_out)
                     just_synced = true;
                 }
 
-                const int32_t emergency_limit = max_pulses + max_pulses / 4;
+                // emergency_limit: если мотор залетел глубоко за лимит — максимальный откат
+                const int32_t emergency_limit = max_pulses + stop_dist;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
                 const bool in_brake_zone_pos = (debug_actual_pulses > brake_zone_start);
