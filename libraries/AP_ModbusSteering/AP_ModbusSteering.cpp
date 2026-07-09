@@ -683,6 +683,7 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                     -max_pulses, max_pulses);
 
+                // Максимальный шаг за один такт (для pull-back у упоров)
                 const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
                                                                      POSITION_SEND_INTERVAL_MS * 2);
 
@@ -695,20 +696,11 @@ void AP_ModbusSteering::update(float steering_out)
                     just_synced = true;
                 }
 
-                int32_t capped_desired = desired;
-
-                const int32_t brake_zone = brake_zone_pulses((uint16_t)max_speed.get(),
-                                                             active_limit,
-                                                             max_pulses);
-                const bool approach_pos = capped_desired > debug_actual_pulses &&
-                                          debug_actual_pulses > max_pulses - brake_zone;
-                const bool approach_neg = capped_desired < debug_actual_pulses &&
-                                          debug_actual_pulses < -max_pulses + brake_zone;
-                const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
-                const bool near_limit = abs_int32(debug_actual_pulses) > max_pulses - active_limit * 4;
                 const int32_t emergency_limit = max_pulses + max_pulses / 4;
+                const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
                 if (abs_int32(debug_actual_pulses) > emergency_limit) {
+                    // Аварийный откат: притянуть к границе с фиксированным шагом
                     const int32_t pull = active_limit * 8;
                     if (debug_actual_pulses > 0) {
                         commanded = debug_actual_pulses - pull;
@@ -718,6 +710,7 @@ void AP_ModbusSteering::update(float steering_out)
                         commanded = MIN(commanded, -max_pulses + active_limit);
                     }
                 } else if (past_limit) {
+                    // Мягкий откат пропорционально перелёту
                     const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
                     const int32_t pull = MIN(MAX(overshoot, active_limit), active_limit * 8);
                     if (debug_actual_pulses > 0) {
@@ -727,18 +720,13 @@ void AP_ModbusSteering::update(float steering_out)
                         commanded = debug_actual_pulses + pull;
                         commanded = MIN(commanded, -max_pulses + active_limit);
                     }
-                } else if (near_limit || approach_pos || approach_neg) {
-                    int32_t step = active_limit;
-                    if (abs_int32(debug_actual_pulses) > max_pulses - active_limit * 3) {
-                        step = MAX(active_limit / 2, 1);
-                    }
-                    commanded = step_toward(last_sent_target_pulses, capped_desired, step);
                 } else if (returning && ret_slew.get() > 0) {
-                    commanded = step_toward(last_sent_target_pulses, capped_desired,
+                    // Возврат в центр с ограниченной скоростью
+                    commanded = step_toward(last_sent_target_pulses, desired,
                                             (int32_t)ret_slew.get());
                 } else {
-                    commanded = step_toward(last_sent_target_pulses, capped_desired,
-                                            active_limit);
+                    // Нормальное слежение: прямая цель от стика, CL57R сам тормозит
+                    commanded = desired;
                 }
 
                 if (abs_int32(debug_actual_pulses) <= max_pulses) {
