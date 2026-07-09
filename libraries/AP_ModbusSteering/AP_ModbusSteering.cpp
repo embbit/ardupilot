@@ -723,8 +723,7 @@ void AP_ModbusSteering::update(float steering_out)
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
                 if (past_limit) {
-                    // Мотор за лимитом. Если стик ведёт к центру — следовать стику.
-                    // Если стик держит у упора — фиксироваться у края.
+                    // Мотор за лимитом. Если стик ведёт к центру — следовать ему.
                     const bool going_back = (debug_actual_pulses > 0)
                         ? (desired < debug_actual_pulses)
                         : (desired > debug_actual_pulses);
@@ -735,14 +734,16 @@ void AP_ModbusSteering::update(float steering_out)
                     } else {
                         commanded = -max_pulses + active_limit;
                     }
-                } else if (returning && ret_slew.get() > 0) {
-                    // Возврат в центр с ограниченной скоростью
-                    commanded = step_toward(last_sent_target_pulses, desired,
-                                            (int32_t)ret_slew.get());
+                } else if (returning) {
+                    // Возврат в центр: плавно двигать цель к нулю со скоростью мотора.
+                    // Это предотвращает перелёт нуля: мотор гонится за движущейся целью
+                    // и тормозит по пути, а не тормозит в одной точке.
+                    const int32_t step = (ret_slew.get() > 0)
+                        ? MIN((int32_t)ret_slew.get(), active_limit)
+                        : active_limit;
+                    commanded = step_toward(last_sent_target_pulses, 0, step);
                 } else {
                     // Прямое управление: стик = абсолютная позиция.
-                    // CL57R тормозит у цели своими рампами ACCEL/DECEL.
-                    // При перелёте упора уменьшите OB_STR_DECEL_MS.
                     commanded = desired;
                 }
 
@@ -766,8 +767,7 @@ void AP_ModbusSteering::update(float steering_out)
                 debug_target_pulses = commanded;
 
                 const bool past_limit_now = abs_int32(debug_actual_pulses) > max_pulses;
-                // near_limit_now: повторная отправка при активном руджении (не при возврате).
-                // При returning=true повторный триггер сбрасывает рампу CL57R — мотор не тормозит.
+                // near_limit_now: дополнительный триггер только при активном рулении.
                 const bool near_limit_now = !returning &&
                                             abs_int32(debug_actual_pulses) >
                                             max_pulses - active_limit * 4;
