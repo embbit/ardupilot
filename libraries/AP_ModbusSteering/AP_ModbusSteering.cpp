@@ -384,14 +384,18 @@ void AP_ModbusSteering::update(float steering_out)
                         have_actual_position = true;
 
                         const int32_t max_pulses = travel_limit_pulses();
-                        if (abs_int32(actual_position) > max_pulses) {
+                        // Разрешаем небольшой перелёт равный TRACK_ERR (8000 имп) —
+                        // нормальная погрешность остановки CL57R. Fault только при
+                        // реальном уходе за лимит, не из-за jitter энкодера.
+                        const int32_t fault_limit = max_pulses + CL57R_TRACK_ERR_DEFAULT;
+                        if (abs_int32(actual_position) > fault_limit) {
                             if (!encoder_fault_latched) {
                                 encoder_fault_latched = true;
                                 current_state = DriveState::FAULT_RELEASE;
                                 gcs().send_text(MAV_SEVERITY_CRITICAL,
                                                 "CL57R: encoder %ld out of range (+/-%ld), latched",
                                                 (long)actual_position,
-                                                (long)max_pulses);
+                                                (long)fault_limit);
                             }
                             break;
                         }
