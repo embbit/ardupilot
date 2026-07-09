@@ -321,7 +321,7 @@ def run_fault_test():
         ["--inject-positions", build_fault_inject_schedule()],
         {"OB_STR_MAX_SPD": 1200},
         test_fault_latched,
-        timeout_s=80,
+        timeout_s=100,
     )
     return rc
 

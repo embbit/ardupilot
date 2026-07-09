@@ -194,6 +194,22 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("INV", 10, AP_ModbusSteering, invert, 1),
 
+    // @Param: ACCEL_MS
+    // @DisplayName: Acceleration time (ms)
+    // @Description: Время разгона CL57R от 0 до MAX_SPD (регистр 0x0031). Увеличьте при рывках на старте.
+    // @Units: ms
+    // @Range: 50 5000
+    // @User: Standard
+    AP_GROUPINFO("ACCEL_MS", 11, AP_ModbusSteering, accel_ms, 400),
+
+    // @Param: DECEL_MS
+    // @DisplayName: Deceleration time (ms)
+    // @Description: Время торможения CL57R от MAX_SPD до 0 (регистр 0x0032). Уменьшите при перелёте упора.
+    // @Units: ms
+    // @Range: 50 5000
+    // @User: Standard
+    AP_GROUPINFO("DECEL_MS", 12, AP_ModbusSteering, decel_ms, 400),
+
     AP_GROUPEND};
 
 AP_ModbusSteering::AP_ModbusSteering()
@@ -608,12 +624,12 @@ void AP_ModbusSteering::update(float steering_out)
         break;
 
     case DriveState::INIT_ACCEL:
-        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0031, 400, tx_packet);
+        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0031, (uint16_t)accel_ms.get(), tx_packet);
         _uart->write(tx_packet, 8);
         break;
 
     case DriveState::INIT_DECEL:
-        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0032, 400, tx_packet);
+        modbus_create_write_packet((uint8_t)slave_id.get(), 0x0032, (uint16_t)decel_ms.get(), tx_packet);
         _uart->write(tx_packet, 8);
         break;
 
@@ -683,16 +699,16 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t desired = clamp_int32((int32_t)(clean_steering * (float)max_pulses),
                                                     -max_pulses, max_pulses);
 
-                // active_limit: расстояние за 2 такта при MAX_SPD.
+                // Шаг за 1 такт и тормозной путь.
                 const int32_t active_limit = speed_move_limit_pulses((uint16_t)max_speed.get(),
                                                                      POSITION_SEND_INTERVAL_MS * 2);
+                // stop_dist = v * DECEL_MS/2000 (расстояние при торможении с полной скорости)
+                const int32_t stop_dist = speed_move_limit_pulses((uint16_t)max_speed.get(),
+                                                                   (uint32_t)decel_ms.get());
 
-                // stop_dist: тормозной путь при полной скорости и DECEL=400ms.
-                // v * decel/2 = (rpm*4000/60) * 0.4/2 = active_limit * 2
-                const int32_t stop_dist = active_limit * 2;
-
-                // brake_zone: начало зоны торможения (за stop_dist*4 до упора, ~2 тормозных пути)
-                const int32_t brake_zone_start = max_pulses - stop_dist * 4;
+                // Brake zone: начинается за stop_dist*3 до упора.
+                // С запасом 3x: на неточность DECEL + инерцию нагрузки.
+                const int32_t brake_zone_start = MAX(max_pulses - stop_dist * 3, max_pulses / 2);
 
                 bool just_synced = false;
                 int32_t commanded;
@@ -706,13 +722,11 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t emergency_limit = max_pulses + max_pulses / 4;
                 const bool past_limit = abs_int32(debug_actual_pulses) > max_pulses;
 
-                // Тормозная зона активна, если actual в опасной зоне ИЛИ уже за лимитом.
-                // Условие не зависит от направления стика — работает и при отпускании.
                 const bool in_brake_zone_pos = (debug_actual_pulses > brake_zone_start);
                 const bool in_brake_zone_neg = (debug_actual_pulses < -brake_zone_start);
 
                 if (abs_int32(debug_actual_pulses) > emergency_limit) {
-                    // Аварийный откат: сильная тяга от actual, нет нижнего пола
+                    // Аварийный откат: тянуть к soft limit от текущей позиции
                     const int32_t pull = stop_dist * 4;
                     if (debug_actual_pulses > 0) {
                         commanded = debug_actual_pulses - pull;
@@ -720,25 +734,28 @@ void AP_ModbusSteering::update(float steering_out)
                         commanded = debug_actual_pulses + pull;
                     }
                 } else if (past_limit) {
-                    // За лимитом: откат с ускоренной тягой, без пола
-                    const int32_t overshoot = abs_int32(debug_actual_pulses) - max_pulses;
-                    const int32_t pull = MIN(MAX(overshoot * 2, stop_dist), stop_dist * 4);
+                    // За лимитом: откат на stop_dist от actual
+                    const int32_t pull = MAX(stop_dist, active_limit);
                     if (debug_actual_pulses > 0) {
                         commanded = debug_actual_pulses - pull;
                     } else {
                         commanded = debug_actual_pulses + pull;
                     }
                 } else if (in_brake_zone_pos) {
-                    // В тормозной зоне (+): цель ограничена actual + active_limit
-                    // При stik=0 (desired<actual) — это уводит цель к 0, мотор тормозит
-                    commanded = clamp_int32(desired,
-                                           debug_actual_pulses - stop_dist * 2,
-                                           debug_actual_pulses + active_limit);
+                    // В brake zone (+): фиксированная цель max_pulses.
+                    // CL57R получает постоянную цель — тормозит и останавливается у упора.
+                    // Если стик в центре (desired < actual) — даём desired (уйти от упора).
+                    if (desired < debug_actual_pulses) {
+                        commanded = desired;
+                    } else {
+                        commanded = max_pulses;
+                    }
                 } else if (in_brake_zone_neg) {
-                    // В тормозной зоне (-): симметрично
-                    commanded = clamp_int32(desired,
-                                           debug_actual_pulses - active_limit,
-                                           debug_actual_pulses + stop_dist * 2);
+                    if (desired > debug_actual_pulses) {
+                        commanded = desired;
+                    } else {
+                        commanded = -max_pulses;
+                    }
                 } else if (returning && ret_slew.get() > 0) {
                     // Возврат в центр с ограниченной скоростью
                     commanded = step_toward(last_sent_target_pulses, desired,
@@ -748,7 +765,7 @@ void AP_ModbusSteering::update(float steering_out)
                     commanded = desired;
                 }
 
-                // Финальный clamp: в норме — в пределах лимита; за лимитом — не дальше actual
+                // Финальный clamp
                 if (!past_limit) {
                     commanded = clamp_int32(commanded, -max_pulses, max_pulses);
                 } else if (debug_actual_pulses > 0) {
