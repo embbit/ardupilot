@@ -766,8 +766,11 @@ void AP_ModbusSteering::update(float steering_out)
                 debug_target_pulses = commanded;
 
                 const bool past_limit_now = abs_int32(debug_actual_pulses) > max_pulses;
-                const bool near_limit_now = abs_int32(debug_actual_pulses) >
-                    max_pulses - active_limit * 4;
+                // near_limit_now: повторная отправка при активном руджении (не при возврате).
+                // При returning=true повторный триггер сбрасывает рампу CL57R — мотор не тормозит.
+                const bool near_limit_now = !returning &&
+                                            abs_int32(debug_actual_pulses) >
+                                            max_pulses - active_limit * 4;
                 const bool should_send = just_synced ||
                                          !have_sent_target ||
                                          commanded != last_sent_target_pulses ||
