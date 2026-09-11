@@ -230,6 +230,7 @@ void AP_ModbusSteering::update(float steering_out)
     static uint32_t last_steer_vect_ms = 0;
     static uint8_t rx_acc[64];
     static uint8_t rx_len = 0;
+    static uint16_t last_read_reg = 0;
 
     // Stick command in pulses, independent of encoder/init so GCS graphs move with RC.
     {
@@ -315,10 +316,11 @@ void AP_ModbusSteering::update(float steering_out)
                 response_received = true;
             }
         } else if (fn == 0x03 && frame_len >= 9 && rx_acc[offset + 2] == 0x04) {
-            if (current_state == DriveState::RUN_READ_STATUS) {
+            // Parse by last requested register. RUN no longer waits in READ_*
+            // for the echo, so a delayed 0x03 can arrive during WRITE_POS.
+            if (last_read_reg == REG_STATUS_WORD) {
                 const uint16_t status_word = (rx_acc[offset + 3] << 8) | rx_acc[offset + 4];
                 const uint16_t error_code = (rx_acc[offset + 5] << 8) | rx_acc[offset + 6];
-                response_received = true;
 
                 if (error_code != last_driver_error_code) {
                     if (error_code != 0) {
@@ -346,7 +348,8 @@ void AP_ModbusSteering::update(float steering_out)
                                     (unsigned)((status_word >> 4) & 1));
                     last_driver_status_word = status_word;
                 }
-            } else if (current_state >= DriveState::RUN_WRITE_POS) {
+            } else if (last_read_reg == REG_ENCODER_POS ||
+                       current_state == DriveState::FAULT_LATCHED) {
                 uint16_t high_word = (rx_acc[offset + 3] << 8) | rx_acc[offset + 4];
                 uint16_t low_word = (rx_acc[offset + 5] << 8) | rx_acc[offset + 6];
                 int32_t actual_position = static_cast<int32_t>(((uint32_t)high_word << 16) | low_word);
@@ -363,9 +366,6 @@ void AP_ModbusSteering::update(float steering_out)
                                         (long)actual_position,
                                         (long)fault_limit);
                     }
-                } else if (current_state == DriveState::RUN_READ_POS ||
-                           current_state == DriveState::FAULT_LATCHED) {
-                    response_received = (current_state == DriveState::RUN_READ_POS);
                 }
             }
         }
@@ -388,6 +388,7 @@ void AP_ModbusSteering::update(float steering_out)
         (now - last_telemetry_rcvd_ms) > 2000) {
         last_telemetry_rcvd_ms = now;
         rx_len = 0;
+        current_state = DriveState::RUN_WRITE_POS;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout, continuing");
     }
 
@@ -440,19 +441,8 @@ void AP_ModbusSteering::update(float steering_out)
             gcs().send_text(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
             break;
         case DriveState::RUN_WRITE_POS:
-            current_state = DriveState::RUN_READ_POS;
-            break;
         case DriveState::RUN_READ_POS:
-            position_cycles_since_status++;
-            if (position_cycles_since_status >= STATUS_READ_EVERY_N_CYCLES) {
-                position_cycles_since_status = 0;
-                current_state = DriveState::RUN_READ_STATUS;
-            } else {
-                current_state = DriveState::RUN_WRITE_POS;
-            }
-            break;
         case DriveState::RUN_READ_STATUS:
-            current_state = DriveState::RUN_WRITE_POS;
             break;
         case DriveState::FAULT_RELEASE:
             current_state = DriveState::FAULT_LATCHED;
@@ -644,15 +634,25 @@ void AP_ModbusSteering::update(float steering_out)
 
     case DriveState::RUN_READ_POS:
     {
+        last_read_reg = REG_ENCODER_POS;
         modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
         _uart->write(tx_packet, 8);
+        position_cycles_since_status++;
+        if (position_cycles_since_status >= STATUS_READ_EVERY_N_CYCLES) {
+            position_cycles_since_status = 0;
+            current_state = DriveState::RUN_READ_STATUS;
+        } else {
+            current_state = DriveState::RUN_WRITE_POS;
+        }
         break;
     }
 
     case DriveState::RUN_READ_STATUS:
     {
+        last_read_reg = REG_STATUS_WORD;
         modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS_WORD, 2, tx_packet);
         _uart->write(tx_packet, 8);
+        current_state = DriveState::RUN_WRITE_POS;
         break;
     }
     }

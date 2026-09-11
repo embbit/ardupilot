@@ -76,11 +76,13 @@ def wait_for_status(events, needle, timeout_s=60):
     return False
 
 
-def run_sitl(link_drop_delay=None, link_down_duration=None):
+def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
     sitl_lines = []
     sim_lines = []
 
     sim_cmd = [sys.executable, "-u", os.path.join(ROOT, "outb_steer_sim.py")]
+    if mute_reads:
+        sim_cmd.append("--mute-reads")
     if link_drop_delay is not None:
         sim_cmd.extend([
             "--link-drop-delay", str(link_drop_delay),
@@ -291,12 +293,18 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
 
 def main():
     parser = argparse.ArgumentParser(description="SITL test for CL57R Modbus steering")
-    parser.add_argument("--test", choices=("basic", "link-loss", "all"), default="all")
+    parser.add_argument("--test", choices=("basic", "link-loss", "encoder-mute", "all"), default="all")
     args = parser.parse_args()
 
     if args.test in ("basic", "all"):
         print("=== BASIC STEERING + INERTIA TEST ===")
         rc = run_sitl()
+        if rc != 0:
+            return rc
+
+    if args.test in ("encoder-mute", "all"):
+        print("=== STICK MOVES WITH MUTED ENCODER READS ===")
+        rc = run_sitl(mute_reads=True)
         if rc != 0:
             return rc
 

@@ -297,7 +297,7 @@ def handle_write_single(reg_addr, val):
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
                          telemetry_file=None, link_drops=None, inject_positions=None,
-                         alarm_events=None):
+                         alarm_events=None, mute_reads=False):
     motor.encoder_lag_s = encoder_lag_ms / 1000.0
     motor.reported_position = motor.position
     sim_state["telemetry_file"] = telemetry_file
@@ -405,7 +405,9 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                         response.extend(req[2:6])
 
                     elif func_code == 0x03:
-                        if reg_addr == 0x0007:
+                        if mute_reads:
+                            pass
+                        elif reg_addr == 0x0007:
                             high_word, low_word = encode_position(motor.encoder_pos)
                             response.append(slave_id)
                             response.append(0x03)
@@ -464,6 +466,8 @@ def parse_args():
                         help="Comma-separated delay:position pairs, e.g. 8:-310000")
     parser.add_argument("--alarm-events", type=str, default=None,
                         help="Comma-separated delay:position pairs to raise tracking-error alarm")
+    parser.add_argument("--mute-reads", action="store_true",
+                        help="Ack writes but never reply to 0x03 (encoder/status)")
     return parser.parse_args()
 
 
@@ -493,4 +497,4 @@ if __name__ == "__main__":
     if drop_delay is not None:
         link_drops = [(drop_delay, down_duration)]
     run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file,
-                         link_drops, inject_positions, alarm_events)
+                         link_drops, inject_positions, alarm_events, args.mute_reads)
