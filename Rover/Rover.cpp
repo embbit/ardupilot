@@ -597,6 +597,15 @@ void Rover::modbus_steering_update()
     }
 
     modbus_steering.update(current_steering);
+
+    // Stick input for QGC graphs: if STR_IN stays 0 while moving sticks,
+    // the problem is RC/RCMAP/override — not the Modbus driver.
+    static uint32_t last_str_in_ms;
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - last_str_in_ms >= 100) {
+        last_str_in_ms = now_ms;
+        gcs().send_named_float("STR_IN", current_steering);
+    }
 }
 
 
