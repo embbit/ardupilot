@@ -196,9 +196,9 @@ def run_case(name, rpm, stick_fn, duration_s, encoder_lag_ms=0.0):
         print(f"  max_enc_lag={stats['max_enc_lag']}")
 
         mav_track = sum(1 for t in events if "error 0x0004" in t or "Tracking error" in t)
-        # STATUSTEXT may be split across packets (e.g. "...out of range..." then "latched")
-        joined = " ".join(events)
-        mav_latched = ("out of range" in joined and "latched" in joined)
+        # STATUSTEXT may be split mid-word (e.g. "...out of range..., l" + "atched")
+        joined = "".join(events)
+        mav_latched = ("out of range" in joined and "atched" in joined)
         mav_travel = ("travel limit exceeded" in joined)
         print(f"  mav_tracking_errors={mav_track} mav_latched={int(mav_latched)} mav_travel={int(mav_travel)}")
 
