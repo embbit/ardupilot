@@ -642,6 +642,11 @@ void AP_ModbusSteering::update(float steering_out)
                 last_sent_target_pulses = commanded;
                 have_sent_target = true;
                 last_divergence_send_ms = now;
+            } else {
+                // Stick still / deadband: keep a 0x06 exchange so the 2s
+                // link timeout cannot fire while the drive is still on the bus.
+                modbus_create_write_packet((uint8_t)slave_id.get(), REG_MOTOR_ENABLE, 0x0001, tx_packet);
+                _uart->write(tx_packet, 8);
             }
 
             current_state = DriveState::RUN_READ_POS;
