@@ -381,6 +381,19 @@ void GCS::send_named_int(const char *name, int32_t value) const
 #endif  // HAL_LOGGING_ENABLED
 }
 
+void GCS::send_debug_vect(const char *name, float x, float y, float z) const
+{
+    mavlink_debug_vect_t packet {};
+    packet.time_usec = AP_HAL::micros64();
+    packet.x = x;
+    packet.y = y;
+    packet.z = z;
+    memcpy(packet.name, name, MIN(strlen(name), (uint8_t)MAVLINK_MSG_DEBUG_VECT_FIELD_NAME_LEN));
+
+    gcs().send_to_active_channels(MAVLINK_MSG_ID_DEBUG_VECT,
+                                  (const char *)&packet);
+}
+
 void GCS::send_named_string(const char *name, const char *value) const
 {
     mavlink_named_value_string_t packet {};

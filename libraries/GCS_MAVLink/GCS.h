@@ -1204,6 +1204,7 @@ public:
     void send_mission_item_reached_message(uint16_t mission_index);
     void send_named_float(const char *name, float value) const;
     void send_named_int(const char *name, int32_t value) const;
+    void send_debug_vect(const char *name, float x, float y, float z) const;
     void send_named_string(const char *name, const char *value) const;
 
     void send_parameter_value(const char *param_name,
