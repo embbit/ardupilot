@@ -44,24 +44,30 @@ void modbus_create_write_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t va
     out_buffer[7] = (uint8_t)((crc >> 8) & 0xFF);
 }
 
-void modbus_create_write32_packet(uint8_t slave_id, uint16_t reg_addr, int32_t value, uint8_t *out_buffer) {
+void modbus_create_write_multiple_packet(uint8_t slave_id, uint16_t start_reg, uint16_t reg_count, const uint16_t *reg_values, uint8_t *out_buffer) {
     out_buffer[0] = slave_id;
-    out_buffer[1] = 0x10; 
-    out_buffer[2] = (uint8_t)((reg_addr >> 8) & 0xFF);
-    out_buffer[3] = (uint8_t)(reg_addr & 0xFF);
-    out_buffer[4] = 0x00;
-    out_buffer[5] = 0x02; // Пишем 2 регистра (32 бита)
-    out_buffer[6] = 0x04; // 4 байта данных
+    out_buffer[1] = 0x10; // Write Multiple Registers
+    out_buffer[2] = (uint8_t)((start_reg >> 8) & 0xFF);
+    out_buffer[3] = (uint8_t)(start_reg & 0xFF);
+    out_buffer[4] = (uint8_t)((reg_count >> 8) & 0xFF);
+    out_buffer[5] = (uint8_t)(reg_count & 0xFF);
     
-    out_buffer[7]  = (uint8_t)(value >> 24);
-    out_buffer[8]  = (uint8_t)(value >> 16);
-    out_buffer[9]  = (uint8_t)(value >> 8);
-    out_buffer[10] = (uint8_t)value;
+    uint8_t byte_count = (uint8_t)(reg_count * 2);
+    out_buffer[6] = byte_count;
     
-    uint16_t crc = modbus_crc16(out_buffer, 11);
-    out_buffer[11] = (uint8_t)(crc & 0xFF);
-    out_buffer[12] = (uint8_t)((crc >> 8) & 0xFF);
+    uint8_t idx = 7;
+    for (uint16_t i = 0; i < reg_count; i++) {
+        out_buffer[idx++] = (uint8_t)((reg_values[i] >> 8) & 0xFF);
+        out_buffer[idx++] = (uint8_t)(reg_values[i] & 0xFF);
+    }
+    
+    // Считаем CRC для всего пакета перед контрольной суммой (7 байт заголовка + байты данных)
+    uint16_t crc = modbus_crc16(out_buffer, idx);
+    out_buffer[idx++] = (uint8_t)(crc & 0xFF);
+    out_buffer[idx++] = (uint8_t)((crc >> 8) & 0xFF);
 }
+
+
 
 void modbus_create_read_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t reg_count, uint8_t *out_buffer) {
     out_buffer[0] = slave_id;
