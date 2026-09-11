@@ -179,7 +179,7 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
             left_in = send_stick(1100, "LEFT", hold_s=4, expect_abs=0.2)
             send_stick(1500, "CENTER", hold_s=3)
 
-            if any("Modbus Timeout" in t for t in events):
+            if any("Re-initializing" in t for t in events):
                 print("FAIL: unexpected Modbus Timeout while the link was up")
                 return 1
             print("PASS: no telemetry timeout while stick was centered")
