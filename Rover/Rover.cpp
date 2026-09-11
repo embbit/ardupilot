@@ -569,37 +569,26 @@ void Rover::modbus_steering_update()
 {
     float current_steering = 0.0f;
 
-    // MANUAL: read RCMAP roll via get_radio_in() so GCS RC overrides
-    // (QGC joystick) work. Do NOT use hal.rcin->read() — it ignores overrides.
+    // MANUAL: read channel_steer (RCMAP roll) via get_radio_in()/norm_input()
+    // so physical RC, RC_CHANNELS_OVERRIDE and QGC joystick all work.
+    // motors.get_steering() is not used here: throttle failsafe zeros that path.
     if (control_mode == &mode_manual) {
-        RC_Channel *roll_ch = rc().channel(rcmap.roll() - 1);
-        if (roll_ch == nullptr) {
-            current_steering = 0.0f;
-        } else {
-            const uint16_t raw_pwm = roll_ch->get_radio_in();
-
-            // No valid RC / override yet (PWM out of range) → hold center
-            if (raw_pwm < 900 || raw_pwm > 2100) {
-                current_steering = 0.0f;
-            } else {
-                const int16_t center = roll_ch->get_radio_trim();
-                const int16_t half_left = center - roll_ch->get_radio_min();
-                const int16_t half_right = roll_ch->get_radio_max() - center;
-                const int16_t half_range = MAX(half_left, half_right);
-                if (half_range > 0) {
-                    current_steering = ((float)raw_pwm - (float)center) / (float)half_range;
-                }
+        RC_Channel *steer_ch = channel_steer;
+        if (steer_ch != nullptr) {
+            const uint16_t raw_pwm = steer_ch->get_radio_in();
+            if (raw_pwm >= 900 && raw_pwm <= 2100) {
+                current_steering = constrain_float(steer_ch->norm_input(), -1.0f, 1.0f);
             }
         }
     } else {
-        // AUTO/GUIDED: motors output is ±4500, driver expects ±1
+        // AUTO/GUIDED/STEERING: motors output is already ±4500
         current_steering = constrain_float(g2.motors.get_steering() / 4500.0f, -1.0f, 1.0f);
     }
 
     modbus_steering.update(current_steering);
 
-    // Stick input for QGC graphs: if STR_IN stays 0 while moving sticks,
-    // the problem is RC/RCMAP/override — not the Modbus driver.
+    // STR_IN is independent of Modbus telemetry: if it stays 0 while moving
+    // sticks, the problem is RC/RCMAP/override, not the CL57R driver.
     static uint32_t last_str_in_ms;
     const uint32_t now_ms = AP_HAL::millis();
     if (now_ms - last_str_in_ms >= 100) {

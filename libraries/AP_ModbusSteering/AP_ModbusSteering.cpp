@@ -204,6 +204,22 @@ void AP_ModbusSteering::update(float steering_out)
     static bool encoder_fault_latched = false;
     static bool pending_alarm_clear = false;
     static uint32_t last_divergence_send_ms = 0;
+    static uint8_t init_attempts = 0;
+    static uint32_t last_steer_vect_ms = 0;
+
+    // Stick command in pulses, independent of encoder/init so GCS graphs move with RC.
+    {
+        const int32_t max_pulses = travel_limit_pulses();
+        const int32_t stick_pulses = clamp_int32((int32_t)(steering_out * (float)max_pulses),
+                                                 -max_pulses, max_pulses);
+        if (now - last_steer_vect_ms >= 200) {
+            last_steer_vect_ms = now;
+            gcs().send_debug_vect("STEER",
+                                  (float)debug_actual_pulses,
+                                  (float)stick_pulses,
+                                  (float)(stick_pulses - debug_actual_pulses));
+        }
+    }
 
     // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
     if (available_bytes > 0)
@@ -359,6 +375,7 @@ void AP_ModbusSteering::update(float steering_out)
         position_cycles_since_status = 0;
         last_sent_target_pulses = 0;
         have_sent_target = false;
+        init_attempts = 0;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 
@@ -378,6 +395,7 @@ void AP_ModbusSteering::update(float steering_out)
     if (response_received)
     {
         response_received = false;
+        init_attempts = 0;
         switch (current_state)
         {
         case DriveState::INIT_ENABLE:
@@ -429,6 +447,22 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         case DriveState::FAULT_LATCHED:
             break;
+        }
+    }
+
+    // If a CL57R register does not echo 0x06, skip the step after 2s.
+    // Stick commands never reach RUN_WRITE_POS until the sequence completes.
+    if (current_state <= DriveState::INIT_ABS_MODE) {
+        if (init_attempts == 0) {
+            gcs().send_text(MAV_SEVERITY_INFO, "CL57R: init step %d", (int)current_state);
+        }
+        init_attempts++;
+        if (init_attempts >= 40) {
+            gcs().send_text(MAV_SEVERITY_WARNING,
+                            "CL57R: init step %d no echo, continuing",
+                            (int)current_state);
+            response_received = true;
+            init_attempts = 0;
         }
     }
 

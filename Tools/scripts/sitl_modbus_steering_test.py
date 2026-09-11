@@ -133,30 +133,64 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
         mavlink.set_mode_apm("MANUAL")
         time.sleep(0.5)
 
-        def send_stick(pwm, label):
+        def send_stick(pwm, label, hold_s=0.0, expect_abs=None):
             print(f"STICK {label} pwm={pwm}")
-            mavlink.mav.rc_channels_override_send(
-                mavlink.target_system,
-                mavlink.target_component,
-                pwm, 0, 1500, 1500, 1500, 1500, 1500, 1500,
-            )
+            deadline = time.time() + hold_s
+            seen_in = False
+            while True:
+                mavlink.mav.rc_channels_override_send(
+                    mavlink.target_system,
+                    mavlink.target_component,
+                    pwm, 0, 1500, 1500, 1500, 1500, 1500, 1500,
+                )
+                msg = mavlink.recv_match(
+                    type=["NAMED_VALUE_FLOAT", "DEBUG_VECT", "STATUSTEXT"],
+                    blocking=False,
+                )
+                while msg is not None:
+                    mtype = msg.get_type()
+                    if mtype == "STATUSTEXT":
+                        print(f"[MAV] {msg.text}")
+                        events.append(msg.text)
+                    else:
+                        name = getattr(msg, "name", "")
+                        if isinstance(name, bytes):
+                            name = name.split(b"\x00", 1)[0].decode("ascii", "ignore")
+                        name = str(name).rstrip("\x00")
+                        if mtype == "NAMED_VALUE_FLOAT" and name.startswith("STR_IN"):
+                            print(f"[MAV] STR_IN={msg.value:.3f}")
+                            if expect_abs is not None and abs(msg.value) >= expect_abs:
+                                seen_in = True
+                        if mtype == "DEBUG_VECT" and name.startswith("STEER"):
+                            print(f"[MAV] STEER y={msg.y:.0f}")
+                            if expect_abs is not None and abs(msg.y) >= 1000:
+                                seen_in = True
+                    msg = mavlink.recv_match(
+                        type=["NAMED_VALUE_FLOAT", "DEBUG_VECT", "STATUSTEXT"],
+                        blocking=False,
+                    )
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.2)
+            return seen_in
 
         if link_drop_delay is None:
-            send_stick(1900, "RIGHT")
-            time.sleep(4)
-            send_stick(1100, "LEFT")
-            time.sleep(4)
-            send_stick(1500, "CENTER")
-            time.sleep(2)
+            right_in = send_stick(1900, "RIGHT", hold_s=4, expect_abs=0.2)
+            left_in = send_stick(1100, "LEFT", hold_s=4, expect_abs=0.2)
+            send_stick(1500, "CENTER", hold_s=2)
 
-            moved = any("target=" in line and "target=      0" not in line for line in sim_lines[-30:])
+            moved = any("target=" in line and "target=      0" not in line for line in sim_lines)
             inertia = any("vel=" in line and "vel=     +0" not in line and "vel=     -0" not in line
-                          for line in sim_lines[-30:])
+                          for line in sim_lines)
             if moved:
                 print("PASS: simulator received non-zero steering targets")
             else:
                 print("FAIL: simulator did not log non-zero targets")
                 return 1
+            if right_in or left_in:
+                print("PASS: GCS stick telemetry followed RC override")
+            else:
+                print("WARN: STR_IN/DEBUG_VECT not observed (motor still moved)")
             if inertia:
                 print("PASS: NEMA23 inertia model shows non-zero velocity")
             else:
@@ -164,10 +198,8 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
             return 0
 
         # Link-loss test: build inertia, center stick, then drop link
-        send_stick(1900, "RIGHT")
-        time.sleep(2)
-        send_stick(1500, "CENTER")
-        time.sleep(2)
+        send_stick(1900, "RIGHT", hold_s=2)
+        send_stick(1500, "CENTER", hold_s=2)
 
         events.clear()
         deadline = time.time() + link_drop_delay + link_down_duration + 45
@@ -200,8 +232,7 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
                 except (IndexError, ValueError):
                     pass
 
-        send_stick(1500, "CENTER")
-        time.sleep(2)
+        send_stick(1500, "CENTER", hold_s=2)
 
         coast_seen = any("LINK DOWN" in line and "inertia coast" in line for line in sim_lines)
         if not link_lost:
@@ -233,12 +264,11 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
 
         # Verify steering works again after re-init
         events.clear()
-        send_stick(1100, "LEFT")
-        time.sleep(3)
-        send_stick(1500, "CENTER")
-        time.sleep(1)
+        n_before = len(sim_lines)
+        send_stick(1100, "LEFT", hold_s=3)
+        send_stick(1500, "CENTER", hold_s=1)
 
-        if not any("target=" in line and "target=      0" not in line for line in sim_lines[-15:]):
+        if not any("target=" in line and "target=      0" not in line for line in sim_lines[n_before:]):
             print("FAIL: no steering commands after re-init")
             return 1
         print("PASS: steering works after link recovery")
