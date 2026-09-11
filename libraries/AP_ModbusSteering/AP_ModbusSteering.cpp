@@ -217,7 +217,7 @@ void AP_ModbusSteering::update(float steering_out)
             gcs().send_debug_vect("STEER",
                                   (float)debug_actual_pulses,
                                   (float)stick_pulses,
-                                  (float)(stick_pulses - debug_actual_pulses));
+                                  (float)debug_target_pulses);
         }
     }
 
@@ -303,11 +303,6 @@ void AP_ModbusSteering::update(float steering_out)
                         }
 
                         response_received = (current_state == DriveState::RUN_READ_POS);
-
-                        gcs().send_debug_vect("STEER",
-                                              (float)debug_actual_pulses,
-                                              (float)debug_target_pulses,
-                                              (float)(debug_target_pulses - debug_actual_pulses));
                         break;
                     }
                 }
