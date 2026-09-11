@@ -196,7 +196,11 @@ def run_case(name, rpm, stick_fn, duration_s, encoder_lag_ms=0.0):
         print(f"  max_enc_lag={stats['max_enc_lag']}")
 
         mav_track = sum(1 for t in events if "error 0x0004" in t or "Tracking error" in t)
-        print(f"  mav_tracking_errors={mav_track}")
+        # STATUSTEXT may be split across packets (e.g. "...out of range..." then "latched")
+        joined = " ".join(events)
+        mav_latched = ("out of range" in joined and "latched" in joined)
+        mav_travel = ("travel limit exceeded" in joined)
+        print(f"  mav_tracking_errors={mav_track} mav_latched={int(mav_latched)} mav_travel={int(mav_travel)}")
 
         # Pass criteria
         if name.startswith("slow"):
@@ -213,9 +217,16 @@ def run_case(name, rpm, stick_fn, duration_s, encoder_lag_ms=0.0):
         if encoder_lag_ms > 0 and stats["max_enc_lag"] < encoder_lag_ms * rpm * CL57R_STEPS_PER_REV / 60000:
             print("WARN: encoder lag lower than expected")
 
-        if name.startswith("desync") and stats["track_err_count"] == 0 and mav_track == 0:
-            print("FAIL: encoder desync case produced no tracking errors")
-            return rc
+        # Desync can surface as tracking-error alarm OR as encoder past fault_limit
+        # (high RPM + lag overshoots soft limit and latches before alarm bit is read).
+        if name.startswith("desync"):
+            desync_seen = (stats["track_err_count"] > 0 or mav_track > 0 or
+                           mav_latched or mav_travel)
+            if not desync_seen:
+                print("FAIL: encoder desync case produced no tracking/fault response")
+                return rc
+            if mav_latched and mav_track == 0:
+                print("WARN: desync latched on fault_limit before tracking-error alarm")
 
         print(f"PASS: {name} @ {rpm} RPM")
         rc = 0

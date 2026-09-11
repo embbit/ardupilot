@@ -569,24 +569,30 @@ void Rover::modbus_steering_update()
 {
     float current_steering = 0.0f;
 
-    // В ручном режиме MANUAL читаем канал руля через RCMAP (не сырой канал 0)
+    // MANUAL: read RCMAP roll via get_radio_in() so GCS RC overrides
+    // (QGC joystick) work. Do NOT use hal.rcin->read() — it ignores overrides.
     if (control_mode == &mode_manual) {
         RC_Channel *roll_ch = rc().channel(rcmap.roll() - 1);
-        const uint16_t raw_pwm = roll_ch->get_radio_in();
-
-        if (raw_pwm < 900 || raw_pwm > 2100) {
+        if (roll_ch == nullptr) {
             current_steering = 0.0f;
         } else {
-            const int16_t center = roll_ch->get_radio_trim();
-            const int16_t half_left = center - roll_ch->get_radio_min();
-            const int16_t half_right = roll_ch->get_radio_max() - center;
-            const int16_t half_range = MAX(half_left, half_right);
-            if (half_range > 0) {
-                current_steering = ((float)raw_pwm - (float)center) / (float)half_range;
+            const uint16_t raw_pwm = roll_ch->get_radio_in();
+
+            // No valid RC / override yet (PWM out of range) → hold center
+            if (raw_pwm < 900 || raw_pwm > 2100) {
+                current_steering = 0.0f;
+            } else {
+                const int16_t center = roll_ch->get_radio_trim();
+                const int16_t half_left = center - roll_ch->get_radio_min();
+                const int16_t half_right = roll_ch->get_radio_max() - center;
+                const int16_t half_range = MAX(half_left, half_right);
+                if (half_range > 0) {
+                    current_steering = ((float)raw_pwm - (float)center) / (float)half_range;
+                }
             }
         }
     } else {
-        // В автоматических режимах (AUTO, GUIDED) — нормализованный руль ±1
+        // AUTO/GUIDED: motors output is ±4500, driver expects ±1
         current_steering = constrain_float(g2.motors.get_steering() / 4500.0f, -1.0f, 1.0f);
     }
 
