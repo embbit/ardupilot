@@ -57,6 +57,28 @@ static int32_t abs_int32(int32_t value)
     return (value >= 0) ? value : -value;
 }
 
+// Complete RTU frame length, or 0 if unknown / not enough header bytes.
+static uint8_t modbus_rtu_frame_len(const uint8_t *buf, uint8_t avail)
+{
+    if (avail < 2) {
+        return 0;
+    }
+    const uint8_t fn = buf[1];
+    if (fn == 0x06 || fn == 0x10) {
+        return 8;
+    }
+    if (fn == 0x03) {
+        if (avail < 3) {
+            return 0;
+        }
+        return (uint8_t)(5 + buf[2]);
+    }
+    if ((fn & 0x80) != 0) {
+        return 5;
+    }
+    return 0;
+}
+
 const char *cl57r_error_str(uint16_t code)
 {
     switch (code) {
@@ -206,6 +228,8 @@ void AP_ModbusSteering::update(float steering_out)
     static uint32_t last_divergence_send_ms = 0;
     static uint8_t init_attempts = 0;
     static uint32_t last_steer_vect_ms = 0;
+    static uint8_t rx_acc[64];
+    static uint8_t rx_len = 0;
 
     // Stick command in pulses, independent of encoder/init so GCS graphs move with RC.
     {
@@ -221,144 +245,135 @@ void AP_ModbusSteering::update(float steering_out)
         }
     }
 
-    // --- БЛОК АППАРАТНОГО ПАРСИНГА ОТВЕТОВ ВНУТРИ C++ ---
-    if (available_bytes > 0)
-    {
-        uint8_t local_buf[64];
-        if (available_bytes > 64)
-        {
-            available_bytes = 64;
+    // Reassemble RTU frames. Partial UART reads must not discard a half-frame.
+    while (available_bytes > 0) {
+        if (rx_len >= sizeof(rx_acc)) {
+            rx_len = 0;
         }
-        for (uint32_t i = 0; i < available_bytes; i++)
-        {
-            local_buf[i] = _uart->read();
+        rx_acc[rx_len++] = _uart->read();
+        available_bytes--;
+    }
+
+    uint16_t offset = 0;
+    while ((uint16_t)rx_len - offset >= 5) {
+        if (rx_acc[offset] != (uint8_t)slave_id.get()) {
+            offset++;
+            continue;
+        }
+        const uint8_t frame_len = modbus_rtu_frame_len(&rx_acc[offset], (uint8_t)(rx_len - offset));
+        if (frame_len == 0) {
+            offset++;
+            continue;
+        }
+        if ((uint16_t)(rx_len - offset) < frame_len) {
+            break;
+        }
+        const uint16_t received_crc = (rx_acc[offset + frame_len - 1] << 8) | rx_acc[offset + frame_len - 2];
+        if (modbus_crc16(&rx_acc[offset], frame_len - 2) != received_crc) {
+            offset++;
+            continue;
         }
 
-        // 1. Парсинг эха для шагов инициализации (строгая проверка регистров)
-        if ((current_state < DriveState::RUN_WRITE_POS || current_state == DriveState::FAULT_RELEASE) && available_bytes >= 8)
-        {
-            for (uint32_t i = 0; i <= available_bytes - 8; i++)
-            {
-                if (local_buf[i] == (uint8_t)slave_id.get())
-                {
-                    uint16_t reg = (local_buf[i + 2] << 8) | local_buf[i + 3];
-                    uint16_t received_crc = (local_buf[i + 7] << 8) | local_buf[i + 6];
-                    if (modbus_crc16(&local_buf[i], 6) == received_crc)
-                    {
-                        if (current_state == DriveState::INIT_ENABLE && reg == REG_MOTOR_ENABLE)
-                            response_received = true;
-                        if (current_state == DriveState::FAULT_RELEASE && reg == REG_MOTOR_ENABLE)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_CLEAR_ALARM && reg == REG_AUX_CONTROL)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_SUBDIVISION && reg == 0x0023)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_START_SPD && reg == 0x0030)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_MAX_SPD && reg == 0x0033)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_ACCEL && reg == 0x0031)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_DECEL && reg == 0x0032)
-                            response_received = true;
-                        if (current_state == DriveState::INIT_ABS_MODE && reg == REG_POS_MODE)
-                            response_received = true;
-                        break;
+        const uint8_t fn = rx_acc[offset + 1];
+        const bool in_run = (current_state >= DriveState::RUN_WRITE_POS &&
+                             current_state <= DriveState::RUN_READ_STATUS);
+        if (in_run) {
+            last_telemetry_rcvd_ms = now;
+        }
+
+        if (fn == 0x06 && frame_len >= 8) {
+            const uint16_t reg = (rx_acc[offset + 2] << 8) | rx_acc[offset + 3];
+            if (current_state == DriveState::INIT_ENABLE && reg == REG_MOTOR_ENABLE) {
+                response_received = true;
+            }
+            if (current_state == DriveState::FAULT_RELEASE && reg == REG_MOTOR_ENABLE) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_CLEAR_ALARM && reg == REG_AUX_CONTROL) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_SUBDIVISION && reg == 0x0023) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_START_SPD && reg == 0x0030) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_MAX_SPD && reg == 0x0033) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_ACCEL && reg == 0x0031) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_DECEL && reg == 0x0032) {
+                response_received = true;
+            }
+            if (current_state == DriveState::INIT_ABS_MODE && reg == REG_POS_MODE) {
+                response_received = true;
+            }
+        } else if (fn == 0x03 && frame_len >= 9 && rx_acc[offset + 2] == 0x04) {
+            if (current_state == DriveState::RUN_READ_STATUS) {
+                const uint16_t status_word = (rx_acc[offset + 3] << 8) | rx_acc[offset + 4];
+                const uint16_t error_code = (rx_acc[offset + 5] << 8) | rx_acc[offset + 6];
+                response_received = true;
+
+                if (error_code != last_driver_error_code) {
+                    if (error_code != 0) {
+                        gcs().send_text(MAV_SEVERITY_WARNING,
+                                        "CL57R: error 0x%04X (%s) status=0x%04X",
+                                        error_code,
+                                        cl57r_error_str(error_code),
+                                        status_word);
+                    } else if (last_driver_error_code != 0) {
+                        gcs().send_text(MAV_SEVERITY_INFO, "CL57R: alarm cleared");
                     }
+                    last_driver_error_code = error_code;
+                }
+
+                const bool alarm_bit = (status_word >> 3) & 1;
+                if (error_code == 4 || alarm_bit) {
+                    pending_alarm_clear = true;
+                }
+
+                if (status_word != last_driver_status_word) {
+                    gcs().send_text(MAV_SEVERITY_INFO,
+                                    "CL57R: status 0x%04X (alarm=%u enabled=%u)",
+                                    status_word,
+                                    (unsigned)((status_word >> 3) & 1),
+                                    (unsigned)((status_word >> 4) & 1));
+                    last_driver_status_word = status_word;
+                }
+            } else if (current_state >= DriveState::RUN_WRITE_POS) {
+                uint16_t high_word = (rx_acc[offset + 3] << 8) | rx_acc[offset + 4];
+                uint16_t low_word = (rx_acc[offset + 5] << 8) | rx_acc[offset + 6];
+                int32_t actual_position = static_cast<int32_t>(((uint32_t)high_word << 16) | low_word);
+                debug_actual_pulses = actual_position;
+
+                const int32_t max_pulses = travel_limit_pulses();
+                const int32_t fault_limit = max_pulses + (max_pulses / 2);
+                if (abs_int32(actual_position) > fault_limit) {
+                    if (!encoder_fault_latched) {
+                        encoder_fault_latched = true;
+                        current_state = DriveState::FAULT_RELEASE;
+                        gcs().send_text(MAV_SEVERITY_CRITICAL,
+                                        "CL57R: encoder %ld out of range (+/-%ld), latched",
+                                        (long)actual_position,
+                                        (long)fault_limit);
+                    }
+                } else if (current_state == DriveState::RUN_READ_POS ||
+                           current_state == DriveState::FAULT_LATCHED) {
+                    response_received = (current_state == DriveState::RUN_READ_POS);
                 }
             }
         }
 
-        // 2. Парсинг позиции энкодера (0x0007-0x0008, функция 0x03, 9 байт)
-        if ((current_state == DriveState::RUN_READ_POS || current_state == DriveState::FAULT_LATCHED) && available_bytes >= 9)
-        {
-            for (uint32_t i = 0; i <= available_bytes - 9; i++)
-            {
-                if (local_buf[i] == (uint8_t)slave_id.get() && local_buf[i + 1] == 0x03 && local_buf[i + 2] == 0x04)
-                {
-                    uint16_t received_crc = (local_buf[i + 8] << 8) | local_buf[i + 7];
-                    if (modbus_crc16(&local_buf[i], 7) == received_crc)
-                    {
-                        uint16_t high_word = (local_buf[i + 3] << 8) | local_buf[i + 4];
-                        uint16_t low_word = (local_buf[i + 5] << 8) | local_buf[i + 6];
-
-                        int32_t actual_position = static_cast<int32_t>(((uint32_t)high_word << 16) | low_word);
-
-                        last_telemetry_rcvd_ms = now;
-
-                        debug_actual_pulses = actual_position;
-
-                        const int32_t max_pulses = travel_limit_pulses();
-                        const int32_t fault_limit = max_pulses + (max_pulses / 2);
-                        if (abs_int32(actual_position) > fault_limit) {
-                            if (!encoder_fault_latched) {
-                                encoder_fault_latched = true;
-                                current_state = DriveState::FAULT_RELEASE;
-                                gcs().send_text(MAV_SEVERITY_CRITICAL,
-                                                "CL57R: encoder %ld out of range (+/-%ld), latched",
-                                                (long)actual_position,
-                                                (long)fault_limit);
-                            }
-                            break;
-                        }
-
-                        response_received = (current_state == DriveState::RUN_READ_POS);
-                        break;
-                    }
-                }
-            }
+        offset = (uint16_t)(offset + frame_len);
+    }
+    if (offset > 0) {
+        uint8_t remain = (uint8_t)(rx_len - offset);
+        for (uint8_t i = 0; i < remain; i++) {
+            rx_acc[i] = rx_acc[offset + i];
         }
-
-        // 3. Парсинг статуса и кода ошибки драйвера (0x0003-0x0004)
-        if (current_state == DriveState::RUN_READ_STATUS && available_bytes >= 9)
-        {
-            for (uint32_t i = 0; i <= available_bytes - 9; i++)
-            {
-                if (local_buf[i] == (uint8_t)slave_id.get() && local_buf[i + 1] == 0x03 && local_buf[i + 2] == 0x04)
-                {
-                    uint16_t received_crc = (local_buf[i + 8] << 8) | local_buf[i + 7];
-                    if (modbus_crc16(&local_buf[i], 7) == received_crc)
-                    {
-                        const uint16_t status_word = (local_buf[i + 3] << 8) | local_buf[i + 4];
-                        const uint16_t error_code = (local_buf[i + 5] << 8) | local_buf[i + 6];
-
-                        last_telemetry_rcvd_ms = now;
-                        response_received = true;
-
-                        if (error_code != last_driver_error_code) {
-                            if (error_code != 0) {
-                                gcs().send_text(MAV_SEVERITY_WARNING,
-                                                "CL57R: error 0x%04X (%s) status=0x%04X",
-                                                error_code,
-                                                cl57r_error_str(error_code),
-                                                status_word);
-                            } else if (last_driver_error_code != 0) {
-                                gcs().send_text(MAV_SEVERITY_INFO, "CL57R: alarm cleared");
-                            }
-                            last_driver_error_code = error_code;
-                        }
-
-                        // Tracking error (код 4) или бит alarm в статусе:
-                        // мотор встал и не исполняет команды позиции. Запрашиваем
-                        // сброс alarm, чтобы восстановить слежение за целью.
-                        const bool alarm_bit = (status_word >> 3) & 1;
-                        if (error_code == 4 || alarm_bit) {
-                            pending_alarm_clear = true;
-                        }
-
-                        if (status_word != last_driver_status_word) {
-                            gcs().send_text(MAV_SEVERITY_INFO,
-                                            "CL57R: status 0x%04X (alarm=%u enabled=%u)",
-                                            status_word,
-                                            (unsigned)((status_word >> 3) & 1),
-                                            (unsigned)((status_word >> 4) & 1));
-                            last_driver_status_word = status_word;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        rx_len = remain;
     }
 
     // Защита: Сброс автомата при потере связи в рабочем режиме (таймаут 2 секунды)
@@ -371,6 +386,7 @@ void AP_ModbusSteering::update(float steering_out)
         last_sent_target_pulses = 0;
         have_sent_target = false;
         init_attempts = 0;
+        rx_len = 0;
         gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
     }
 

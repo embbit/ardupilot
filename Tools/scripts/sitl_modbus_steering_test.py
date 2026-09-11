@@ -177,7 +177,12 @@ def run_sitl(link_drop_delay=None, link_down_duration=None):
         if link_drop_delay is None:
             right_in = send_stick(1900, "RIGHT", hold_s=4, expect_abs=0.2)
             left_in = send_stick(1100, "LEFT", hold_s=4, expect_abs=0.2)
-            send_stick(1500, "CENTER", hold_s=2)
+            send_stick(1500, "CENTER", hold_s=3)
+
+            if any("Modbus Timeout" in t for t in events):
+                print("FAIL: unexpected Modbus Timeout while the link was up")
+                return 1
+            print("PASS: no telemetry timeout while stick was centered")
 
             moved = any("target=" in line and "target=      0" not in line for line in sim_lines)
             inertia = any("vel=" in line and "vel=     +0" not in line and "vel=     -0" not in line
