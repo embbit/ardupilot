@@ -531,8 +531,12 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t err = (_actual_pulses > _center_target) ?
                             (_actual_pulses - _center_target) : (_center_target - _actual_pulses);
         int32_t arrive = pos_db.get();
-        if (arrive < 1000) {
-            arrive = 1000;
+        if (arrive < 200) {
+            arrive = 200;
+        }
+        const int32_t cap = travel_limit_pulses() / 50;
+        if (cap >= 200 && arrive > cap) {
+            arrive = cap;
         }
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("center timeout");

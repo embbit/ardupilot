@@ -382,15 +382,17 @@ def run_rc_buttons():
             return 1
         print("PASS: init sequence completed")
 
+        set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+        time.sleep(0.3)
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
         if heartbeat_armed(mavlink, 1.0):
             print("FAIL: armed before calibration")
             return 1
         if not any("CL57R not calibrated" in t for t in events):
-            print("WARN: pre-arm text not seen (arm still blocked)")
-        else:
-            print("PASS: ARM blocked until calibration")
+            print("FAIL: mandatory pre-arm did not report missing calibration")
+            return 1
+        print("PASS: ARM blocked until calibration")
 
         int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
         int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
