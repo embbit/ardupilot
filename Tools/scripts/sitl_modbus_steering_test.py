@@ -291,9 +291,188 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
                     proc.kill()
 
 
+def wait_for_log(lines, needle, timeout_s):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if any(needle in line for line in lines):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def set_param(mavlink, name, value, ptype):
+    mavlink.mav.param_set_send(
+        mavlink.target_system,
+        mavlink.target_component,
+        name.encode("ascii"),
+        float(value),
+        ptype,
+    )
+
+
+def hold_rc(mavlink, events, seconds, ch1=1500, ch6=1500, ch7=1500):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        mavlink.mav.rc_channels_override_send(
+            mavlink.target_system,
+            mavlink.target_component,
+            ch1, 0, 1500, 1500, 1500, ch6, ch7, 1500,
+        )
+        msg = mavlink.recv_match(type="STATUSTEXT", blocking=False)
+        while msg is not None:
+            print(f"[MAV] {msg.text}")
+            events.append(msg.text)
+            msg = mavlink.recv_match(type="STATUSTEXT", blocking=False)
+        time.sleep(0.1)
+
+
+def try_arm(mavlink):
+    mavlink.mav.command_long_send(
+        mavlink.target_system,
+        mavlink.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 0, 0, 0, 0, 0, 0,
+    )
+
+
+def heartbeat_armed(mavlink, timeout_s):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        msg = mavlink.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+        if msg is not None and (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+            return True
+    return False
+
+
+def run_rc_buttons():
+    sitl_lines = []
+    sim_lines = []
+    sim_cmd = [
+        sys.executable, "-u", os.path.join(ROOT, "outb_steer_sim.py"),
+        "--alarm-events", "8:5000",
+    ]
+    sim_proc = start_process(sim_cmd)
+    threading.Thread(target=stream_output, args=(sim_proc, "SIM", sim_lines), daemon=True).start()
+    time.sleep(0.5)
+
+    rover_cmd = [
+        os.path.join(ROOT, "build/sitl/bin/ardurover"),
+        "--model", "rover",
+        "--speedup", "1",
+        "--defaults", os.path.join(ROOT, "ports.parm"),
+        "-I0",
+        "--serial5=udpclient:127.0.0.1:14555",
+    ]
+    rover_proc = start_process(rover_cmd)
+    threading.Thread(target=stream_output, args=(rover_proc, "SITL", sitl_lines), daemon=True).start()
+    procs = (rover_proc, sim_proc)
+
+    try:
+        if not wait_for_tcp_port("127.0.0.1", 5760, timeout_s=30):
+            print("FAIL: SITL did not open TCP port 5760")
+            return 1
+
+        mavlink = mavutil.mavlink_connection("tcp:127.0.0.1:5760", timeout=1)
+        mavlink.wait_heartbeat(timeout=30)
+        events = []
+        ready = lambda t: "Modbus Driver READY" in t
+        collect_mavlink_events(mavlink, 60, events, stop_when=ready)
+        if not any(ready(t) for t in events):
+            print("FAIL: CL57R driver did not reach READY")
+            return 1
+        print("PASS: init sequence completed")
+
+        try_arm(mavlink)
+        hold_rc(mavlink, events, 2.0)
+        if heartbeat_armed(mavlink, 1.0):
+            print("FAIL: armed before calibration")
+            return 1
+        if not any("CL57R not calibrated" in t for t in events):
+            print("WARN: pre-arm text not seen (arm still blocked)")
+        else:
+            print("PASS: ARM blocked until calibration")
+
+        int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
+        int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
+        set_param(mavlink, "OB_STR_RST_CH", 6, int8)
+        set_param(mavlink, "OB_STR_HOME_CH", 7, int8)
+        set_param(mavlink, "OB_STR_OUT_REV", 1, int8)
+        set_param(mavlink, "OB_STR_RATIO", 1, int16)
+        set_param(mavlink, "OB_STR_HOME_SPD", 900, int16)
+        set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
+        time.sleep(0.5)
+
+        if not wait_for_log(sim_lines, "ALARM raised", 20):
+            print("FAIL: simulator did not raise tracking alarm")
+            return 1
+        print("PASS: tracking alarm injected")
+
+        hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
+        hold_rc(mavlink, events, 0.8, ch6=1900, ch7=1500)
+        hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
+        if not wait_for_log(sim_lines, "ALARM CLEAR write", 5):
+            print("FAIL: reset button did not write alarm clear")
+            return 1
+        print("PASS: reset button cleared alarm")
+
+        hold_rc(mavlink, events, 0.8, ch6=1500, ch7=1900)
+        calibrated = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
+            if any("CL57R: calibrated" in t for t in events):
+                calibrated = True
+                break
+        if not calibrated:
+            print("FAIL: homing button did not finish calibration")
+            return 1
+        if not wait_for_log(sim_lines, "HOME START", 2):
+            print("FAIL: simulator did not see HOME START")
+            return 1
+        if not wait_for_log(sim_lines, "POSITION ZEROED", 2):
+            print("FAIL: simulator did not zero after center move")
+            return 1
+        print("PASS: home button calibrated (alarm clear + home + center)")
+
+        if not any("HOME_SPD=900" in line for line in sim_lines):
+            print("FAIL: homing did not write HOME_SPD=900")
+            return 1
+        after_home = False
+        restored = False
+        for line in sim_lines:
+            if "HOME START" in line:
+                after_home = True
+            if after_home and "MAX_SPD=1300" in line:
+                restored = True
+        if not restored:
+            print("FAIL: run speed 1300 not restored after home")
+            return 1
+        print("PASS: home speed 900, run speed restored to 1300")
+
+        try_arm(mavlink)
+        hold_rc(mavlink, events, 2.0)
+        if not heartbeat_armed(mavlink, 5.0):
+            print("FAIL: ARM failed after calibration")
+            return 1
+        print("PASS: ARM succeeded after calibration")
+        return 0
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+
 def main():
     parser = argparse.ArgumentParser(description="SITL test for CL57R Modbus steering")
-    parser.add_argument("--test", choices=("basic", "link-loss", "encoder-mute", "all"), default="all")
+    parser.add_argument(
+        "--test",
+        choices=("basic", "link-loss", "encoder-mute", "rc-buttons", "all"),
+        default="all",
+    )
     args = parser.parse_args()
 
     if args.test in ("basic", "all"):
@@ -310,8 +489,13 @@ def main():
 
     if args.test in ("link-loss", "all"):
         print("=== LINK LOSS + RE-INIT TEST ===")
-        # Drop at 8s, down 5s (>3s MODBUS_LINK_TIMEOUT_MS)
         rc = run_sitl(link_drop_delay=8.0, link_down_duration=5.0)
+        if rc != 0:
+            return rc
+
+    if args.test in ("rc-buttons", "all"):
+        print("=== RC RESET + HOME + PRE-ARM TEST ===")
+        rc = run_rc_buttons()
         if rc != 0:
             return rc
 
