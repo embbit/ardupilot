@@ -230,6 +230,7 @@ void AP_ModbusSteering::update(float steering_out)
     static uint32_t last_steer_vect_ms = 0;
     static uint8_t rx_acc[64];
     static uint8_t rx_len = 0;
+    static uint32_t last_rx_byte_ms = 0;
 
     // Stick command in pulses, independent of encoder/init so GCS graphs move with RC.
     {
@@ -248,9 +249,14 @@ void AP_ModbusSteering::update(float steering_out)
     // Reassemble RTU frames. Partial UART reads must not discard a half-frame.
     while (available_bytes > 0) {
         if (rx_len >= sizeof(rx_acc)) {
-            rx_len = 0;
+            // Resync: drop oldest byte instead of wiping a full buffer.
+            for (uint8_t i = 1; i < rx_len; i++) {
+                rx_acc[i - 1] = rx_acc[i];
+            }
+            rx_len--;
         }
         rx_acc[rx_len++] = _uart->read();
+        last_rx_byte_ms = now;
         available_bytes--;
     }
 
@@ -376,18 +382,25 @@ void AP_ModbusSteering::update(float steering_out)
         rx_len = remain;
     }
 
-    // Защита: Сброс автомата при потере связи в рабочем режиме (таймаут 2 секунды)
-    if (!encoder_fault_latched && current_state >= DriveState::RUN_WRITE_POS && (now - last_telemetry_rcvd_ms) > 2000)
-    {
-        current_state = DriveState::INIT_ENABLE;
-        last_driver_error_code = 0;
-        last_driver_status_word = 0;
-        position_cycles_since_status = 0;
-        last_sent_target_pulses = 0;
-        have_sent_target = false;
-        init_attempts = 0;
-        rx_len = 0;
-        gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
+    // Lost link: no UART bytes for 2s. If bytes are arriving but not parsing,
+    // resync the buffer and keep sending position (do not drop to INIT).
+    if (!encoder_fault_latched && current_state >= DriveState::RUN_WRITE_POS &&
+        (now - last_telemetry_rcvd_ms) > 2000) {
+        if ((now - last_rx_byte_ms) < 2000) {
+            rx_len = 0;
+            last_telemetry_rcvd_ms = now;
+            gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus RX desync, staying in RUN");
+        } else {
+            current_state = DriveState::INIT_ENABLE;
+            last_driver_error_code = 0;
+            last_driver_status_word = 0;
+            position_cycles_since_status = 0;
+            last_sent_target_pulses = 0;
+            have_sent_target = false;
+            init_attempts = 0;
+            rx_len = 0;
+            gcs().send_text(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout! Re-initializing...");
+        }
     }
 
     // --- БЛОК ОТПРАВКИ КОМАНД ПО ТАЙМЕРУ (позиция 10 Гц, статус 1 Гц) ---
