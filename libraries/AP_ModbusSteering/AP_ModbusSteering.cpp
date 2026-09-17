@@ -136,6 +136,13 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("HOME_SPD", 13, AP_ModbusSteering, home_speed, 900),
 
+    // @Param: HOME_TRIG
+    // @DisplayName: Homing trigger
+    // @Description: Start CL57R actions from the GCS. Set to 1 to start calibration (alarm clear, home, center, zero). Set to 2 to clear the alarm only. Ignored while armed. Resets to 0 when the action completes or is rejected.
+    // @Values: 0:None,1:Calibrate,2:ClearAlarm
+    // @User: Standard
+    AP_GROUPINFO("HOME_TRIG", 14, AP_ModbusSteering, home_trig, 0),
+
     AP_GROUPEND
 };
 
@@ -280,7 +287,7 @@ void AP_ModbusSteering::request_alarm_clear()
         return;
     }
     _alarm_clear_pending = true;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear (RC)");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear");
 }
 
 void AP_ModbusSteering::start_home()
@@ -304,7 +311,31 @@ void AP_ModbusSteering::start_home()
     _got_status = false;
     _saw_home_run = false;
     _state = DriveState::HOME_CLEAR_ALARM;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start (RC)");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
+}
+
+void AP_ModbusSteering::poll_param_trigger()
+{
+    const int8_t trig = home_trig.get();
+    if (trig == 0) {
+        return;
+    }
+
+    if (hal.util->get_soft_armed()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: HOME_TRIG ignored, armed");
+        home_trig.set_and_save(0);
+        return;
+    }
+
+    if (trig == 1) {
+        start_home();
+    } else if (trig == 2) {
+        request_alarm_clear();
+        home_trig.set_and_save(0);
+    } else {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: invalid HOME_TRIG %d", (int)trig);
+        home_trig.set_and_save(0);
+    }
 }
 
 void AP_ModbusSteering::poll_rc_buttons()
@@ -335,6 +366,9 @@ void AP_ModbusSteering::finish_home()
     _pending_run_spd = true;
     _rx_expect = RxExpect::NONE;
     _last_rx_ms = AP_HAL::millis();
+    if (home_trig.get() == 1) {
+        home_trig.set_and_save(0);
+    }
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: calibrated");
 }
 
@@ -345,6 +379,9 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _have_target = false;
     _rx_expect = RxExpect::NONE;
     _last_rx_ms = AP_HAL::millis();
+    if (home_trig.get() == 1) {
+        home_trig.set_and_save(0);
+    }
 }
 
 void AP_ModbusSteering::consume_rx()
@@ -497,6 +534,7 @@ void AP_ModbusSteering::update(float steering_out)
 
     const uint32_t now = AP_HAL::millis();
     consume_rx();
+    poll_param_trigger();
     poll_rc_buttons();
 
     const bool armed = hal.util->get_soft_armed();

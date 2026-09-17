@@ -344,6 +344,97 @@ def heartbeat_armed(mavlink, timeout_s):
     return False
 
 
+def run_param_trigger():
+    sitl_lines = []
+    sim_lines = []
+    sim_cmd = [
+        sys.executable, "-u", os.path.join(ROOT, "outb_steer_sim.py"),
+        "--alarm-events", "8:5000",
+    ]
+    sim_proc = start_process(sim_cmd)
+    threading.Thread(target=stream_output, args=(sim_proc, "SIM", sim_lines), daemon=True).start()
+    time.sleep(0.5)
+
+    rover_cmd = [
+        os.path.join(ROOT, "build/sitl/bin/ardurover"),
+        "--model", "rover",
+        "--speedup", "1",
+        "--defaults", os.path.join(ROOT, "ports.parm"),
+        "-I0",
+        "--serial5=udpclient:127.0.0.1:14555",
+    ]
+    rover_proc = start_process(rover_cmd)
+    threading.Thread(target=stream_output, args=(rover_proc, "SITL", sitl_lines), daemon=True).start()
+    procs = (rover_proc, sim_proc)
+
+    try:
+        if not wait_for_tcp_port("127.0.0.1", 5760, timeout_s=30):
+            print("FAIL: SITL did not open TCP port 5760")
+            return 1
+
+        mavlink = mavutil.mavlink_connection("tcp:127.0.0.1:5760", timeout=1)
+        mavlink.wait_heartbeat(timeout=30)
+        events = []
+        ready = lambda t: "Modbus Driver READY" in t
+        collect_mavlink_events(mavlink, 60, events, stop_when=ready)
+        if not any(ready(t) for t in events):
+            print("FAIL: CL57R driver did not reach READY")
+            return 1
+
+        int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
+        int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
+        set_param(mavlink, "OB_STR_OUT_REV", 1, int8)
+        set_param(mavlink, "OB_STR_RATIO", 1, int16)
+        set_param(mavlink, "OB_STR_HOME_SPD", 900, int16)
+        set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
+        time.sleep(0.5)
+
+        if not wait_for_log(sim_lines, "ALARM raised", 20):
+            print("FAIL: simulator did not raise tracking alarm")
+            return 1
+
+        set_param(mavlink, "OB_STR_HOME_TRIG", 2, int8)
+        time.sleep(1.0)
+        collect_mavlink_events(mavlink, 2, events)
+        if not wait_for_log(sim_lines, "ALARM CLEAR write", 5):
+            print("FAIL: HOME_TRIG=2 did not clear alarm")
+            return 1
+        print("PASS: HOME_TRIG=2 cleared alarm")
+
+        set_param(mavlink, "OB_STR_HOME_TRIG", 1, int8)
+        calibrated = False
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.5, events)
+            if any("CL57R: calibrated" in t for t in events):
+                calibrated = True
+                break
+        if not calibrated:
+            print("FAIL: HOME_TRIG=1 did not finish calibration")
+            return 1
+        if not wait_for_log(sim_lines, "HOME START", 2):
+            print("FAIL: simulator did not see HOME START")
+            return 1
+        print("PASS: HOME_TRIG=1 calibrated steering")
+
+        set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+        try_arm(mavlink)
+        hold_rc(mavlink, events, 2.0)
+        if not heartbeat_armed(mavlink, 5.0):
+            print("FAIL: ARM failed after param calibration")
+            return 1
+        print("PASS: ARM succeeded after param calibration")
+        return 0
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+
 def run_rc_buttons():
     sitl_lines = []
     sim_lines = []
@@ -472,7 +563,7 @@ def main():
     parser = argparse.ArgumentParser(description="SITL test for CL57R Modbus steering")
     parser.add_argument(
         "--test",
-        choices=("basic", "link-loss", "encoder-mute", "rc-buttons", "all"),
+        choices=("basic", "link-loss", "encoder-mute", "rc-buttons", "param-trigger", "all"),
         default="all",
     )
     args = parser.parse_args()
@@ -498,6 +589,12 @@ def main():
     if args.test in ("rc-buttons", "all"):
         print("=== RC RESET + HOME + PRE-ARM TEST ===")
         rc = run_rc_buttons()
+        if rc != 0:
+            return rc
+
+    if args.test in ("param-trigger", "all"):
+        print("=== HOME_TRIG PARAM TEST ===")
+        rc = run_param_trigger()
         if rc != 0:
             return rc
 

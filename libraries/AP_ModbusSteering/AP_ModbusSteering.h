@@ -55,6 +55,7 @@ private:
     void advance_init();
     void advance_home();
     void poll_rc_buttons();
+    void poll_param_trigger();
     bool rc_rising_edge(int8_t ch, bool &was_high) const;
     void request_alarm_clear();
     void start_home();
@@ -111,4 +112,5 @@ private:
     AP_Int8  home_ch;
     AP_Int8  home_mth;
     AP_Int16 home_speed;
+    AP_Int8  home_trig;
 };
