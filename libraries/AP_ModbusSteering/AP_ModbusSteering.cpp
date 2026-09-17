@@ -202,6 +202,16 @@ uint16_t AP_ModbusSteering::calib_speed_rpm() const
     return (uint16_t)rpm;
 }
 
+uint16_t AP_ModbusSteering::calib_crawl_rpm() const
+{
+    const uint16_t home = calib_speed_rpm();
+    uint16_t crawl = home / 4;
+    if (crawl < 150) {
+        crawl = 150;
+    }
+    return crawl;
+}
+
 int32_t AP_ModbusSteering::center_target_pulses() const
 {
     const int32_t limit = travel_limit_pulses();
@@ -319,6 +329,7 @@ void AP_ModbusSteering::start_home()
     _got_status = false;
     _saw_home_run = false;
     _saw_home_motion = false;
+    _home_center_run_spd = false;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -624,6 +635,7 @@ void AP_ModbusSteering::update(float steering_out)
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no motion yet");
         } else if (home_bit && !running && _saw_home_motion) {
             _center_target = center_target_pulses();
+            _home_center_run_spd = false;
             _state = DriveState::HOME_MOVE_CENTER;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
         }
@@ -779,7 +791,7 @@ void AP_ModbusSteering::update(float steering_out)
         send_u16(REG_MAX_SPD, calib_speed_rpm());
         break;
     case DriveState::HOME_SET_CRAWL:
-        send_u16(REG_HOME_CRAWL, (uint16_t)start_speed.get());
+        send_u16(REG_HOME_CRAWL, calib_crawl_rpm());
         break;
     case DriveState::HOME_SET_ACCEL:
         send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
@@ -809,6 +821,11 @@ void AP_ModbusSteering::update(float steering_out)
         }
         break;
     case DriveState::HOME_MOVE_CENTER:
+        if (!_home_center_run_spd) {
+            send_u16(REG_MAX_SPD, run_speed_rpm());
+            _home_center_run_spd = true;
+            break;
+        }
         send_abs_move(_center_target);
         _home_start_ms = now;
         _got_status = false;

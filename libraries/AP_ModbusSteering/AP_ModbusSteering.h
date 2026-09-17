@@ -66,6 +66,7 @@ private:
     uint16_t home_method_reg() const;
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
+    uint16_t calib_crawl_rpm() const;
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_abs_move(int32_t target);
@@ -101,6 +102,7 @@ private:
     bool _saw_home_run = false;
     bool _saw_home_motion = false;
     bool _home_read_encoder = false;
+    bool _home_center_run_spd = false;
     int32_t _home_start_pulses = 0;
     bool _read_status_next = false;
     int32_t _last_target = 0;
