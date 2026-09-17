@@ -304,8 +304,10 @@ void AP_ModbusSteering::start_home()
         return;
     }
     if (_state < DriveState::RUN_WRITE) {
-        _home_pending = true;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home queued");
+        if (!_home_pending) {
+            _home_pending = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home queued");
+        }
         return;
     }
     _alarm_clear_pending = false;
@@ -440,9 +442,6 @@ void AP_ModbusSteering::consume_rx()
             if (_rx_expect == RxExpect::STATUS && byte_count >= 2) {
                 _status_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 _got_status = true;
-                if ((_status_word & STATUS_RUNNING) != 0) {
-                    _saw_home_run = true;
-                }
             } else if (_rx_expect == RxExpect::ENCODER && byte_count == 0x04 && frame_len >= 9) {
                 const uint16_t high_word = (_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 const uint16_t low_word = (_rx_buf[offset + 5] << 8) | _rx_buf[offset + 6];
@@ -586,10 +585,15 @@ void AP_ModbusSteering::update(float steering_out)
     if (_state == DriveState::HOME_WAIT) {
         const bool home_bit = (_got_status && (_status_word & STATUS_HOME_DONE) != 0);
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
+        if (running) {
+            _saw_home_run = true;
+        }
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("home timeout");
-        } else if (home_bit && !running &&
-                   (_saw_home_run || (now - _home_start_ms >= 2000))) {
+        } else if (!_saw_home_run && (now - _last_home_progress_ms) > 10000) {
+            _last_home_progress_ms = now;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no run yet");
+        } else if (home_bit && !running && _saw_home_run) {
             _center_target = center_target_pulses();
             _state = DriveState::HOME_MOVE_CENTER;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");

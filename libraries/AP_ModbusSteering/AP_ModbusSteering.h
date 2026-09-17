@@ -79,6 +79,7 @@ private:
     uint32_t _home_start_ms = 0;
     uint32_t _last_home_retry_ms = 0;
     uint32_t _last_home_norx_ms = 0;
+    uint32_t _last_home_progress_ms = 0;
     uint32_t _last_button_ms = 0;
     DriveState _state = DriveState::INIT_ENABLE;
     RxExpect _rx_expect = RxExpect::NONE;
