@@ -40,6 +40,7 @@ class Nema23Motor:
         self.home_done = False
         self.home_rpm = 0
         self.home_finish_at = 0.0
+        self.home_runs = 0
         # Alarm/stall: когда True, мотор НЕ исполняет команды позиции,
         # пока не придёт alarm-clear (0x0037=0x0004). Моделирует tracking error.
         self.alarmed = False
@@ -107,9 +108,8 @@ class Nema23Motor:
             if time.time() >= self.home_finish_at:
                 self.home_finish_at = 0.0
                 self.home_done = True
-                self.position = 0.0
-                self.reported_position = 0.0
-                self.driver_target = 0
+                self.position = float(self.driver_target)
+                self.reported_position = self.position
                 self.velocity = 0.0
             else:
                 self.velocity = self.max_vel * 0.4
@@ -333,10 +333,15 @@ def handle_write_single(reg_addr, val):
     elif reg_addr == 0x0036 and (val & 0x0010):
         motor.clear_alarm()
         motor.home_done = False
+        motor.home_runs += 1
         motor.home_finish_at = time.time() + 1.5
+        if motor.home_runs == 1:
+            motor.driver_target = 0
+        else:
+            motor.driver_target = 80000
         if motor.home_rpm:
             motor.max_rpm = motor.home_rpm
-        print("[CL57R Modbus Sim] HOME START")
+        print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs}")
     elif reg_addr == 0x0036:
         pass  # other motion bits handled via 0x10 position write
 

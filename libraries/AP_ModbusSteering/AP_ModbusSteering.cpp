@@ -121,8 +121,8 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     AP_GROUPINFO("HOME_CH", 11, AP_ModbusSteering, home_ch, 0),
 
     // @Param: HOME_MTH
-    // @DisplayName: CL57R home method
-    // @Description: Native CL57R homing method. 17 searches the negative limit (X2 N-OT). 18 searches the positive limit (X1 P-OT).
+    // @DisplayName: CL57R first home method
+    // @Description: First limit for homing. 17 searches the negative limit (X2 N-OT). 18 searches the positive limit (X1 P-OT). In DualLimit mode the driver homes to the opposite limit second and measures travel.
     // @Values: 17:NegativeLimit,18:PositiveLimit
     // @Range: 17 18
     // @User: Standard
@@ -143,6 +143,13 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("HOME_TRIG", 14, AP_ModbusSteering, home_trig, 0),
 
+    // @Param: HOME_MODE
+    // @DisplayName: Homing mode
+    // @Description: 0 uses one limit switch and OUT_REV/RATIO for center and travel. 1 homes to both limits, measures encoder travel lock-to-lock, centers at the midpoint, and saves half-travel to MAX_STEPS.
+    // @Values: 0:SingleLimit,1:DualLimit
+    // @User: Standard
+    AP_GROUPINFO("HOME_MODE", 15, AP_ModbusSteering, home_mode, 1),
+
     AP_GROUPEND
 };
 
@@ -153,6 +160,9 @@ AP_ModbusSteering::AP_ModbusSteering()
 
 int32_t AP_ModbusSteering::travel_limit_pulses() const
 {
+    if (_measured_half_travel > 0) {
+        return _measured_half_travel;
+    }
     if (out_rev.get() > 0 && ratio.get() > 0) {
         return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV / 2;
     }
@@ -175,13 +185,23 @@ bool AP_ModbusSteering::home_prep_wait_echo() const
            _state == DriveState::HOME_ZERO;
 }
 
+bool AP_ModbusSteering::dual_limit_home() const
+{
+    return home_mode.get() == 1;
+}
+
+uint16_t AP_ModbusSteering::home_first_method() const
+{
+    return home_mth.get() == 18 ? 18 : 17;
+}
+
 uint16_t AP_ModbusSteering::home_method_reg() const
 {
-    const int8_t method = home_mth.get();
-    if (method == 18) {
-        return 18;
+    const uint16_t first = home_first_method();
+    if (dual_limit_home() && _home_leg == 1) {
+        return first == 17 ? 18 : 17;
     }
-    return 17;
+    return first;
 }
 
 uint16_t AP_ModbusSteering::run_speed_rpm() const
@@ -330,6 +350,10 @@ void AP_ModbusSteering::start_home()
     _saw_home_run = false;
     _saw_home_motion = false;
     _home_center_run_spd = false;
+    _home_leg = 0;
+    _limit1_pulses = 0;
+    _limit2_pulses = 0;
+    _measured_half_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -386,6 +410,45 @@ void AP_ModbusSteering::poll_rc_buttons()
     }
 }
 
+void AP_ModbusSteering::home_leg_done(uint32_t now)
+{
+    if (!dual_limit_home() || _home_leg == 1) {
+        if (dual_limit_home()) {
+            _limit2_pulses = _actual_pulses;
+            const int32_t full_travel = (_limit2_pulses > _limit1_pulses) ?
+                                        (_limit2_pulses - _limit1_pulses) :
+                                        (_limit1_pulses - _limit2_pulses);
+            if (full_travel < 1000) {
+                abort_home("measured travel too small");
+                return;
+            }
+            _measured_half_travel = full_travel / 2;
+            _center_target = (_limit1_pulses + _limit2_pulses) / 2;
+            max_steps.set_and_save(_measured_half_travel);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d pulses, center %d",
+                          (int)full_travel, (int)_center_target);
+        } else {
+            _center_target = center_target_pulses();
+        }
+        _home_center_run_spd = false;
+        _state = DriveState::HOME_MOVE_CENTER;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
+        return;
+    }
+
+    _limit1_pulses = _actual_pulses;
+    _home_leg = 1;
+    _state = DriveState::HOME_SET_METHOD;
+    _got_echo = false;
+    _init_attempts = 0;
+    _saw_home_motion = false;
+    _saw_home_run = false;
+    _home_start_ms = now;
+    _last_home_progress_ms = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 at %d, seek limit 2",
+                  (int)_limit1_pulses);
+}
+
 void AP_ModbusSteering::finish_home()
 {
     _state = DriveState::RUN_WRITE;
@@ -394,7 +457,6 @@ void AP_ModbusSteering::finish_home()
     _homed = true;
     _pending_run_spd = true;
     _rx_expect = RxExpect::NONE;
-    _last_rx_ms = AP_HAL::millis();
     if (home_trig.get() == 1) {
         home_trig.set_and_save(0);
     }
@@ -554,7 +616,12 @@ void AP_ModbusSteering::advance_home()
         _got_status = false;
         _saw_home_run = false;
         _saw_home_motion = false;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing to limit (M%d)", (int)home_method_reg());
+        if (dual_limit_home()) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
+                          (unsigned)(_home_leg + 1), (int)home_method_reg());
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing to limit (M%d)", (int)home_method_reg());
+        }
         break;
     case DriveState::HOME_ZERO:
         finish_home();
@@ -634,10 +701,7 @@ void AP_ModbusSteering::update(float steering_out)
             _last_home_progress_ms = now;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no motion yet");
         } else if (home_bit && !running && _saw_home_motion) {
-            _center_target = center_target_pulses();
-            _home_center_run_spd = false;
-            _state = DriveState::HOME_MOVE_CENTER;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
+            home_leg_done(now);
         }
     } else if (_state == DriveState::HOME_WAIT_CENTER) {
         const int32_t err = (_actual_pulses > _center_target) ?

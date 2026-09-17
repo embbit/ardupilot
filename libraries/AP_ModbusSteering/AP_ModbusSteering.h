@@ -63,7 +63,10 @@ private:
     bool in_run() const;
     bool in_home() const;
     bool home_prep_wait_echo() const;
+    uint16_t home_first_method() const;
     uint16_t home_method_reg() const;
+    bool dual_limit_home() const;
+    void home_leg_done(uint32_t now);
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
     uint16_t calib_crawl_rpm() const;
@@ -104,6 +107,10 @@ private:
     bool _home_read_encoder = false;
     bool _home_center_run_spd = false;
     int32_t _home_start_pulses = 0;
+    int32_t _limit1_pulses = 0;
+    int32_t _limit2_pulses = 0;
+    int32_t _measured_half_travel = 0;
+    uint8_t _home_leg = 0;
     bool _read_status_next = false;
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
@@ -126,5 +133,6 @@ private:
     AP_Int8  home_mth;
     AP_Int16 home_speed;
     AP_Int8  home_trig;
+    AP_Int8  home_mode;
     int8_t   _home_trig_last = 0;
 };
