@@ -316,6 +316,7 @@ void AP_ModbusSteering::start_home()
     _init_attempts = 0;
     _got_status = false;
     _saw_home_run = false;
+    _saw_home_motion = false;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -535,8 +536,11 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_WAIT;
         _home_start_ms = AP_HAL::millis();
         _last_home_retry_ms = _home_start_ms;
+        _home_start_pulses = _actual_pulses;
+        _home_read_encoder = false;
         _got_status = false;
         _saw_home_run = false;
+        _saw_home_motion = false;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing to limit (M%d)", (int)home_method_reg());
         break;
     case DriveState::HOME_ZERO:
@@ -595,15 +599,28 @@ void AP_ModbusSteering::update(float steering_out)
     if (_state == DriveState::HOME_WAIT) {
         const bool home_bit = (_got_status && (_status_word & STATUS_HOME_DONE) != 0);
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
-        if (running) {
+        const int32_t moved = (_actual_pulses > _home_start_pulses) ?
+                              (_actual_pulses - _home_start_pulses) :
+                              (_home_start_pulses - _actual_pulses);
+        if (moved >= 200) {
+            _saw_home_motion = true;
+        }
+        if (running && moved >= 50) {
             _saw_home_run = true;
         }
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("home timeout");
-        } else if (!_saw_home_run && (now - _last_home_progress_ms) > 10000) {
+        } else if (home_bit && !running && !_saw_home_motion &&
+                   (now - _home_start_ms) > 5000) {
+            if (now - _last_home_retry_ms > 3000) {
+                _last_home_retry_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: home done bit set, no motion, retry");
+            }
+        } else if (!_saw_home_motion && (now - _last_home_progress_ms) > 10000) {
             _last_home_progress_ms = now;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no run yet");
-        } else if (home_bit && !running && _saw_home_run) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no motion yet");
+        } else if (home_bit && !running && _saw_home_motion) {
             _center_target = center_target_pulses();
             _state = DriveState::HOME_MOVE_CENTER;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
@@ -762,10 +779,16 @@ void AP_ModbusSteering::update(float steering_out)
         send_u16(REG_MOTION, MOTION_HOME);
         break;
     case DriveState::HOME_WAIT:
-        _rx_expect = RxExpect::STATUS;
-        modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
+        if (_home_read_encoder) {
+            _rx_expect = RxExpect::ENCODER;
+            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+        } else {
+            _rx_expect = RxExpect::STATUS;
+            modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
+        }
+        _home_read_encoder = !_home_read_encoder;
         _uart->write(tx_packet, 8);
-        if (!_saw_home_run && (now - _home_start_ms) > 3000 &&
+        if (!_saw_home_motion && (now - _home_start_ms) > 3000 &&
             (now - _last_home_retry_ms) > 3000 && _uart->txspace() >= 16) {
             _last_home_retry_ms = now;
             send_u16(REG_MOTOR_ENABLE, 0x0001);

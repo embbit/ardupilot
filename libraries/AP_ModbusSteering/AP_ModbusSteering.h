@@ -97,6 +97,9 @@ private:
     bool _home_was_high = false;
     bool _got_status = false;
     bool _saw_home_run = false;
+    bool _saw_home_motion = false;
+    bool _home_read_encoder = false;
+    int32_t _home_start_pulses = 0;
     bool _read_status_next = false;
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
