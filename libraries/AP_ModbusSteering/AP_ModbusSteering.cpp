@@ -27,6 +27,7 @@ constexpr uint16_t REG_MOTION = 0x0036;
 constexpr uint16_t REG_AUX_CONTROL = 0x0037;
 constexpr uint16_t REG_MOTOR_ENABLE = 0x0038;
 constexpr uint16_t REG_POS_MODE = 0x003A;
+constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t AUX_POS_ZERO = 0x0008;
 constexpr uint16_t MOTION_START_ABS_IRQ = 0x0007;
@@ -40,6 +41,9 @@ constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
 constexpr uint8_t INIT_SKIP_ATTEMPTS = 40;
+constexpr int32_t CENTER_MOVE_STEP = 10000;
+constexpr uint16_t TRACK_ERR_LIMIT = 50000;
+constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
@@ -169,6 +173,14 @@ int32_t AP_ModbusSteering::travel_limit_pulses() const
     return max_steps.get();
 }
 
+int32_t AP_ModbusSteering::expected_full_travel_pulses() const
+{
+    if (out_rev.get() > 0 && ratio.get() > 0) {
+        return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV;
+    }
+    return max_steps.get() * 2;
+}
+
 bool AP_ModbusSteering::in_run() const
 {
     return _state == DriveState::RUN_WRITE || _state == DriveState::RUN_READ;
@@ -182,7 +194,7 @@ bool AP_ModbusSteering::in_home() const
 bool AP_ModbusSteering::home_prep_wait_echo() const
 {
     return (_state >= DriveState::HOME_CLEAR_ALARM && _state <= DriveState::HOME_START) ||
-           _state == DriveState::HOME_ZERO;
+           _state == DriveState::HOME_ZERO || _state == DriveState::HOME_ZERO_AT_L1;
 }
 
 bool AP_ModbusSteering::dual_limit_home() const
@@ -317,9 +329,6 @@ bool AP_ModbusSteering::rc_rising_edge(int8_t ch, bool &was_high) const
 
 void AP_ModbusSteering::request_alarm_clear()
 {
-    if (in_home()) {
-        return;
-    }
     _alarm_clear_pending = true;
     _enable_after_alarm_clear = true;
     _have_target = false;
@@ -350,10 +359,11 @@ void AP_ModbusSteering::start_home()
     _saw_home_run = false;
     _saw_home_motion = false;
     _home_center_run_spd = false;
+    _home_leg_settling = false;
+    _center_step_settling = false;
     _home_leg = 0;
-    _limit1_pulses = 0;
-    _limit2_pulses = 0;
     _measured_half_travel = 0;
+    _center_move_target = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -361,6 +371,11 @@ void AP_ModbusSteering::start_home()
 void AP_ModbusSteering::poll_param_trigger()
 {
     const int8_t trig = home_trig.get();
+    if (!_home_trig_inited) {
+        _home_trig_last = trig;
+        _home_trig_inited = true;
+        return;
+    }
     if (trig == 0) {
         _home_trig_last = 0;
         return;
@@ -379,8 +394,14 @@ void AP_ModbusSteering::poll_param_trigger()
     _home_trig_last = trig;
 
     if (trig == 1) {
+        if (in_home()) {
+            abort_home("restart home");
+        }
         start_home();
     } else if (trig == 2) {
+        if (in_home()) {
+            abort_home("alarm clear");
+        }
         request_alarm_clear();
         home_trig.set_and_save(0);
         _home_trig_last = 0;
@@ -412,41 +433,44 @@ void AP_ModbusSteering::poll_rc_buttons()
 
 void AP_ModbusSteering::home_leg_done(uint32_t now)
 {
-    if (!dual_limit_home() || _home_leg == 1) {
-        if (dual_limit_home()) {
-            _limit2_pulses = _actual_pulses;
-            const int32_t full_travel = (_limit2_pulses > _limit1_pulses) ?
-                                        (_limit2_pulses - _limit1_pulses) :
-                                        (_limit1_pulses - _limit2_pulses);
-            if (full_travel < 1000) {
-                abort_home("measured travel too small");
-                return;
-            }
-            _measured_half_travel = full_travel / 2;
-            _center_target = (_limit1_pulses + _limit2_pulses) / 2;
-            max_steps.set_and_save(_measured_half_travel);
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d pulses, center %d",
-                          (int)full_travel, (int)_center_target);
-        } else {
-            _center_target = center_target_pulses();
-        }
-        _home_center_run_spd = false;
-        _state = DriveState::HOME_MOVE_CENTER;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
+    (void)now;
+    if (dual_limit_home() && _home_leg == 0) {
+        _home_leg = 1;
+        _state = DriveState::HOME_ZERO_AT_L1;
+        _got_echo = false;
+        _init_attempts = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 reached, zero and seek limit 2");
         return;
     }
 
-    _limit1_pulses = _actual_pulses;
-    _home_leg = 1;
-    _state = DriveState::HOME_SET_METHOD;
-    _got_echo = false;
-    _init_attempts = 0;
-    _saw_home_motion = false;
-    _saw_home_run = false;
-    _home_start_ms = now;
-    _last_home_progress_ms = 0;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 at %d, seek limit 2",
-                  (int)_limit1_pulses);
+    if (dual_limit_home()) {
+        const int32_t full_travel = (_actual_pulses >= 0) ? _actual_pulses : -_actual_pulses;
+        if (full_travel < MIN_MEASURED_TRAVEL) {
+            abort_home("measured travel too small");
+            return;
+        }
+        const int32_t expected = expected_full_travel_pulses();
+        if (expected >= 20000) {
+            const int32_t tol = expected / 4;
+            if (full_travel > expected + tol || full_travel < expected - tol) {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
+                              (int)full_travel, (int)expected);
+                abort_home("measured travel implausible");
+                return;
+            }
+        }
+        _measured_half_travel = full_travel / 2;
+        _center_move_target = _measured_half_travel;
+        max_steps.set_and_save(_measured_half_travel);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d pulses, center %d",
+                      (int)full_travel, (int)_center_move_target);
+    } else {
+        _center_move_target = center_target_pulses();
+    }
+
+    _home_center_run_spd = false;
+    _state = DriveState::HOME_MOVE_CENTER;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
 }
 
 void AP_ModbusSteering::finish_home()
@@ -565,6 +589,9 @@ void AP_ModbusSteering::advance_init()
         _state = DriveState::INIT_ABS_MODE;
         break;
     case DriveState::INIT_ABS_MODE:
+        _state = DriveState::INIT_TRACK_ERR;
+        break;
+    case DriveState::INIT_TRACK_ERR:
         _state = DriveState::RUN_WRITE;
         if (_init_no_echo) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: READY but no Modbus echo");
@@ -616,12 +643,22 @@ void AP_ModbusSteering::advance_home()
         _got_status = false;
         _saw_home_run = false;
         _saw_home_motion = false;
+        _home_leg_settling = false;
         if (dual_limit_home()) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
                           (unsigned)(_home_leg + 1), (int)home_method_reg());
         } else {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing to limit (M%d)", (int)home_method_reg());
         }
+        break;
+    case DriveState::HOME_ZERO_AT_L1:
+        _state = DriveState::HOME_SET_METHOD;
+        _got_echo = false;
+        _init_attempts = 0;
+        _saw_home_motion = false;
+        _saw_home_run = false;
+        _home_start_ms = AP_HAL::millis();
+        _last_home_progress_ms = 0;
         break;
     case DriveState::HOME_ZERO:
         finish_home();
@@ -701,11 +738,23 @@ void AP_ModbusSteering::update(float steering_out)
             _last_home_progress_ms = now;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no motion yet");
         } else if (home_bit && !running && _saw_home_motion) {
-            home_leg_done(now);
+            if (!_home_leg_settling) {
+                _home_leg_settling = true;
+                _home_leg_settle_ms = now + 200;
+            } else if (now >= _home_leg_settle_ms) {
+                _home_leg_settling = false;
+                home_leg_done(now);
+            }
+        } else if (_home_leg_settling && running) {
+            _home_leg_settling = false;
         }
     } else if (_state == DriveState::HOME_WAIT_CENTER) {
-        const int32_t err = (_actual_pulses > _center_target) ?
-                            (_actual_pulses - _center_target) : (_center_target - _actual_pulses);
+        const int32_t step_err = (_actual_pulses > _center_step_target) ?
+                                 (_actual_pulses - _center_step_target) :
+                                 (_center_step_target - _actual_pulses);
+        const int32_t final_err = (_actual_pulses > _center_move_target) ?
+                                  (_actual_pulses - _center_move_target) :
+                                  (_center_move_target - _actual_pulses);
         int32_t arrive = pos_db.get();
         if (arrive < 200) {
             arrive = 200;
@@ -714,12 +763,26 @@ void AP_ModbusSteering::update(float steering_out)
         if (cap >= 200 && arrive > cap) {
             arrive = cap;
         }
+        const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("center timeout");
-        } else if (err <= arrive) {
-            _state = DriveState::HOME_ZERO;
-            _got_echo = false;
-            _init_attempts = 0;
+        } else if (step_err <= arrive && !running) {
+            if (!_center_step_settling) {
+                _center_step_settling = true;
+                _center_step_settle_ms = now + 400;
+            } else if (now >= _center_step_settle_ms) {
+                _center_step_settling = false;
+                if (final_err <= arrive) {
+                    _state = DriveState::HOME_ZERO;
+                    _got_echo = false;
+                    _init_attempts = 0;
+                } else {
+                    _state = DriveState::HOME_MOVE_CENTER;
+                    _home_center_run_spd = true;
+                }
+            }
+        } else if (_center_step_settling && (step_err > arrive || running)) {
+            _center_step_settling = false;
         }
     }
 
@@ -798,6 +861,9 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     case DriveState::INIT_ABS_MODE:
         send_u16(REG_POS_MODE, 0x0001);
+        break;
+    case DriveState::INIT_TRACK_ERR:
+        send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
         break;
     case DriveState::RUN_WRITE: {
         if (_alarm_clear_pending) {
@@ -886,19 +952,50 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     case DriveState::HOME_MOVE_CENTER:
         if (!_home_center_run_spd) {
-            send_u16(REG_MAX_SPD, run_speed_rpm());
+            send_u16(REG_MAX_SPD, calib_crawl_rpm());
             _home_center_run_spd = true;
             break;
         }
-        send_abs_move(_center_target);
-        _home_start_ms = now;
-        _got_status = false;
-        _state = DriveState::HOME_WAIT_CENTER;
+        {
+            const int32_t err = _center_move_target - _actual_pulses;
+            const int32_t abs_err = (err >= 0) ? err : -err;
+            int32_t arrive = pos_db.get();
+            if (arrive < 200) {
+                arrive = 200;
+            }
+            if (abs_err <= arrive) {
+                _center_step_target = _center_move_target;
+                _center_step_settling = false;
+                _home_start_ms = now;
+                _state = DriveState::HOME_WAIT_CENTER;
+                break;
+            }
+            int32_t step = CENTER_MOVE_STEP;
+            if (abs_err < step) {
+                step = abs_err;
+            }
+            const int32_t next_target = (err > 0) ? (_actual_pulses + step) : (_actual_pulses - step);
+            send_abs_move(next_target);
+            _center_step_target = next_target;
+            _center_step_settling = false;
+            _home_start_ms = now;
+            _got_status = false;
+            _state = DriveState::HOME_WAIT_CENTER;
+        }
         break;
     case DriveState::HOME_WAIT_CENTER:
-        _rx_expect = RxExpect::ENCODER;
-        modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+        if (_home_read_encoder) {
+            _rx_expect = RxExpect::ENCODER;
+            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+        } else {
+            _rx_expect = RxExpect::STATUS;
+            modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
+        }
+        _home_read_encoder = !_home_read_encoder;
         _uart->write(tx_packet, 8);
+        break;
+    case DriveState::HOME_ZERO_AT_L1:
+        send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
         break;
     case DriveState::HOME_ZERO:
         send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);

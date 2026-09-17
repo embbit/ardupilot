@@ -214,21 +214,20 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
         link_restored = False
 
         while time.time() < deadline:
+            if not link_lost and any("LINK DOWN" in line for line in sim_lines):
+                link_lost = True
+                print("PASS: Modbus link lost detected")
+            if link_lost and any("LINK UP" in line for line in sim_lines):
+                link_restored = True
+                break
+
             msg = mavlink.recv_match(blocking=False)
             while msg is not None:
                 if msg.get_type() == "STATUSTEXT":
                     text = msg.text
                     print(f"[MAV] {text}")
                     events.append(text)
-                    if "Modbus Timeout" in text or "Modbus link lost" in text:
-                        link_lost = True
-                    if "Modbus Driver READY" in text or "Modbus Timeout, continuing" in text:
-                        if link_lost:
-                            link_restored = True
                 msg = mavlink.recv_match(blocking=False)
-
-            if link_lost and link_restored:
-                break
             time.sleep(0.05)
 
         init_after_loss = 0
@@ -245,14 +244,13 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
         if not link_lost:
             print("FAIL: did not observe Modbus link lost")
             return 1
-        print("PASS: Modbus link lost detected")
 
         if link_down_duration < MODBUS_LINK_TIMEOUT_S:
             print(f"WARN: link down {link_down_duration}s < timeout {MODBUS_LINK_TIMEOUT_S}s")
         if not link_restored:
-            print("WARN: no READY after drop (driver stayed in RUN, keep sending)")
-        else:
-            print("PASS: Modbus link restored after drop")
+            print("FAIL: Modbus link did not come back up")
+            return 1
+        print("PASS: Modbus link restored after drop")
 
         if init_after_loss < 2:
             print(f"WARN: enable-count={init_after_loss} (re-init not required if RUN keepalive)")
@@ -383,8 +381,10 @@ def run_param_trigger():
 
         int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
         int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
-        set_param(mavlink, "OB_STR_OUT_REV", 1, int8)
-        set_param(mavlink, "OB_STR_RATIO", 1, int16)
+        set_param(mavlink, "OB_STR_HOME_TRIG", 0, int8)
+        time.sleep(0.5)
+        set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
+        set_param(mavlink, "OB_STR_RATIO", 10, int16)
         set_param(mavlink, "OB_STR_HOME_SPD", 900, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
@@ -403,7 +403,7 @@ def run_param_trigger():
 
         set_param(mavlink, "OB_STR_HOME_TRIG", 1, int8)
         calibrated = False
-        deadline = time.time() + 20
+        deadline = time.time() + 45
         while time.time() < deadline:
             collect_mavlink_events(mavlink, 0.5, events)
             if any("CL57R: calibrated" in t for t in events):
@@ -489,8 +489,8 @@ def run_rc_buttons():
         int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
         set_param(mavlink, "OB_STR_RST_CH", 6, int8)
         set_param(mavlink, "OB_STR_HOME_CH", 7, int8)
-        set_param(mavlink, "OB_STR_OUT_REV", 1, int8)
-        set_param(mavlink, "OB_STR_RATIO", 1, int16)
+        set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
+        set_param(mavlink, "OB_STR_RATIO", 10, int16)
         set_param(mavlink, "OB_STR_HOME_SPD", 900, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
@@ -510,7 +510,7 @@ def run_rc_buttons():
 
         hold_rc(mavlink, events, 0.8, ch6=1500, ch7=1900)
         calibrated = False
-        deadline = time.time() + 20
+        deadline = time.time() + 45
         while time.time() < deadline:
             hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
             if any("CL57R: calibrated" in t for t in events):

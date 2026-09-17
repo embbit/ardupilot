@@ -28,6 +28,7 @@ private:
         INIT_ACCEL,
         INIT_DECEL,
         INIT_ABS_MODE,
+        INIT_TRACK_ERR,
         RUN_WRITE,
         RUN_READ,
         HOME_CLEAR_ALARM,
@@ -39,6 +40,7 @@ private:
         HOME_ENABLE,
         HOME_START,
         HOME_WAIT,
+        HOME_ZERO_AT_L1,
         HOME_MOVE_CENTER,
         HOME_WAIT_CENTER,
         HOME_ZERO,
@@ -51,6 +53,7 @@ private:
     };
 
     int32_t travel_limit_pulses() const;
+    int32_t expected_full_travel_pulses() const;
     uint8_t rtu_frame_len(const uint8_t *buf, uint8_t avail) const;
     void consume_rx();
     void advance_init();
@@ -106,15 +109,18 @@ private:
     bool _saw_home_motion = false;
     bool _home_read_encoder = false;
     bool _home_center_run_spd = false;
+    bool _home_leg_settling = false;
+    uint32_t _home_leg_settle_ms = 0;
+    bool _center_step_settling = false;
+    uint32_t _center_step_settle_ms = 0;
     int32_t _home_start_pulses = 0;
-    int32_t _limit1_pulses = 0;
-    int32_t _limit2_pulses = 0;
+    int32_t _center_move_target = 0;
+    int32_t _center_step_target = 0;
     int32_t _measured_half_travel = 0;
     uint8_t _home_leg = 0;
     bool _read_status_next = false;
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
-    int32_t _center_target = 0;
     uint16_t _status_word = 0;
     uint8_t _rx_buf[64] {};
     uint8_t _rx_len = 0;
@@ -135,4 +141,5 @@ private:
     AP_Int8  home_trig;
     AP_Int8  home_mode;
     int8_t   _home_trig_last = 0;
+    bool     _home_trig_inited = false;
 };

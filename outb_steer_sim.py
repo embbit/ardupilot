@@ -113,16 +113,31 @@ class Nema23Motor:
                 self.velocity = 0.0
             else:
                 self.velocity = self.max_vel * 0.4
-                self.position += self.velocity * dt_s
+                new_pos = self.position + self.velocity * dt_s
+                if ((self.position - self.driver_target) * (new_pos - self.driver_target)) < 0:
+                    self.position = float(self.driver_target)
+                    self.velocity = 0.0
+                else:
+                    self.position = new_pos
         elif not self.motor_enabled:
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
         elif link_active:
             self._track_target(dt_s)
-            self.position += self.velocity * dt_s
+            new_pos = self.position + self.velocity * dt_s
+            if ((self.position - self.driver_target) * (new_pos - self.driver_target)) < 0:
+                self.position = float(self.driver_target)
+                self.velocity = 0.0
+            else:
+                self.position = new_pos
         else:
             self._coast(dt_s)
-            self.position += self.velocity * dt_s
+            new_pos = self.position + self.velocity * dt_s
+            if ((self.position - self.driver_target) * (new_pos - self.driver_target)) < 0:
+                self.position = float(self.driver_target)
+                self.velocity = 0.0
+            else:
+                self.position = new_pos
 
         lag = max(self.encoder_lag_s, 0.0)
         if lag > 0.0:
@@ -150,6 +165,10 @@ class Nema23Motor:
         if abs(error) < 0.5 and abs(self.velocity) < 1.0:
             self.velocity = 0.0
             self.position = float(self.driver_target)
+            return
+        if abs(error) <= max(abs(self.velocity) * dt_s * 1.5, 80.0):
+            self.position = float(self.driver_target)
+            self.velocity = 0.0
             return
 
         direction = 1.0 if error > 0 else -1.0
@@ -327,6 +346,7 @@ def handle_write_single(reg_addr, val):
         motor.reported_position = 0.0
         motor.driver_target = 0
         motor.velocity = 0.0
+        motor.home_done = False
         print("[CL57R Modbus Sim] POSITION ZEROED")
     elif reg_addr == 0x0052:
         motor.track_err_limit = val
