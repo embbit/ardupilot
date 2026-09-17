@@ -393,7 +393,6 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _state = DriveState::RUN_WRITE;
     _have_target = false;
     _rx_expect = RxExpect::NONE;
-    _last_rx_ms = AP_HAL::millis();
     if (home_trig.get() == 1) {
         home_trig.set_and_save(0);
     }
@@ -433,6 +432,8 @@ void AP_ModbusSteering::consume_rx()
             offset++;
             continue;
         }
+
+        _ever_got_rx = true;
 
         const uint8_t fn = _rx_buf[offset + 1];
         if (fn == 0x06) {
@@ -489,8 +490,11 @@ void AP_ModbusSteering::advance_init()
         break;
     case DriveState::INIT_ABS_MODE:
         _state = DriveState::RUN_WRITE;
-        _last_rx_ms = AP_HAL::millis();
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
+        if (_init_no_echo) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: READY but no Modbus echo");
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
+        }
         if (_home_pending) {
             _home_pending = false;
             start_home();
@@ -572,10 +576,16 @@ void AP_ModbusSteering::update(float steering_out)
     }
 
     if (in_home()) {
-        if (_last_rx_ms == 0 || (now - _last_rx_ms) > 3000) {
+        if (!_ever_got_rx) {
             if (now - _last_home_norx_ms > 10000) {
                 _last_home_norx_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: no Modbus RX during home");
+                GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                              "CL57R: no Modbus RX from CL57R (check RS485 A/B RX)");
+            }
+        } else if (_last_rx_ms == 0 || (now - _last_rx_ms) > 3000) {
+            if (now - _last_home_norx_ms > 10000) {
+                _last_home_norx_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus RX lost during home");
             }
         } else {
             _last_home_norx_ms = 0;
@@ -638,6 +648,7 @@ void AP_ModbusSteering::update(float steering_out)
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                               "CL57R: init step %d no echo, continuing",
                               (int)_state);
+                _init_no_echo = true;
                 advance_init();
             }
         }

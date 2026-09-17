@@ -85,6 +85,8 @@ private:
     RxExpect _rx_expect = RxExpect::NONE;
     uint8_t _init_attempts = 0;
     bool _got_echo = false;
+    bool _ever_got_rx = false;
+    bool _init_no_echo = false;
     bool _have_target = false;
     bool _alarm_clear_pending = false;
     bool _pending_run_spd = false;
