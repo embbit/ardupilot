@@ -237,6 +237,10 @@ void AP_ModbusSteering::init(AP_SerialManager &serial_manager)
     _uart = serial_manager.find_serial((AP_SerialManager::SerialProtocol)101, 0);
     if (_uart != nullptr) {
         _uart->begin(115200);
+        const int8_t port = serial_manager.find_portnum((AP_SerialManager::SerialProtocol)101, 0);
+        if (port >= 0) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: using SERIAL%d", (int)port);
+        }
     }
 }
 
@@ -318,23 +322,32 @@ void AP_ModbusSteering::poll_param_trigger()
 {
     const int8_t trig = home_trig.get();
     if (trig == 0) {
+        _home_trig_last = 0;
         return;
     }
 
     if (hal.util->get_soft_armed()) {
         GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: HOME_TRIG ignored, armed");
         home_trig.set_and_save(0);
+        _home_trig_last = 0;
         return;
     }
+
+    if (trig == _home_trig_last) {
+        return;
+    }
+    _home_trig_last = trig;
 
     if (trig == 1) {
         start_home();
     } else if (trig == 2) {
         request_alarm_clear();
         home_trig.set_and_save(0);
+        _home_trig_last = 0;
     } else {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: invalid HOME_TRIG %d", (int)trig);
         home_trig.set_and_save(0);
+        _home_trig_last = 0;
     }
 }
 
@@ -510,13 +523,18 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_SET_ACCEL;
         break;
     case DriveState::HOME_SET_ACCEL:
+        _state = DriveState::HOME_ENABLE;
+        break;
+    case DriveState::HOME_ENABLE:
         _state = DriveState::HOME_START;
         break;
     case DriveState::HOME_START:
         _state = DriveState::HOME_WAIT;
         _home_start_ms = AP_HAL::millis();
+        _last_home_retry_ms = _home_start_ms;
         _got_status = false;
         _saw_home_run = false;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing to limit (M%d)", (int)home_method_reg());
         break;
     case DriveState::HOME_ZERO:
         finish_home();
@@ -552,6 +570,17 @@ void AP_ModbusSteering::update(float steering_out)
                               (float)_actual_pulses,
                               (float)stick_pulses,
                               (float)_last_target);
+    }
+
+    if (in_home()) {
+        if (_last_rx_ms == 0 || (now - _last_rx_ms) > 3000) {
+            if (now - _last_home_norx_ms > 10000) {
+                _last_home_norx_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: no Modbus RX during home");
+            }
+        } else {
+            _last_home_norx_ms = 0;
+        }
     }
 
     if (_state == DriveState::HOME_WAIT) {
@@ -617,6 +646,9 @@ void AP_ModbusSteering::update(float steering_out)
         if (_got_echo) {
             advance_home();
         } else {
+            if (_init_attempts == 0) {
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home prep step %d", (int)_state);
+            }
             _init_attempts++;
             if (_init_attempts >= INIT_SKIP_ATTEMPTS) {
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
@@ -708,6 +740,9 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_SET_ACCEL:
         send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
         break;
+    case DriveState::HOME_ENABLE:
+        send_u16(REG_MOTOR_ENABLE, 0x0001);
+        break;
     case DriveState::HOME_START:
         send_u16(REG_MOTION, MOTION_HOME);
         break;
@@ -715,6 +750,13 @@ void AP_ModbusSteering::update(float steering_out)
         _rx_expect = RxExpect::STATUS;
         modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
         _uart->write(tx_packet, 8);
+        if (!_saw_home_run && (now - _home_start_ms) > 3000 &&
+            (now - _last_home_retry_ms) > 3000 && _uart->txspace() >= 16) {
+            _last_home_retry_ms = now;
+            send_u16(REG_MOTOR_ENABLE, 0x0001);
+            send_u16(REG_MOTION, MOTION_HOME);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
+        }
         break;
     case DriveState::HOME_MOVE_CENTER:
         send_abs_move(_center_target);

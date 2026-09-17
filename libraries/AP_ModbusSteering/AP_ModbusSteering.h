@@ -36,6 +36,7 @@ private:
         HOME_SET_RUN_SPD,
         HOME_SET_CRAWL,
         HOME_SET_ACCEL,
+        HOME_ENABLE,
         HOME_START,
         HOME_WAIT,
         HOME_MOVE_CENTER,
@@ -76,6 +77,8 @@ private:
     uint32_t _last_vect_ms = 0;
     uint32_t _last_rx_ms = 0;
     uint32_t _home_start_ms = 0;
+    uint32_t _last_home_retry_ms = 0;
+    uint32_t _last_home_norx_ms = 0;
     uint32_t _last_button_ms = 0;
     DriveState _state = DriveState::INIT_ENABLE;
     RxExpect _rx_expect = RxExpect::NONE;
@@ -113,4 +116,5 @@ private:
     AP_Int8  home_mth;
     AP_Int16 home_speed;
     AP_Int8  home_trig;
+    int8_t   _home_trig_last = 0;
 };
