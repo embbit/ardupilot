@@ -89,7 +89,9 @@ private:
     bool _init_no_echo = false;
     bool _have_target = false;
     bool _alarm_clear_pending = false;
+    bool _enable_after_alarm_clear = false;
     bool _pending_run_spd = false;
+    uint32_t _last_alarm_warn_ms = 0;
     bool _home_pending = false;
     bool _homed = false;
     bool _was_armed = false;

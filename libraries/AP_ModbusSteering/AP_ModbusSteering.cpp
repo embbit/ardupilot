@@ -291,6 +291,8 @@ void AP_ModbusSteering::request_alarm_clear()
         return;
     }
     _alarm_clear_pending = true;
+    _enable_after_alarm_clear = true;
+    _have_target = false;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear");
 }
 
@@ -674,6 +676,10 @@ void AP_ModbusSteering::update(float steering_out)
             _last_rx_ms = now;
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout, continuing");
         }
+        if (_got_status && alarmed() && (now - _last_alarm_warn_ms) > 5000) {
+            _last_alarm_warn_ms = now;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: alarm latched, HOME_TRIG=2");
+        }
     } else if (home_prep_wait_echo()) {
         if (_got_echo) {
             advance_home();
@@ -721,6 +727,12 @@ void AP_ModbusSteering::update(float steering_out)
         if (_alarm_clear_pending) {
             send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
             _alarm_clear_pending = false;
+            _state = DriveState::RUN_READ;
+            break;
+        }
+        if (_enable_after_alarm_clear) {
+            send_u16(REG_MOTOR_ENABLE, 0x0001);
+            _enable_after_alarm_clear = false;
             _state = DriveState::RUN_READ;
             break;
         }
