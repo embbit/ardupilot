@@ -40,7 +40,7 @@ constexpr uint16_t DECEL_DEFAULT = 200;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
-constexpr uint8_t INIT_SKIP_ATTEMPTS = 40;
+constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
 constexpr int32_t CENTER_MOVE_STEP = 10000;
 constexpr uint16_t TRACK_ERR_LIMIT = 50000;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
@@ -593,11 +593,7 @@ void AP_ModbusSteering::advance_init()
         break;
     case DriveState::INIT_TRACK_ERR:
         _state = DriveState::RUN_WRITE;
-        if (_init_no_echo) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: READY but no Modbus echo");
-        } else {
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
-        }
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
         if (_home_pending) {
             _home_pending = false;
             start_home();
@@ -800,15 +796,14 @@ void AP_ModbusSteering::update(float steering_out)
         } else {
             if (_init_attempts == 0) {
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: init step %d", (int)_state);
+                _last_echo_wait_ms = now;
+            } else if ((now - _last_echo_wait_ms) >= WAIT_ECHO_WARN_MS) {
+                _last_echo_wait_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: init step %d waiting for echo",
+                              (int)_state);
             }
             _init_attempts++;
-            if (_init_attempts >= INIT_SKIP_ATTEMPTS) {
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: init step %d no echo, continuing",
-                              (int)_state);
-                _init_no_echo = true;
-                advance_init();
-            }
         }
     } else if (in_run()) {
         if (_last_rx_ms != 0 && (now - _last_rx_ms) > 2000) {
@@ -825,14 +820,14 @@ void AP_ModbusSteering::update(float steering_out)
         } else {
             if (_init_attempts == 0) {
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home prep step %d", (int)_state);
+                _last_echo_wait_ms = now;
+            } else if ((now - _last_echo_wait_ms) >= WAIT_ECHO_WARN_MS) {
+                _last_echo_wait_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: home step %d waiting for echo",
+                              (int)_state);
             }
             _init_attempts++;
-            if (_init_attempts >= INIT_SKIP_ATTEMPTS) {
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: home step %d no echo, continuing",
-                              (int)_state);
-                advance_home();
-            }
         }
     }
 

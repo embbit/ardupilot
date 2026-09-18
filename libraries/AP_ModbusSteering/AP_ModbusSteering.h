@@ -93,7 +93,7 @@ private:
     uint8_t _init_attempts = 0;
     bool _got_echo = false;
     bool _ever_got_rx = false;
-    bool _init_no_echo = false;
+    uint32_t _last_echo_wait_ms = 0;
     bool _have_target = false;
     bool _alarm_clear_pending = false;
     bool _enable_after_alarm_clear = false;
