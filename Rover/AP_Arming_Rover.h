@@ -31,5 +31,7 @@ protected:
     bool parameter_checks(bool report);
     bool mode_checks(bool report);
     bool motor_checks(bool report);
+    bool mandatory_checks(bool report) override;
+    bool modbus_steering_checks(bool report);
 
 };
