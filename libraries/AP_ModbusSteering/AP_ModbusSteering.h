@@ -118,13 +118,17 @@ private:
     uint8_t _home_center_prep = 0;
     bool _center_resend = false;
     int32_t _steer_cmd_offset = 0;
-    bool _pending_mid_seek = false;
-    bool _hold_after_cal = false;
-    uint8_t _mid_seek_prep = 0;
-    int32_t _mid_seek_cmd = 0;
-    int32_t _mid_seek_last_enc = 0;
-    int8_t _mid_seek_sign = 1;
-    bool _mid_seek_retried = false;
+    // After dual-limit cal: continuous speed-mode follow toward
+    // stick_pulses + _steer_cmd_offset (stick=0 drives to physical mid).
+    bool _speed_follow = false;
+    uint8_t _follow_prep = 0;
+    bool _follow_moving = false;
+    int8_t _follow_sign = 0;
+    uint8_t _follow_slot = 0;
+    uint8_t _follow_alarm_step = 0;
+    uint8_t _follow_restore = 0;
+    int32_t _follow_last_enc = 0;
+    uint32_t _follow_progress_ms = 0;
     uint16_t _queued_motion = 0;
     bool _home_retry_pending = false;
     bool _home_leg_settling = false;

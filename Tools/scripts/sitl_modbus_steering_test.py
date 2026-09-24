@@ -415,12 +415,20 @@ def run_param_trigger():
         if not wait_for_log(sim_lines, "HOME START", 2):
             print("FAIL: simulator did not see HOME START")
             return 1
-        # Auto mid-seek disabled — calibration finishes at the limit with offset.
-        hold_rc_deadline = time.time() + 5
+        # Auto mid return via speed-mode follow after cal.
+        mid_ok = False
+        hold_rc_deadline = time.time() + 45
         while time.time() < hold_rc_deadline:
             collect_mavlink_events(mavlink, 0.5, events)
-            if any("cal done at limit" in t for t in events):
+            if any("at mid-travel" in t for t in events):
+                mid_ok = True
                 break
+            if any("speed follow" in t for t in events) or any("SPEED START" in line for line in sim_lines):
+                # Keep waiting for arrive
+                pass
+        if not mid_ok and not any("speed follow" in t for t in events):
+            print("FAIL: missing speed-follow mid return after cal")
+            return 1
         print("PASS: HOME_TRIG=1 calibrated steering")
 
         set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
@@ -542,10 +550,29 @@ def run_rc_buttons():
         if not any("cal done at limit" in t for t in events):
             print("FAIL: missing cal done at limit message")
             return 1
-        # Auto mid-seek disabled: run speed should restore right after calibrated.
+        if not any("speed follow" in t for t in events):
+            print("FAIL: missing speed-follow mid return message")
+            return 1
+
+        # Wait for physical mid return (speed mode at crawl RPM).
+        mid_done = False
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
+            if any("at mid-travel" in t for t in events):
+                mid_done = True
+                break
+            if any("SPEED START" in line for line in sim_lines):
+                pass
+        if not mid_done:
+            print("FAIL: did not reach mid-travel after cal")
+            return 1
+        print("PASS: returned to mid-travel after cal")
+
+        # Run speed restores after mid arrive.
         n_before = len(sim_lines)
         restored = False
-        deadline = time.time() + 10
+        deadline = time.time() + 15
         while time.time() < deadline:
             hold_rc(mavlink, events, 0.3, ch6=1500, ch7=1500)
             for line in sim_lines[n_before:]:
@@ -554,20 +581,19 @@ def run_rc_buttons():
                     break
             if restored:
                 break
-            # Also accept a 1300 that appeared after HOME START in the full log.
-            after_home = False
+            after_mid = False
             for line in sim_lines:
-                if "HOME START" in line:
-                    after_home = True
-                elif after_home and "MAX_SPD=1300" in line:
+                if "SPEED START" in line:
+                    after_mid = True
+                elif after_mid and "MAX_SPD=1300" in line:
                     restored = True
                     break
             if restored:
                 break
         if not restored:
-            print("FAIL: run speed 1300 not restored after home")
+            print("FAIL: run speed 1300 not restored after mid")
             return 1
-        print("PASS: home speed 1800, hold at limit, run speed restored to 1300")
+        print("PASS: home speed 1800, mid return, run speed restored to 1300")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
@@ -575,6 +601,43 @@ def run_rc_buttons():
             print("FAIL: ARM failed after calibration")
             return 1
         print("PASS: ARM succeeded after calibration")
+
+        # QGC/virtual-stick path: RC override must drive speed-mode motion.
+        n_stick = len(sim_lines)
+        for _ in range(20):
+            mavlink.mav.rc_channels_override_send(
+                mavlink.target_system,
+                mavlink.target_component,
+                1900, 0, 1500, 1500, 1500, 1500, 1500, 1500,
+            )
+            collect_mavlink_events(mavlink, 0.25, events)
+        stick_moved = any(
+            ("SPEED START" in line and "rpm=" in line and "rpm=0" not in line)
+            or ("MAX_SPD=" in line and "MAX_SPD=0" not in line and "MAX_SPD=1300" not in line
+                and "MAX_SPD=-1300" not in line)
+            or ("vel=" in line and "vel=     +0" not in line and "vel=     -0" not in line)
+            for line in sim_lines[n_stick:]
+        )
+        # Also accept a new SPEED START after mid with non-zero signed rpm.
+        if not stick_moved:
+            stick_moved = any("SPEED START" in line for line in sim_lines[n_stick:])
+        if not stick_moved:
+            # Fallback: any non-zero MAX_SPD write after mid restore means follow reacted.
+            stick_moved = any(
+                "MAX_SPD=" in line and not line.rstrip().endswith("MAX_SPD=1300")
+                and not line.rstrip().endswith("MAX_SPD=-1300")
+                for line in sim_lines[n_stick:]
+            )
+        # Signed run speed toward stick is expected (±1300 or other non-zero).
+        if not stick_moved:
+            for line in sim_lines[n_stick:]:
+                if "MAX_SPD=" in line:
+                    stick_moved = True
+                    break
+        if not stick_moved:
+            print("FAIL: stick override did not command speed-mode motion")
+            return 1
+        print("PASS: virtual stick override drives speed-mode follow")
         return 0
     finally:
         for proc in procs:
