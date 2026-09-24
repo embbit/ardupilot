@@ -30,13 +30,16 @@ constexpr uint16_t REG_POS_MODE = 0x003A;
 constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t AUX_POS_ZERO = 0x0008;
-// CL57R 0x0036 bits (official Modbus doc):
-// Bit0 start positioning, Bit1 abs(1)/rel(0), Bit2 interrupt, Bit4 home.
-// Example start is 0x0001. Bit1 alone (0x0002) does NOT start motion.
+// CL57R 0x0036 (official Modbus doc):
+// Bit0 position start, Bit1 abs/rel, Bit2 irq, Bit3 speed start,
+// Bit4 home, Bit5 stop, Bit6 e-stop.
+// After native home the drive often ignores Bit0 until Bit5 stop exits home mode.
 constexpr uint16_t MOTION_START_REL = 0x0001;
 constexpr uint16_t MOTION_START_ABS = 0x0003;
 constexpr uint16_t MOTION_START_ABS_IRQ = 0x0007;
+constexpr uint16_t MOTION_SPEED = 0x0008;
 constexpr uint16_t MOTION_HOME = 0x0010;
+constexpr uint16_t MOTION_STOP = 0x0020;
 constexpr uint16_t STATUS_HOME_DONE = (1U << 1);
 constexpr uint16_t STATUS_RUNNING = (1U << 2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
@@ -247,16 +250,16 @@ uint16_t AP_ModbusSteering::calib_speed_rpm() const
 
 uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 {
-    // Register 0x0042 is limited to 5..300 RPM per the CL57R Modbus manual.
+    // 0x0042 is limited to 5..300. Dual-limit legs on this drive often run the
+    // whole travel at crawl (limit already seen / polarity) — use the max.
     const uint16_t home = calib_speed_rpm();
-    uint16_t crawl = home / 10;
-    if (crawl < 30) {
-        crawl = 30;
+    if (home >= 300) {
+        return 300;
     }
-    if (crawl > 300) {
-        crawl = 300;
+    if (home < 5) {
+        return 30;
     }
-    return crawl;
+    return home;
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -545,7 +548,10 @@ void AP_ModbusSteering::finish_home()
     _have_target = false;
     _last_target = 0;
     _homed = true;
-    _pending_run_spd = true;
+    // Restore armed run speed only after mid-seek finishes (needs calib MAX_SPD).
+    if (!_pending_mid_seek) {
+        _pending_run_spd = true;
+    }
     _rx_expect = RxExpect::NONE;
     if (home_trig.get() == 1) {
         home_trig.set_and_save(0);
@@ -1014,67 +1020,101 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         }
         if (_pending_mid_seek) {
-            // Post-home seek to mid-travel. One Modbus frame per 50 ms slot.
-            // Official doc: write target pulses, then 0x0036=0x0001 to start
-            // (relative). 0x0002 alone never starts motion.
+            // Positioning (0x0001/0x0003) is ignored after native home on this
+            // CL57R until home mode is cleared. Exit with Bit5 stop, then run
+            // speed mode (Bit3=0x0008) toward mid-travel and stop at the goal.
+            const int32_t goal = _steer_cmd_offset;
+            const int32_t enc = _actual_pulses - _center_encoder_origin;
+            const int32_t abs_goal = (goal >= 0) ? goal : -goal;
+            const int32_t abs_enc = (enc >= 0) ? enc : -enc;
+
             if (_mid_seek_prep == 0) {
-                send_u16(REG_MOTOR_ENABLE, 0x0001);
+                send_u16(REG_MOTION, MOTION_STOP);
                 _mid_seek_prep = 1;
             } else if (_mid_seek_prep == 1) {
-                send_u16(REG_POS_MODE, 0x0000);  // relative path mode
+                send_u16(REG_MOTION, 0x0000);
                 _mid_seek_prep = 2;
             } else if (_mid_seek_prep == 2) {
-                send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
+                send_u16(REG_MOTOR_ENABLE, 0x0001);
                 _mid_seek_prep = 3;
             } else if (_mid_seek_prep == 3) {
-                send_u16(REG_MAX_SPD, calib_speed_rpm());
+                send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
                 _mid_seek_prep = 4;
             } else if (_mid_seek_prep == 4) {
-                send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                send_u16(0x0030, (uint16_t)start_speed.get());
                 _mid_seek_prep = 5;
-                _center_encoder_origin = _actual_pulses;
             } else if (_mid_seek_prep == 5) {
-                // Full remaining distance in one relative command.
-                const int32_t enc = _actual_pulses - _center_encoder_origin;
-                const int32_t goal = _steer_cmd_offset;
-                const int32_t rel = goal - enc;
-                send_target_pos(rel);
-                queue_motion(MOTION_START_REL);
-                _mid_seek_cmd = rel;
+                send_u16(0x0031, ACCEL_DEFAULT);
                 _mid_seek_prep = 6;
+            } else if (_mid_seek_prep == 6) {
+                send_u16(0x0032, DECEL_DEFAULT);
+                _mid_seek_prep = 7;
+            } else if (_mid_seek_prep == 7) {
+                send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
+                _mid_seek_prep = 8;
+            } else if (_mid_seek_prep == 8) {
+                send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                _center_encoder_origin = _actual_pulses;
+                _mid_seek_prep = 9;
+            } else if (_mid_seek_prep == 9) {
+                // Signed max speed: direction toward mid from the limit.
+                int16_t spd = (int16_t)calib_speed_rpm();
+                if (goal < 0) {
+                    spd = -spd;
+                }
+                send_u16(REG_MAX_SPD, (uint16_t)spd);
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "CL57R: mid speed %d rpm, goal %d",
+                              (int)spd, (int)goal);
+                _mid_seek_prep = 10;
+            } else if (_mid_seek_prep == 10) {
+                send_u16(REG_MOTION, MOTION_SPEED);
+                _mid_seek_prep = 11;
                 _last_home_progress_ms = now;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                              "CL57R: mid rel %d enc %d/%d",
-                              (int)rel, (int)enc, (int)goal);
-            } else {
-                const int32_t enc = _actual_pulses - _center_encoder_origin;
-                const int32_t goal = _steer_cmd_offset;
-                const int32_t err = (enc > goal) ? (enc - goal) : (goal - enc);
-                if (err <= 800) {
-                    send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
-                    _steer_cmd_offset = 0;
-                    _pending_mid_seek = false;
-                    _pending_run_spd = true;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, zeroed");
+                              "CL57R: mid speed start enc %d/%d",
+                              (int)enc, (int)goal);
+            } else if (_mid_seek_prep == 11) {
+                // Stop when encoder has covered the mid offset (same sign as goal).
+                const bool reached = (abs_goal > 0) && (abs_enc >= abs_goal - 800) &&
+                                     ((goal >= 0 && enc >= 0) || (goal < 0 && enc <= 0));
+                if (reached) {
+                    send_u16(REG_MOTION, MOTION_STOP);
+                    _mid_seek_prep = 12;
                 } else if ((now - _home_start_ms) > 45000) {
-                    _pending_mid_seek = false;
-                    _pending_run_spd = true;
+                    send_u16(REG_MOTION, MOTION_STOP);
+                    _mid_seek_prep = 12;
                     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: mid seek timeout, offset %d remains",
-                                  (int)_steer_cmd_offset);
+                                  "CL57R: mid speed timeout enc %d/%d",
+                                  (int)enc, (int)goal);
                 } else if ((now - _last_home_progress_ms) > 2000) {
                     _last_home_progress_ms = now;
-                    // Resend remaining relative distance if still stuck.
-                    const int32_t rel = goal - enc;
-                    if (rel != 0) {
-                        send_target_pos(rel);
-                        queue_motion(MOTION_START_REL);
-                        _mid_seek_cmd = rel;
-                    }
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: mid rel %d enc %d/%d",
-                                  (int)rel, (int)enc, (int)goal);
+                                  "CL57R: mid speed enc %d/%d",
+                                  (int)enc, (int)goal);
+                    // Re-assert speed mode if the drive dropped it.
+                    if (abs_enc < 200) {
+                        send_u16(REG_MOTION, MOTION_SPEED);
+                    }
                 }
+            } else if (_mid_seek_prep == 12) {
+                send_u16(REG_MOTION, 0x0000);
+                _mid_seek_prep = 13;
+            } else if (_mid_seek_prep == 13) {
+                send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                _mid_seek_prep = 14;
+            } else {
+                const bool ok = abs_enc >= (abs_goal > 800 ? abs_goal - 800 : 0);
+                if (ok) {
+                    _steer_cmd_offset = 0;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, zeroed");
+                } else {
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: mid seek incomplete, offset %d remains",
+                                  (int)_steer_cmd_offset);
+                }
+                _pending_mid_seek = false;
+                _pending_run_spd = true;
             }
             _state = DriveState::RUN_READ;
             break;

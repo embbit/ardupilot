@@ -28,6 +28,8 @@ class Nema23Motor:
         self.driver_target = 0
         self.pending_cmd = 0
         self.max_rpm = DEFAULT_MAX_RPM
+        self.max_rpm_signed = DEFAULT_MAX_RPM
+        self.speed_mode = False
         self.accel_ms = DEFAULT_ACCEL_MS
         self.decel_ms = DEFAULT_DECEL_MS
         self.motor_enabled = False
@@ -121,7 +123,9 @@ class Nema23Motor:
         if self.alarmed:
             # Мотор в alarm: не двигается, ждёт alarm-clear. Позиция заморожена.
             self.velocity = 0.0
+            self.speed_mode = False
         elif self.home_finish_at > 0.0:
+            self.speed_mode = False
             error = self.driver_target - self.position
             if abs(error) > 80.0:
                 direction = 1.0 if error > 0 else -1.0
@@ -141,8 +145,21 @@ class Nema23Motor:
                 self.driver_target = 0
                 self.velocity = 0.0
         elif not self.motor_enabled:
+            self.speed_mode = False
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
+        elif self.speed_mode and link_active:
+            # Continuous speed mode (0x0036 Bit3): run at signed MAX_SPD.
+            direction = 1.0 if self.max_rpm_signed >= 0 else -1.0
+            target_vel = self.max_vel * direction
+            if abs(self.velocity - target_vel) < 1.0:
+                self.velocity = target_vel
+            elif self.velocity < target_vel:
+                self.velocity = min(target_vel, self.velocity + self.max_accel * dt_s)
+            else:
+                self.velocity = max(target_vel, self.velocity - self.max_accel * dt_s)
+            self.position += self.velocity * dt_s
+            self.driver_target = int(round(self.position))
         elif link_active:
             self._track_target(dt_s)
             new_pos = self.position + self.velocity * dt_s
@@ -343,8 +360,13 @@ def handle_write_single(reg_addr, val):
     if reg_addr == 0x0030:
         pass  # start speed
     elif reg_addr == 0x0033:
-        motor.max_rpm = val
-        print(f"[CL57R Modbus Sim] MAX_SPD={val}")
+        # Signed RPM (-3000..3000) per CL57R doc.
+        if val >= 0x8000:
+            motor.max_rpm_signed = val - 0x10000
+        else:
+            motor.max_rpm_signed = val
+        motor.max_rpm = abs(motor.max_rpm_signed)
+        print(f"[CL57R Modbus Sim] MAX_SPD={motor.max_rpm_signed}")
     elif reg_addr == 0x0031:
         motor.accel_ms = val
     elif reg_addr == 0x0032:
@@ -356,6 +378,7 @@ def handle_write_single(reg_addr, val):
         motor.motor_enabled = (val == 0x0001)
         if not motor.motor_enabled:
             motor.velocity = 0.0
+            motor.speed_mode = False
             print("[CL57R Modbus Sim] MOTOR DISABLE")
     elif reg_addr == 0x0037 and val == 0x0004:
         print("[CL57R Modbus Sim] ALARM CLEAR write")
@@ -374,6 +397,7 @@ def handle_write_single(reg_addr, val):
         motor.track_err_limit = val
     elif reg_addr == 0x0036 and (val & 0x0010):
         motor.clear_alarm()
+        motor.speed_mode = False
         motor.home_done = False
         motor.home_runs += 1
         motor.home_finish_at = time.time() + 1.5
@@ -383,8 +407,18 @@ def handle_write_single(reg_addr, val):
             motor.driver_target = 80000
         if motor.home_rpm:
             motor.max_rpm = motor.home_rpm
+            motor.max_rpm_signed = motor.home_rpm
         print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs}")
+    elif reg_addr == 0x0036 and (val & 0x0008):
+        motor.speed_mode = True
+        print(f"[CL57R Modbus Sim] SPEED START rpm={motor.max_rpm_signed}")
+    elif reg_addr == 0x0036 and (val & 0x0020):
+        motor.speed_mode = False
+        motor.velocity = 0.0
+        motor.driver_target = int(round(motor.position))
+        print("[CL57R Modbus Sim] MOTION STOP")
     elif reg_addr == 0x0036 and (val & 0x0001):
+        motor.speed_mode = False
         if motor.apply_motion_start(val):
             print(f"[CL57R Modbus Sim] MOTION START 0x{val:04X} target={motor.driver_target}")
     elif reg_addr == 0x0036:
