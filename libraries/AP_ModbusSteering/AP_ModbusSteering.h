@@ -75,6 +75,7 @@ private:
     uint16_t calib_speed_rpm() const;
     uint16_t calib_crawl_rpm() const;
     uint16_t mid_seek_speed_rpm() const;
+    uint16_t track_err_limit() const;
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_target_pos(int32_t target);
@@ -148,6 +149,9 @@ private:
     bool _home_stop_pending = false;
     bool _home_clear_pending = false;
     bool _home_speed_leg = false;
+    bool _home_crawl_pending = false;   // resume seek at crawl after early alarm
+    uint8_t _home_early_retries = 0;
+    int32_t _leg1_travel = 0;           // peak travel of dual-limit leg 1
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
     uint8_t _follow_alarm_count = 0;
@@ -166,7 +170,7 @@ private:
     AP_Int16 start_speed;
     AP_Int16 max_speed;
     AP_Int32 pos_db;
-    AP_Int32 ret_slew;
+    AP_Int32 track_err;
     AP_Int8  out_rev;
     AP_Int16 ratio;
     AP_Int8  rst_ch;
