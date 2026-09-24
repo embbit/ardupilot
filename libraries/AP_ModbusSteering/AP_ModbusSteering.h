@@ -73,6 +73,7 @@ private:
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
     uint16_t calib_crawl_rpm() const;
+    uint16_t mid_seek_speed_rpm() const;
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_target_pos(int32_t target);
@@ -120,6 +121,7 @@ private:
     bool _pending_mid_seek = false;
     uint8_t _mid_seek_prep = 0;
     int32_t _mid_seek_cmd = 0;
+    int32_t _mid_seek_last_enc = 0;
     uint16_t _queued_motion = 0;
     bool _home_retry_pending = false;
     bool _home_leg_settling = false;
