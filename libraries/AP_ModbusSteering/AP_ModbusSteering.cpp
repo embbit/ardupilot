@@ -571,6 +571,15 @@ void AP_ModbusSteering::consume_rx()
         const uint8_t fn = _rx_buf[offset + 1];
         if (fn == 0x06) {
             _got_echo = true;
+        } else if ((fn & 0x80) != 0) {
+            // Exception response still proves the slave heard us; advance so an
+            // unsupported register cannot stall homing forever.
+            _got_echo = true;
+            if (frame_len >= 3) {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: Modbus ex fn=0x%02x code=%u",
+                              (unsigned)fn, (unsigned)_rx_buf[offset + 2]);
+            }
         } else if (fn == 0x03 && frame_len >= 7) {
             const uint8_t byte_count = _rx_buf[offset + 2];
             if (_rx_expect == RxExpect::STATUS && byte_count >= 2) {
@@ -652,7 +661,9 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_SET_RUN_SPD;
         break;
     case DriveState::HOME_SET_RUN_SPD:
-        _state = DriveState::HOME_SET_CRAWL;
+        // Skip HOME_CRAWL (0x0042): many CL57R builds do not implement it and
+        // never echo, which previously stalled calibration on step 15.
+        _state = DriveState::HOME_SET_ACCEL;
         break;
     case DriveState::HOME_SET_CRAWL:
         _state = DriveState::HOME_SET_ACCEL;
@@ -984,7 +995,8 @@ void AP_ModbusSteering::update(float steering_out)
         send_u16(REG_MAX_SPD, calib_speed_rpm());
         break;
     case DriveState::HOME_SET_CRAWL:
-        send_u16(REG_HOME_CRAWL, calib_crawl_rpm());
+        // Unused: advance_home skips this state. Kept for enum stability.
+        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
         break;
     case DriveState::HOME_SET_ACCEL:
         send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
