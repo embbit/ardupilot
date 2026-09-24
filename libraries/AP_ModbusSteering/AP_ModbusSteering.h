@@ -115,6 +115,9 @@ private:
     uint8_t _home_center_prep = 0;
     bool _center_resend = false;
     int32_t _steer_cmd_offset = 0;
+    bool _pending_mid_seek = false;
+    uint8_t _mid_seek_prep = 0;
+    int32_t _mid_seek_cmd = 0;
     bool _home_leg_settling = false;
     uint32_t _home_leg_settle_ms = 0;
     bool _center_step_settling = false;

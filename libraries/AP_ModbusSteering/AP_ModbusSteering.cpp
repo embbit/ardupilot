@@ -378,6 +378,9 @@ void AP_ModbusSteering::start_home()
     _center_move_target = 0;
     _steer_cmd_offset = 0;
     _center_resend = false;
+    _pending_mid_seek = false;
+    _mid_seek_prep = 0;
+    _mid_seek_cmd = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -499,20 +502,20 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _center_move_target = center_target_pulses();
     }
 
-    // Native home zeros the COMMAND position, but encoder reg 0x0007 may keep
-    // its absolute value. Command moves in command-space from 0; judge arrival
-    // by encoder delta from the limit-2 origin.
+    // Absolute moves after native home are unreliable on CL57R (command accepted
+    // but motor never leaves the limit). Finish calibration at the limit and map
+    // stick-center to mid-travel via command offset; optionally seek mid in RUN.
     _center_encoder_origin = _actual_pulses;
-    _center_step_target = 0;
-    _home_center_run_spd = false;
-    _home_center_prep = 0;
-    _center_step_settling = false;
+    _steer_cmd_offset = _center_move_target;
+    _pending_mid_seek = true;
+    _mid_seek_prep = 0;
+    _mid_seek_cmd = 0;
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
-    _last_home_retry_ms = _home_start_ms;
-    _state = DriveState::HOME_MOVE_CENTER;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering to %d (enc origin %d)",
-                  (int)_center_move_target, (int)_center_encoder_origin);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "CL57R: cal done at limit, mid offset %d",
+                  (int)_steer_cmd_offset);
+    finish_home();
 }
 
 void AP_ModbusSteering::finish_home()
@@ -980,12 +983,72 @@ void AP_ModbusSteering::update(float steering_out)
             _state = DriveState::RUN_READ;
             break;
         }
+        if (_pending_mid_seek) {
+            // Quiet post-home seek to mid-travel using command offset.
+            if (_mid_seek_prep == 0) {
+                send_u16(REG_MOTOR_ENABLE, 0x0001);
+                _mid_seek_prep = 1;
+            } else if (_mid_seek_prep == 1) {
+                send_u16(REG_POS_MODE, 0x0001);
+                _mid_seek_prep = 2;
+            } else if (_mid_seek_prep == 2) {
+                send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
+                _mid_seek_prep = 3;
+            } else if (_mid_seek_prep == 3) {
+                send_u16(REG_MAX_SPD, calib_speed_rpm());
+                _mid_seek_prep = 4;
+            } else if (_mid_seek_prep == 4) {
+                send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                _mid_seek_prep = 5;
+                _center_encoder_origin = _actual_pulses;
+            } else {
+                const int32_t enc = _actual_pulses - _center_encoder_origin;
+                const int32_t goal = _steer_cmd_offset;
+                const int32_t err = (enc > goal) ? (enc - goal) : (goal - enc);
+                if (err <= 800) {
+                    send_u16(REG_POS_MODE, 0x0001);
+                    send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                    _steer_cmd_offset = 0;
+                    _pending_mid_seek = false;
+                    _pending_run_spd = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, zeroed");
+                } else if ((now - _home_start_ms) > 45000) {
+                    // Keep offset so stick-center still commands mid-travel.
+                    _pending_mid_seek = false;
+                    _pending_run_spd = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: mid seek timeout, offset %d remains",
+                                  (int)_steer_cmd_offset);
+                } else {
+                    // Relative steps: abs moves after native home often do nothing
+                    // on CL57R, while relative path-control still runs.
+                    int32_t step = CENTER_MOVE_STEP;
+                    if (err < step) {
+                        step = err;
+                    }
+                    const int32_t rel = (goal >= enc) ? step : -step;
+                    send_u16(REG_POS_MODE, 0x0000);
+                    send_u16(REG_MOTION, 0x0000);
+                    send_pos_then_motion(rel, 0x0002);
+                    _mid_seek_cmd = rel;
+                    if ((now - _last_home_progress_ms) > 2000) {
+                        _last_home_progress_ms = now;
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: mid rel %d enc %d/%d",
+                                      (int)rel, (int)enc, (int)goal);
+                    }
+                }
+            }
+            _state = DriveState::RUN_READ;
+            break;
+        }
         const int32_t target = stick_pulses + _steer_cmd_offset;
         const int32_t deadband = pos_db.get();
         const int32_t delta = (target > _last_target) ? (target - _last_target) : (_last_target - target);
         const bool send_pos = !_have_target || (delta > deadband);
         if (send_pos) {
-            send_abs_move(target);
+            send_u16(REG_MOTION, 0x0000);
+            send_pos_then_motion(target, 0x0001);
         } else {
             send_u16(REG_MOTOR_ENABLE, 0x0001);
         }
@@ -1010,12 +1073,18 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_SET_METHOD:
         send_u16(REG_HOME_METHOD, home_method_reg());
         break;
-    case DriveState::HOME_SET_SPD:
-        send_u16(REG_HOME_SPD, calib_speed_rpm());
+    case DriveState::HOME_SET_SPD: {
+        const uint16_t spd = calib_speed_rpm();
+        send_u16(REG_HOME_SPD, spd);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write HOME_SPD=%u", (unsigned)spd);
         break;
-    case DriveState::HOME_SET_RUN_SPD:
-        send_u16(REG_MAX_SPD, calib_speed_rpm());
+    }
+    case DriveState::HOME_SET_RUN_SPD: {
+        const uint16_t spd = calib_speed_rpm();
+        send_u16(REG_MAX_SPD, spd);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write MAX_SPD=%u (calib)", (unsigned)spd);
         break;
+    }
     case DriveState::HOME_SET_CRAWL:
         // Unused: advance_home skips this state. Kept for enum stability.
         send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
