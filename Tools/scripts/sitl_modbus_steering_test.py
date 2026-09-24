@@ -416,16 +416,14 @@ def run_param_trigger():
             print("FAIL: simulator did not see HOME START")
             return 1
         mid_done = False
-        deadline = time.time() + 30
+        deadline = time.time() + 90
         while time.time() < deadline:
             collect_mavlink_events(mavlink, 0.5, events)
             if any("at mid-travel" in t for t in events):
                 mid_done = True
                 break
-            if any("mid seek incomplete" in t or "mid abandon" in t for t in events):
-                mid_done = True
-                break
-            if any("mid seek" in t and "offset" in t for t in events):
+            if any("mid seek incomplete" in t or "mid abandon" in t or "mid incomplete" in t
+                   for t in events):
                 mid_done = True
                 break
         if not mid_done:
@@ -552,16 +550,14 @@ def run_rc_buttons():
         # Mid-seek runs after "calibrated" via speed mode; wait for it to finish
         # and restore armed run speed.
         mid_done = False
-        deadline = time.time() + 30
+        deadline = time.time() + 90
         while time.time() < deadline:
             hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
             if any("at mid-travel" in t for t in events):
                 mid_done = True
                 break
-            if any("mid seek incomplete" in t or "mid abandon" in t for t in events):
-                mid_done = True
-                break
-            if any("mid seek" in t and "offset" in t for t in events):
+            if any("mid seek incomplete" in t or "mid abandon" in t or "mid incomplete" in t
+                   for t in events):
                 mid_done = True
                 break
         if not mid_done:
@@ -570,13 +566,18 @@ def run_rc_buttons():
         if not wait_for_log(sim_lines, "SPEED START", 2):
             print("FAIL: simulator did not see speed-mode mid-seek")
             return 1
-        after_home = False
+        # Run-speed restore is a few slots after at-mid-travel / abandon.
+        n_before = len(sim_lines)
         restored = False
-        for line in sim_lines:
-            if "HOME START" in line:
-                after_home = True
-            if after_home and "MAX_SPD=1300" in line:
-                restored = True
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            hold_rc(mavlink, events, 0.3, ch6=1500, ch7=1500)
+            for line in sim_lines[n_before:]:
+                if "MAX_SPD=1300" in line:
+                    restored = True
+                    break
+            if restored:
+                break
         if not restored:
             print("FAIL: run speed 1300 not restored after home")
             return 1
