@@ -507,6 +507,9 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _state = DriveState::HOME_ZERO_AT_L1;
         _got_echo = false;
         _init_attempts = 0;
+        _home_stop_pending = false;
+        _home_clear_pending = false;
+        _home_leg_settling = false;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 reached, zero and seek limit 2");
         return;
     }
@@ -528,8 +531,9 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         }
         const int32_t expected = expected_full_travel_pulses();
         // Only reject wildly wrong values; OUT_REV/RATIO are approximate until
-        // dual-limit measurement replaces them.
-        if (expected >= 20000 && full_travel > expected * 3) {
+        // dual-limit measurement replaces them. Speed-mode seek can measure
+        // larger travel than a rough OUT_REV*RATIO estimate — allow 5x.
+        if (expected >= 20000 && full_travel > expected * 5) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
                           (int)full_travel, (int)expected);
             abort_home("measured travel implausible");

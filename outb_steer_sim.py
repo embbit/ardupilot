@@ -14,7 +14,9 @@ DEFAULT_MAX_RPM = 120
 DEFAULT_ACCEL_MS = 400
 DEFAULT_DECEL_MS = 400
 # Soft mechanical stops for speed-mode limit seek (dual-limit cal).
-SPEED_HARD_STOP = 194000
+# Full travel ≈ 2 * SPEED_HARD_STOP; keep in line with SITL OUT_REV*RATIO*PPR
+# (2*10*4000=80000) so measured travel passes the plausibility check.
+SPEED_HARD_STOP = 40000
 
 # NEMA23 + 25:1 gearbox + rudder load (reflected inertia at motor shaft)
 NEMA23_INERTIA_FACTOR = 1.35
