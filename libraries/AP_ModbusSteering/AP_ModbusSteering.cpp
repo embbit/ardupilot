@@ -1106,6 +1106,8 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_leg_settling = true;
                     _home_leg_settle_ms = now + 200;
                     _home_stop_pending = true;
+                    _home_crawl_pending = false;
+                    _home_crawl_away = false;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                                   "CL57R: DI limit hit travel %d",
                                   (int)_leg_peak_travel);
@@ -1142,6 +1144,8 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_leg_settling = true;
                     _home_leg_settle_ms = now + 250;
                     _home_stop_pending = true;
+                    _home_crawl_pending = false;
+                    _home_crawl_away = false;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                                   "CL57R: limit hit travel %d",
                                   (int)_leg_peak_travel);
