@@ -119,6 +119,7 @@ private:
     bool _center_resend = false;
     int32_t _steer_cmd_offset = 0;
     bool _pending_mid_seek = false;
+    bool _hold_after_cal = false;
     uint8_t _mid_seek_prep = 0;
     int32_t _mid_seek_cmd = 0;
     int32_t _mid_seek_last_enc = 0;

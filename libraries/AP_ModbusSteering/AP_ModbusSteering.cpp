@@ -413,6 +413,7 @@ void AP_ModbusSteering::start_home()
     _steer_cmd_offset = 0;
     _center_resend = false;
     _pending_mid_seek = false;
+    _hold_after_cal = false;
     _mid_seek_prep = 0;
     _mid_seek_cmd = 0;
     _mid_seek_last_enc = 0;
@@ -541,12 +542,14 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _center_move_target = center_target_pulses();
     }
 
-    // Absolute moves after native home are unreliable on CL57R (command accepted
-    // but motor never leaves the limit). Finish calibration at the limit and map
-    // stick-center to mid-travel via command offset; optionally seek mid in RUN.
+    // Absolute moves after native home are unreliable on CL57R, and speed-mode
+    // mid-seek trips tracking alarms / can reverse under fault. Stay at the
+    // limit with a stick offset so GCS/auto "center" maps to mid-travel; the
+    // pilot (or a later abs move once the bus is quiet) can leave the limit.
     _center_encoder_origin = _actual_pulses;
     _steer_cmd_offset = _center_move_target;
-    _pending_mid_seek = true;
+    _pending_mid_seek = false;
+    _hold_after_cal = true;
     _mid_seek_prep = 0;
     _mid_seek_cmd = 0;
     _mid_seek_last_enc = 0;
@@ -555,7 +558,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal done at limit, mid offset %d",
+                  "CL57R: cal done at limit, mid offset %d (hold)",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -566,10 +569,9 @@ void AP_ModbusSteering::finish_home()
     _have_target = false;
     _last_target = 0;
     _homed = true;
-    // Restore armed run speed only after mid-seek finishes (needs calib MAX_SPD).
-    if (!_pending_mid_seek) {
-        _pending_run_spd = true;
-    }
+    _pending_run_spd = true;
+    _alarm_clear_pending = true;
+    _enable_after_alarm_clear = true;
     _rx_expect = RxExpect::NONE;
     if (home_trig.get() == 1) {
         home_trig.set_and_save(0);
@@ -1035,6 +1037,22 @@ void AP_ModbusSteering::update(float steering_out)
         if (_pending_run_spd) {
             send_u16(REG_MAX_SPD, run_speed_rpm());
             _pending_run_spd = false;
+            _state = DriveState::RUN_READ;
+            break;
+        }
+        if (_hold_after_cal) {
+            // Do not blast absolute mid target after home — that is the fast
+            // wrong-way / alarm move. Hold enable until the stick leaves center.
+            const int32_t release = MAX(pos_db.get(), travel_limit_pulses() / 20);
+            if (stick_pulses > release || stick_pulses < -release) {
+                _hold_after_cal = false;
+                // Re-zero here so stick deflection is relative to the limit;
+                // offset still shifts the "center" command for full travel.
+                send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: hold released, stick active");
+            } else {
+                send_u16(REG_MOTOR_ENABLE, 0x0001);
+            }
             _state = DriveState::RUN_READ;
             break;
         }

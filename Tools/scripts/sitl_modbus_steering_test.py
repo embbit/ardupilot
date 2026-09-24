@@ -415,20 +415,12 @@ def run_param_trigger():
         if not wait_for_log(sim_lines, "HOME START", 2):
             print("FAIL: simulator did not see HOME START")
             return 1
-        mid_done = False
-        deadline = time.time() + 90
-        while time.time() < deadline:
+        # Auto mid-seek disabled — calibration finishes at the limit with offset.
+        hold_rc_deadline = time.time() + 5
+        while time.time() < hold_rc_deadline:
             collect_mavlink_events(mavlink, 0.5, events)
-            if any("at mid-travel" in t for t in events):
-                mid_done = True
+            if any("cal done at limit" in t for t in events):
                 break
-            if any("mid seek incomplete" in t or "mid abandon" in t or "mid incomplete" in t
-                   for t in events):
-                mid_done = True
-                break
-        if not mid_done:
-            print("FAIL: mid-seek did not finish after HOME_TRIG calibration")
-            return 1
         print("PASS: HOME_TRIG=1 calibrated steering")
 
         set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
@@ -547,26 +539,10 @@ def run_rc_buttons():
         if not any("HOME_SPD=1800" in line for line in sim_lines):
             print("FAIL: homing did not write HOME_SPD=1800")
             return 1
-        # Mid-seek runs after "calibrated" via speed mode; wait for it to finish
-        # and restore armed run speed.
-        mid_done = False
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
-            if any("at mid-travel" in t for t in events):
-                mid_done = True
-                break
-            if any("mid seek incomplete" in t or "mid abandon" in t or "mid incomplete" in t
-                   for t in events):
-                mid_done = True
-                break
-        if not mid_done:
-            print("FAIL: mid-seek did not finish after calibration")
+        if not any("cal done at limit" in t for t in events):
+            print("FAIL: missing cal done at limit message")
             return 1
-        if not wait_for_log(sim_lines, "SPEED START", 2):
-            print("FAIL: simulator did not see speed-mode mid-seek")
-            return 1
-        # Run-speed restore is a few slots after at-mid-travel / abandon.
+        # Auto mid-seek disabled: run speed should restore right after calibrated.
         n_before = len(sim_lines)
         restored = False
         deadline = time.time() + 10
@@ -578,10 +554,20 @@ def run_rc_buttons():
                     break
             if restored:
                 break
+            # Also accept a 1300 that appeared after HOME START in the full log.
+            after_home = False
+            for line in sim_lines:
+                if "HOME START" in line:
+                    after_home = True
+                elif after_home and "MAX_SPD=1300" in line:
+                    restored = True
+                    break
+            if restored:
+                break
         if not restored:
             print("FAIL: run speed 1300 not restored after home")
             return 1
-        print("PASS: home speed 1800, mid-seek done, run speed restored to 1300")
+        print("PASS: home speed 1800, hold at limit, run speed restored to 1300")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
