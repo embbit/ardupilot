@@ -128,6 +128,7 @@ private:
     uint8_t _follow_alarm_step = 0;
     uint8_t _follow_restore = 0;
     int32_t _follow_last_enc = 0;
+    int16_t _follow_last_spd = 0;
     uint32_t _follow_progress_ms = 0;
     uint16_t _queued_motion = 0;
     bool _home_retry_pending = false;

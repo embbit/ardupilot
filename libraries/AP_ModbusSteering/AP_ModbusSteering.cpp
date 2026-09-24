@@ -432,6 +432,7 @@ void AP_ModbusSteering::start_home()
     _follow_alarm_step = 0;
     _follow_restore = 0;
     _follow_last_enc = 0;
+    _follow_last_spd = 0;
     _follow_progress_ms = 0;
     _follow_dir_flipped = false;
     _follow_halted = false;
@@ -580,6 +581,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _follow_alarm_step = 0;
     _follow_restore = 0;
     _follow_last_enc = 0;
+    _follow_last_spd = 0;
     _follow_progress_ms = 0;
     _follow_dir_flipped = false;
     _follow_halted = false;
@@ -1122,6 +1124,7 @@ void AP_ModbusSteering::update(float steering_out)
                     // Do not AUX_POS_ZERO on the pressed limit — it aggravates faults.
                     _center_encoder_origin = _actual_pulses;
                     _follow_last_enc = 0;
+                    _follow_last_spd = 0;
                     _follow_progress_ms = now;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                                   "CL57R: spd-follow on, ofs %d",
@@ -1278,8 +1281,8 @@ void AP_ModbusSteering::update(float steering_out)
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    mid_seek_speed_rpm() : run_speed_rpm();
                 // Scale RPM with remaining error so high stick speed does not
-                // overshoot and chatter through the arrive deadband.
-                const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60;
+                // overshoot and chatter through the arrive deadband (~0.5s zone).
+                const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 120;
                 uint16_t rpm = max_rpm;
                 if (slow_zone > 0 && abs_err < slow_zone) {
                     const uint16_t min_rpm = (_steer_cmd_offset != 0) ? 40 : 80;
@@ -1293,10 +1296,12 @@ void AP_ModbusSteering::update(float steering_out)
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
+                    _follow_last_spd = 0;
                 } else if (!_follow_moving || _follow_sign != want_sign) {
                     if (_follow_slot == 0) {
                         send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
                         _follow_sign = want_sign;
+                        _follow_last_spd = signed_spd;
                         _follow_slot = 1;
                     } else {
                         send_u16(REG_MOTION, MOTION_SPEED);
@@ -1322,14 +1327,21 @@ void AP_ModbusSteering::update(float steering_out)
                         // Drive dropped speed mode — reassert without reversing.
                         send_u16(REG_MOTION, MOTION_SPEED);
                     } else {
-                        // Refresh approach speed as error shrinks.
-                        send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
+                        send_u16(REG_MOTOR_ENABLE, 0x0001);
                     }
-                } else if (abs_err < slow_zone) {
-                    // Keep updating signed MAX_SPD while braking into target.
-                    send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
                 } else {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    // Refresh approach MAX_SPD only when rpm changes a lot.
+                    // Spamming MAX_SPD every 50ms starves encoder RX and the
+                    // firmware thinks enc stuck at 0 while the motor runs away.
+                    const int16_t spd_delta = (signed_spd > _follow_last_spd) ?
+                                             (signed_spd - _follow_last_spd) :
+                                             (_follow_last_spd - signed_spd);
+                    if (spd_delta >= 30) {
+                        send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
+                        _follow_last_spd = signed_spd;
+                    } else {
+                        send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    }
                 }
             }
             _state = DriveState::RUN_READ;
