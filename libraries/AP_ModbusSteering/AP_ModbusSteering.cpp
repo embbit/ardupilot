@@ -277,10 +277,12 @@ uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 int32_t AP_ModbusSteering::center_target_pulses() const
 {
     const int32_t limit = travel_limit_pulses();
+    // After finishing on method M17 the free mid lies in the negative
+    // command direction; after M18 it is positive (matches measured leg sign).
     if (home_method_reg() == 18) {
-        return -limit;
+        return limit;
     }
-    return limit;
+    return -limit;
 }
 
 uint8_t AP_ModbusSteering::rtu_frame_len(const uint8_t *buf, uint8_t avail) const
@@ -409,6 +411,7 @@ void AP_ModbusSteering::start_home()
     _home_leg = 0;
     _measured_half_travel = 0;
     _leg_peak_travel = 0;
+    _leg_dir_sign = 0;
     _center_move_target = 0;
     _steer_cmd_offset = 0;
     _center_resend = false;
@@ -421,6 +424,9 @@ void AP_ModbusSteering::start_home()
     _follow_restore = 0;
     _follow_last_enc = 0;
     _follow_progress_ms = 0;
+    _follow_dir_flipped = false;
+    _follow_halted = false;
+    _follow_alarm_count = 0;
     _queued_motion = 0;
     _home_retry_pending = false;
     _state = DriveState::HOME_CLEAR_ALARM;
@@ -533,13 +539,22 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             return;
         }
         _measured_half_travel = full_travel / 2;
-        // After leg 2 native home we sit at limit 2 with position ~0.
-        // Move toward mid-travel (opposite of the second home method).
-        _center_move_target = (home_method_reg() == 18) ?
-                              -_measured_half_travel : _measured_half_travel;
+        // After leg 2 we sit on that limit (encoder ~0). Mid is BACK toward
+        // the other limit — opposite of the signed travel measured on leg 2.
+        // User log: M17 as leg 2 + positive cmd slammed the stop; leg sign fixes it.
+        int8_t mid_sign = 0;
+        if (_leg_dir_sign > 0) {
+            mid_sign = -1;
+        } else if (_leg_dir_sign < 0) {
+            mid_sign = 1;
+        } else {
+            // Fallback if encoder never moved (should not happen after a valid leg).
+            mid_sign = (home_method_reg() == 18) ? 1 : -1;
+        }
+        _center_move_target = (int32_t)mid_sign * _measured_half_travel;
         max_steps.set_and_save(_measured_half_travel);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d pulses, center %d",
-                      (int)full_travel, (int)_center_move_target);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d mid %d (legdir %d)",
+                      (int)full_travel, (int)_center_move_target, (int)_leg_dir_sign);
     } else {
         _center_move_target = center_target_pulses();
     }
@@ -557,6 +572,9 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _follow_restore = 0;
     _follow_last_enc = 0;
     _follow_progress_ms = 0;
+    _follow_dir_flipped = false;
+    _follow_halted = false;
+    _follow_alarm_count = 0;
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
@@ -746,6 +764,7 @@ void AP_ModbusSteering::advance_home()
         _last_home_progress_ms = _home_start_ms;
         _home_start_pulses = _actual_pulses;
         _leg_peak_travel = 0;
+        _leg_dir_sign = 0;
         _home_read_encoder = false;
         _got_status = false;
         _saw_home_run = false;
@@ -838,11 +857,15 @@ void AP_ModbusSteering::update(float steering_out)
     if (_state == DriveState::HOME_WAIT) {
         const bool home_bit = (_got_status && (_status_word & STATUS_HOME_DONE) != 0);
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
-        const int32_t moved = (_actual_pulses > _home_start_pulses) ?
-                              (_actual_pulses - _home_start_pulses) :
-                              (_home_start_pulses - _actual_pulses);
+        const int32_t delta = _actual_pulses - _home_start_pulses;
+        const int32_t moved = (delta >= 0) ? delta : -delta;
         if (moved > _leg_peak_travel) {
             _leg_peak_travel = moved;
+            if (delta > 0) {
+                _leg_dir_sign = 1;
+            } else if (delta < 0) {
+                _leg_dir_sign = -1;
+            }
         }
         if (_got_status && !home_bit) {
             _saw_home_clear = true;
@@ -941,6 +964,9 @@ void AP_ModbusSteering::update(float steering_out)
                 _follow_slot = 0;
                 _follow_alarm_step = 0;
                 _follow_restore = 0;
+                _follow_dir_flipped = false;
+                _follow_halted = false;
+                _follow_alarm_count = 0;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                               "CL57R: center fail, spd-follow %d",
                               (int)_steer_cmd_offset);
@@ -1111,6 +1137,26 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
+            if (_follow_halted) {
+                // Do not keep slamming a limit after wrong-way / repeat alarms.
+                // Stick deflection releases control from the current pose.
+                if (stick_pulses > arrive_db || stick_pulses < -arrive_db) {
+                    _follow_halted = false;
+                    _follow_alarm_count = 0;
+                    _steer_cmd_offset = 0;
+                    _center_encoder_origin = _actual_pulses;
+                    _follow_moving = false;
+                    _follow_sign = 0;
+                    _follow_slot = 0;
+                    _pending_run_spd = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: follow stick takeover");
+                } else {
+                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                }
+                _state = DriveState::RUN_READ;
+                break;
+            }
+
             if (_follow_alarm_step > 0) {
                 if (_follow_alarm_step == 1) {
                     send_u16(REG_MOTION, MOTION_STOP);
@@ -1121,20 +1167,55 @@ void AP_ModbusSteering::update(float steering_out)
                 } else if (_follow_alarm_step == 3) {
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                     _follow_alarm_step = 4;
-                } else {
-                    _follow_moving = false;
-                    _follow_sign = 0;
-                    _follow_slot = 0;
-                    _follow_alarm_step = 0;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: follow resume %d->%d",
-                                  (int)enc, (int)target);
+                } else if (_follow_alarm_step == 4) {
+                    // Mid-return: early alarm usually means wrong direction into
+                    // the hard stop. Flip offset once; never hammer the same way.
+                    const bool mid_return = (_steer_cmd_offset != 0);
+                    const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
+                    if (mid_return && !_follow_dir_flipped && toward < 20000) {
+                        _steer_cmd_offset = -_steer_cmd_offset;
+                        _center_move_target = _steer_cmd_offset;
+                        _center_encoder_origin = _actual_pulses;
+                        _follow_dir_flipped = true;
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_alarm_step = 0;
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: mid dir flip ofs %d",
+                                      (int)_steer_cmd_offset);
+                    } else if (mid_return) {
+                        _follow_halted = true;
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_alarm_step = 0;
+                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                                      "CL57R: mid halt (alarm), power ok?");
+                    } else if (_follow_alarm_count >= 3) {
+                        _follow_halted = true;
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_alarm_step = 0;
+                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                                      "CL57R: follow halt after alarms");
+                    } else {
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_alarm_step = 0;
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: follow resume %d->%d",
+                                      (int)enc, (int)target);
+                    }
                 }
                 _state = DriveState::RUN_READ;
                 break;
             }
 
             if (_got_status && alarmed()) {
+                _follow_alarm_count++;
                 _follow_moving = false;
                 _follow_sign = 0;
                 _follow_slot = 0;
@@ -1181,7 +1262,13 @@ void AP_ModbusSteering::update(float steering_out)
                                         (int32_t)max_rpm * abs_err / slow_zone);
                 }
                 const int16_t signed_spd = (int16_t)((int32_t)rpm * (int32_t)want_sign);
-                if (!_follow_moving || _follow_sign != want_sign) {
+                if (_follow_moving && _follow_sign != want_sign) {
+                    // Soft stop before reversing — avoids harsh direction flip.
+                    send_u16(REG_MOTION, MOTION_STOP);
+                    _follow_moving = false;
+                    _follow_sign = 0;
+                    _follow_slot = 0;
+                } else if (!_follow_moving || _follow_sign != want_sign) {
                     if (_follow_slot == 0) {
                         send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
                         _follow_sign = want_sign;

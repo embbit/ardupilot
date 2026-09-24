@@ -137,11 +137,15 @@ private:
     uint32_t _center_step_settle_ms = 0;
     int32_t _home_start_pulses = 0;
     int32_t _leg_peak_travel = 0;
+    int8_t _leg_dir_sign = 0;
     int32_t _center_move_target = 0;
     int32_t _center_step_target = 0;
     int32_t _center_encoder_origin = 0;
     int32_t _measured_half_travel = 0;
     uint8_t _home_leg = 0;
+    bool _follow_dir_flipped = false;
+    bool _follow_halted = false;
+    uint8_t _follow_alarm_count = 0;
     bool _read_status_next = false;
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
