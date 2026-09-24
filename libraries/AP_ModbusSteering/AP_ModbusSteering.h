@@ -86,6 +86,7 @@ private:
     uint32_t _home_start_ms = 0;
     uint32_t _last_home_retry_ms = 0;
     uint32_t _last_home_norx_ms = 0;
+    uint32_t _home_rx_lost_ms = 0;
     uint32_t _last_home_progress_ms = 0;
     uint32_t _last_button_ms = 0;
     DriveState _state = DriveState::INIT_ENABLE;
@@ -107,6 +108,7 @@ private:
     bool _got_status = false;
     bool _saw_home_run = false;
     bool _saw_home_motion = false;
+    bool _saw_home_clear = false;
     bool _home_read_encoder = false;
     bool _home_center_run_spd = false;
     bool _home_leg_settling = false;

@@ -41,9 +41,12 @@ constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
 constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
+constexpr uint32_t HOME_RX_LOST_WARN_MS = 5000;
+constexpr uint32_t HOME_RX_ABORT_MS = 8000;
 constexpr int32_t CENTER_MOVE_STEP = 10000;
 constexpr uint16_t TRACK_ERR_LIMIT = 50000;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
+constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
@@ -358,6 +361,7 @@ void AP_ModbusSteering::start_home()
     _got_status = false;
     _saw_home_run = false;
     _saw_home_motion = false;
+    _saw_home_clear = false;
     _home_center_run_spd = false;
     _home_leg_settling = false;
     _center_step_settling = false;
@@ -446,7 +450,9 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     if (dual_limit_home()) {
         const int32_t full_travel = (_actual_pulses >= 0) ? _actual_pulses : -_actual_pulses;
         if (full_travel < MIN_MEASURED_TRAVEL) {
-            abort_home("measured travel too small");
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: travel %d pulses (min %d)",
+                          (int)full_travel, (int)MIN_MEASURED_TRAVEL);
+            abort_home("measured travel too small (need both limits?)");
             return;
         }
         const int32_t expected = expected_full_travel_pulses();
@@ -634,11 +640,13 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_WAIT;
         _home_start_ms = AP_HAL::millis();
         _last_home_retry_ms = _home_start_ms;
+        _last_home_progress_ms = _home_start_ms;
         _home_start_pulses = _actual_pulses;
         _home_read_encoder = false;
         _got_status = false;
         _saw_home_run = false;
         _saw_home_motion = false;
+        _saw_home_clear = false;
         _home_leg_settling = false;
         if (dual_limit_home()) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
@@ -653,8 +661,9 @@ void AP_ModbusSteering::advance_home()
         _init_attempts = 0;
         _saw_home_motion = false;
         _saw_home_run = false;
+        _saw_home_clear = false;
         _home_start_ms = AP_HAL::millis();
-        _last_home_progress_ms = 0;
+        _last_home_progress_ms = _home_start_ms;
         break;
     case DriveState::HOME_ZERO:
         finish_home();
@@ -694,19 +703,28 @@ void AP_ModbusSteering::update(float steering_out)
 
     if (in_home()) {
         if (!_ever_got_rx) {
-            if (now - _last_home_norx_ms > 10000) {
+            if (_last_home_norx_ms == 0 || (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS) {
                 _last_home_norx_ms = now;
                 GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
                               "CL57R: no Modbus RX from CL57R (check RS485 A/B RX)");
             }
         } else if (_last_rx_ms == 0 || (now - _last_rx_ms) > 3000) {
-            if (now - _last_home_norx_ms > 10000) {
+            if (_home_rx_lost_ms == 0) {
+                _home_rx_lost_ms = now;
+            }
+            if ((now - _home_rx_lost_ms) >= HOME_RX_ABORT_MS &&
+                (_state == DriveState::HOME_WAIT || _state == DriveState::HOME_WAIT_CENTER)) {
+                abort_home("Modbus RX lost, abort home");
+            } else if (_last_home_norx_ms == 0 ||
+                       (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS) {
                 _last_home_norx_ms = now;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus RX lost during home");
             }
         } else {
-            _last_home_norx_ms = 0;
+            _home_rx_lost_ms = 0;
         }
+    } else {
+        _home_rx_lost_ms = 0;
     }
 
     if (_state == DriveState::HOME_WAIT) {
@@ -715,7 +733,10 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t moved = (_actual_pulses > _home_start_pulses) ?
                               (_actual_pulses - _home_start_pulses) :
                               (_home_start_pulses - _actual_pulses);
-        if (moved >= 200) {
+        if (_got_status && !home_bit) {
+            _saw_home_clear = true;
+        }
+        if (moved >= MIN_HOME_LEG_MOTION) {
             _saw_home_motion = true;
         }
         if (running && moved >= 50) {
@@ -733,7 +754,7 @@ void AP_ModbusSteering::update(float steering_out)
         } else if (!_saw_home_motion && (now - _last_home_progress_ms) > 10000) {
             _last_home_progress_ms = now;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no motion yet");
-        } else if (home_bit && !running && _saw_home_motion) {
+        } else if (home_bit && !running && _saw_home_clear && _saw_home_motion) {
             if (!_home_leg_settling) {
                 _home_leg_settling = true;
                 _home_leg_settle_ms = now + 200;
