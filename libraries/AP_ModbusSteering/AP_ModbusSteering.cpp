@@ -46,16 +46,17 @@ constexpr uint16_t STATUS_RUNNING = (1U << 2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
-constexpr uint16_t MID_SEEK_ACCEL_MS = 2000;
-constexpr uint16_t MID_SEEK_DECEL_MS = 2000;
-constexpr uint16_t MID_SEEK_RPM = 100;
+constexpr uint16_t MID_SEEK_ACCEL_MS = 1500;
+constexpr uint16_t MID_SEEK_DECEL_MS = 1500;
+constexpr uint16_t MID_SEEK_RPM_MIN = 200;
+constexpr uint16_t MID_SEEK_RPM_MAX = 600;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
 constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
-constexpr uint32_t HOME_RX_LOST_WARN_MS = 10000;
-constexpr uint32_t HOME_RX_ABORT_MS = 20000;
-constexpr uint32_t HOME_RX_SILENCE_MS = 8000;
+constexpr uint32_t HOME_RX_LOST_WARN_MS = 15000;
+constexpr uint32_t HOME_RX_ABORT_MS = 30000;
+constexpr uint32_t HOME_RX_SILENCE_MS = 12000;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
@@ -269,9 +270,17 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Gentle center return — faster values trip tracking alarm and sound harsh.
-    (void)calib_crawl_rpm();
-    return MID_SEEK_RPM;
+    // Direction is known from leg sign; use ~half HOME_SPD (clamped) so mid
+    // return is not crawl-slow but still below calib approach speed.
+    const uint16_t home = calib_speed_rpm();
+    uint16_t rpm = home / 2;
+    if (rpm < MID_SEEK_RPM_MIN) {
+        rpm = MID_SEEK_RPM_MIN;
+    }
+    if (rpm > MID_SEEK_RPM_MAX) {
+        rpm = MID_SEEK_RPM_MAX;
+    }
+    return rpm;
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -842,8 +851,11 @@ void AP_ModbusSteering::update(float steering_out)
                 !_saw_home_motion &&
                 (_state == DriveState::HOME_WAIT || _state == DriveState::HOME_WAIT_CENTER)) {
                 abort_home("Modbus RX lost, abort home");
-            } else if (_last_home_norx_ms == 0 ||
-                       (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS) {
+            } else if (!_saw_home_motion &&
+                       (_last_home_norx_ms == 0 ||
+                        (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS)) {
+                // Warn only before motion is seen; quiet RX during a moving home
+                // leg is normal on this half-duplex bus.
                 _last_home_norx_ms = now;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus RX quiet during home");
             }
@@ -1236,17 +1248,30 @@ void AP_ModbusSteering::update(float steering_out)
                     _follow_slot = 0;
                 } else if (_steer_cmd_offset != 0 &&
                            (stick_pulses <= arrive_db && stick_pulses >= -arrive_db)) {
-                    // Physical mid reached with stick centered — zero command frame.
-                    send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                    // Physical mid: re-base command frame to current encoder.
+                    // Do NOT AUX_POS_ZERO here — the drive zero races Modbus reads
+                    // and caused a phantom ±200k chase at run MAX_SPD (broke sticks).
+                    _center_encoder_origin = _actual_pulses;
                     _steer_cmd_offset = 0;
-                    _center_encoder_origin = 0;
                     _have_target = true;
                     _last_target = 0;
+                    _follow_alarm_count = 0;
+                    _follow_halted = false;
                     _follow_restore = 1;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, zeroed");
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
                 } else {
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                 }
+            } else if (_steer_cmd_offset == 0 &&
+                       abs_err > (travel_limit_pulses() + arrive_db)) {
+                // Encoder frame desync — never chase at run speed across full travel.
+                send_u16(REG_MOTION, MOTION_STOP);
+                _center_encoder_origin = _actual_pulses;
+                _follow_moving = false;
+                _follow_sign = 0;
+                _follow_slot = 0;
+                _last_target = stick_pulses;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: follow rebase (desync)");
             } else {
                 const int8_t want_sign = (err > 0) ? 1 : -1;
                 // Gentle crawl while returning to mid; run speed for stick after.
