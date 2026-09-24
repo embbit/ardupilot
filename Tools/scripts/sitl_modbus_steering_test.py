@@ -553,8 +553,8 @@ def run_rc_buttons():
         if not any("cal@limit" in t or "cal done at limit" in t for t in events):
             print("FAIL: missing cal done at limit message")
             return 1
-        if not any("spd-follow" in t or " v13" in t or " v12" in t or " v11" in t or " v10" in t
-                   or "cal@limit" in t or "limit seek" in t for t in events):
+        if not any("spd-follow" in t or " v14" in t or " v13" in t or " v12" in t or " v11" in t
+                   or " v10" in t or "cal@limit" in t or "limit seek" in t for t in events):
             print("FAIL: missing speed-follow mid return message")
             return 1
 
