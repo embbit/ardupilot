@@ -164,6 +164,8 @@ private:
     uint8_t _jog_slot = 0;
     int32_t _jog_start_enc = 0;
     int32_t _jog_need = 0;
+    uint32_t _jog_start_ms = 0;
+    uint32_t _jog_last_progress_ms = 0;
     uint16_t _di_state = 0;
     bool _got_di = false;
     uint8_t _read_phase = 0;

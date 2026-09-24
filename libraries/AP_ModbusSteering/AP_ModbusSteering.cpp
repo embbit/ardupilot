@@ -176,7 +176,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: JOG
     // @DisplayName: Manual jog trigger
-    // @Description: Disarmed recovery jog. Set 1 to step positive (away from N-OT / toward P-OT), 2 to step negative. Uses JOG_PUL pulses at crawl RPM. Refuses a step into an active limit input. Resets to 0 when the step finishes or is rejected.
+    // @Description: Disarmed recovery jog. Set 1 to step positive, 2 to step negative. Uses JOG_PUL pulses at crawl RPM. Clears alarm and reissues speed if latched. A new JOG while busy preempts the previous step.
     // @Values: 0:None,1:JogPositive,2:JogNegative
     // @User: Standard
     AP_GROUPINFO("JOG", 16, AP_ModbusSteering, jog_trig, 0),
@@ -596,17 +596,22 @@ void AP_ModbusSteering::start_jog(int8_t sign)
     if (need > 50000) {
         need = 50000;
     }
-    _jog_active = true;
-    _jog_sign = sign;
-    _jog_slot = 0;
-    _jog_start_enc = _actual_pulses;
-    _jog_need = need;
-    _follow_halted = false;
+    // Pause stick follow so mid-offset cannot fight the recovery jog.
     _follow_moving = false;
     _follow_sign = 0;
     _follow_slot = 0;
-    _alarm_clear_pending = true;
-    _enable_after_alarm_clear = true;
+    _follow_halted = false;
+    _steer_cmd_offset = 0;
+    _jog_active = true;
+    _jog_sign = sign;
+    // Slot sequence: STOP → CLEAR → ENABLE → SPD → SPEED → run
+    _jog_slot = 0;
+    _jog_start_enc = _actual_pulses;
+    _jog_need = need;
+    _jog_start_ms = AP_HAL::millis();
+    _jog_last_progress_ms = _jog_start_ms;
+    _alarm_clear_pending = false;
+    _enable_after_alarm_clear = false;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: jog %s %d pul",
                   sign > 0 ? "+" : "-", (int)need);
 }
@@ -640,11 +645,9 @@ void AP_ModbusSteering::poll_jog_trigger()
         _jog_trig_last = 0;
         return;
     }
+    // Preempt a stuck jog (latched alarm / no encoder motion).
     if (_jog_active) {
-        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: JOG busy");
-        jog_trig.set_and_save(0);
-        _jog_trig_last = 0;
-        return;
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: JOG preempt");
     }
 
     if (trig == 1) {
@@ -726,18 +729,31 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             abort_home("measured travel too small (need both limits?)");
             return;
         }
-        // Only reject wildly wrong values; OUT_REV/RATIO are approximate until
-        // dual-limit measurement replaces them. Speed-mode seek can measure
-        // larger travel than a rough OUT_REV*RATIO estimate — allow 5x.
+        // Reject / clamp oversize. A late tracking alarm after overshooting the
+        // second switch (into the hard stop) can report ~2x true travel; using
+        // half of that as mid drives INTO the opposite limit.
+        if (expected >= 20000 && full_travel > (expected + expected / 4)) {
+            int32_t use = expected;
+            if (_leg1_travel >= (expected * 3) / 4 &&
+                _leg1_travel <= (expected + expected / 4)) {
+                use = _leg1_travel;
+            }
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "CL57R: travel %d oversize, use %d",
+                          (int)full_travel, (int)use);
+            full_travel = use;
+        }
         if (expected >= 20000 && full_travel > expected * 5) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
                           (int)full_travel, (int)expected);
             abort_home("measured travel implausible");
             return;
         }
-        if (expected >= 20000 && full_travel < expected / 4) {
+        if (expected >= 20000 && full_travel < (expected * 5) / 8) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
                           (int)full_travel, (int)expected);
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "CL57R: raise TRACK_ERR (false early limit?)");
             abort_home("measured travel implausible");
             return;
         }
@@ -755,6 +771,18 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             mid_sign = (home_method_reg() == 18) ? 1 : -1;
         }
         _center_move_target = (int32_t)mid_sign * _measured_half_travel;
+        // Never command more than ~expected/2 for mid — hard safety cap.
+        if (expected >= 20000) {
+            const int32_t half_exp = expected / 2;
+            const int32_t abs_mid = (_center_move_target >= 0) ?
+                                   _center_move_target : -_center_move_target;
+            if (abs_mid > half_exp + half_exp / 8) {
+                _center_move_target = (int32_t)mid_sign * half_exp;
+                _measured_half_travel = half_exp;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: mid clamp to %d", (int)_center_move_target);
+            }
+        }
         max_steps.set_and_save(_measured_half_travel);
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d mid %d (legdir %d)",
                       (int)full_travel, (int)_center_move_target, (int)_leg_dir_sign);
@@ -783,7 +811,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v14",
+                  "CL57R: cal@limit ofs %d v15",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1123,13 +1151,36 @@ void AP_ModbusSteering::update(float steering_out)
             // Do NOT finish a leg on DI alone — floating X1/X2 bits caused
             // false "DI limit hit" with ~7k travel and aborted calibration.
             const int32_t expected = expected_full_travel_pulses();
-            const int32_t min_real = (expected >= 20000) ? (expected / 8) : 20000;
+            // Require a substantial fraction of OUT_REV travel before treating
+            // an alarm as a real endstop. Low TRACK_ERR (e.g. 4000) trips mid
+            // span (~expected/4) and used to "finish" cal while still on a stop.
+            const int32_t min_real = (expected >= 20000) ? ((expected * 5) / 8) : 20000;
             const bool hit = _saw_home_motion && _got_status && alarmed();
             const bool stalled = _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
-            if ((hit || stalled) && !_home_stop_pending && !_home_clear_pending) {
-                if (_leg_peak_travel < min_real && _home_early_retries < 3) {
+            // Soft max travel: if we have already moved past OUT_REV estimate,
+            // stop — do not grind into the hard stop waiting for a late alarm.
+            const bool past_expected =
+                (expected >= 20000) &&
+                _saw_home_motion &&
+                (_leg_peak_travel >= expected + expected / 8);
+            if ((hit || stalled || past_expected) && !_home_stop_pending && !_home_clear_pending) {
+                if (past_expected && !hit && !stalled) {
+                    if (!_home_leg_settling) {
+                        _home_leg_settling = true;
+                        _home_leg_settle_ms = now + 250;
+                        _home_stop_pending = true;
+                        _home_crawl_pending = false;
+                        _home_crawl_away = false;
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: seek past expected %d, stop",
+                                      (int)_leg_peak_travel);
+                    } else if (now >= _home_leg_settle_ms) {
+                        _home_leg_settling = false;
+                        home_leg_done(now);
+                    }
+                } else if (_leg_peak_travel < min_real && _home_early_retries < 6) {
                     _home_early_retries++;
                     _home_leg_settling = false;
                     _home_stop_pending = true;
@@ -1364,12 +1415,31 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         }
         if (_jog_active) {
+            const uint32_t jnow = AP_HAL::millis();
             const int32_t moved = _actual_pulses - _jog_start_enc;
             const int32_t abs_moved = (moved >= 0) ? moved : -moved;
-            if (dir_blocked(_jog_sign)) {
-                // Soft warn only; keep jogging for recovery (LIM_EN may be on
-                // with a false DI bit). Do not stop mid-jog on DI.
-                send_u16(REG_MOTOR_ENABLE, 0x0001);
+            if (abs_moved > 50) {
+                _jog_last_progress_ms = jnow;
+            }
+            // Prep: STOP → CLEAR → ENABLE → SPD → SPEED, then hold/rearm.
+            if (_jog_slot < 5) {
+                if (_jog_slot == 0) {
+                    send_u16(REG_MOTION, MOTION_STOP);
+                } else if (_jog_slot == 1) {
+                    send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+                } else if (_jog_slot == 2) {
+                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                } else if (_jog_slot == 3) {
+                    const int16_t spd = (int16_t)((int32_t)calib_crawl_rpm() *
+                                                 (int32_t)_jog_sign);
+                    send_u16(REG_MAX_SPD, (uint16_t)spd);
+                } else {
+                    send_u16(REG_MOTION, MOTION_SPEED);
+                    _jog_start_enc = _actual_pulses;
+                    _jog_last_progress_ms = jnow;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: jog run");
+                }
+                _jog_slot++;
                 _state = DriveState::RUN_READ;
                 break;
             }
@@ -1377,22 +1447,45 @@ void AP_ModbusSteering::update(float steering_out)
                 send_u16(REG_MOTION, MOTION_STOP);
                 _jog_active = false;
                 _jog_sign = 0;
-                // Re-base hold origin so stick-center does not chase old mid.
                 _center_encoder_origin = _actual_pulses;
                 _last_target = 0;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: jog done moved %d", (int)moved);
                 _state = DriveState::RUN_READ;
                 break;
             }
-            if (_jog_slot == 0) {
-                const int16_t spd = (int16_t)((int32_t)calib_crawl_rpm() * (int32_t)_jog_sign);
-                send_u16(REG_MAX_SPD, (uint16_t)spd);
-                _jog_slot = 1;
-            } else if (_jog_slot == 1) {
-                send_u16(REG_MOTION, MOTION_SPEED);
-                _jog_slot = 2;
-            } else {
+            // No progress (still jammed / alarm) — clear and re-kick speed.
+            if (_got_status && alarmed()) {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: jog alarm, retry");
+                _jog_slot = 0;
+                send_u16(REG_MOTION, MOTION_STOP);
+                _state = DriveState::RUN_READ;
+                break;
+            }
+            if ((jnow - _jog_last_progress_ms) > 4000) {
+                send_u16(REG_MOTION, MOTION_STOP);
+                _jog_active = false;
+                _jog_sign = 0;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: jog timeout moved %d", (int)moved);
+                _state = DriveState::RUN_READ;
+                break;
+            }
+            if ((jnow - _jog_start_ms) > 20000) {
+                send_u16(REG_MOTION, MOTION_STOP);
+                _jog_active = false;
+                _jog_sign = 0;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: jog abort");
+                _state = DriveState::RUN_READ;
+                break;
+            }
+            // Keep enable alive; re-issue SPEED periodically so a cleared
+            // alarm does not leave the drive idle.
+            if (_jog_slot == 5) {
                 send_u16(REG_MOTOR_ENABLE, 0x0001);
+                _jog_slot = 6;
+            } else {
+                send_u16(REG_MOTION, MOTION_SPEED);
+                _jog_slot = 5;
             }
             _state = DriveState::RUN_READ;
             break;
@@ -1422,6 +1515,30 @@ void AP_ModbusSteering::update(float steering_out)
                 const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
                 if (toward > _follow_peak_toward) {
                     _follow_peak_toward = toward;
+                }
+            }
+
+            // Hard safety: never drive further than ~expected/2 from the
+            // post-cal origin. Oversize mid offset used to slam the far limit.
+            if (_steer_cmd_offset != 0 && _follow_prep >= 9 && _follow_alarm_step == 0) {
+                const int32_t exp_full = expected_full_travel_pulses();
+                if (exp_full >= 20000) {
+                    const int32_t abs_enc = (enc >= 0) ? enc : -enc;
+                    if (abs_enc > (exp_full / 2) + mid_stop) {
+                        send_u16(REG_MOTION, MOTION_STOP);
+                        _center_encoder_origin = _actual_pulses;
+                        _steer_cmd_offset = 0;
+                        _have_target = true;
+                        _last_target = 0;
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_restore = 1;
+                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                                      "CL57R: mid overshoot guard %d", (int)enc);
+                        _state = DriveState::RUN_READ;
+                        break;
+                    }
                 }
             }
 
