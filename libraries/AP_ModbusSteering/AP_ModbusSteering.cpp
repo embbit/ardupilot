@@ -46,8 +46,8 @@ constexpr uint16_t STATUS_RUNNING = (1U << 2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
-constexpr uint16_t MID_SEEK_ACCEL_MS = 1500;
-constexpr uint16_t MID_SEEK_DECEL_MS = 1500;
+constexpr uint16_t MID_SEEK_ACCEL_MS = 2500;
+constexpr uint16_t MID_SEEK_DECEL_MS = 2500;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
@@ -268,8 +268,17 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Same speed as dual-limit home approach (OB_STR_HOME_SPD / calib MAX_SPD).
-    return calib_speed_rpm();
+    // Native home can run at full HOME_SPD; post-home speed-mode at that RPM
+    // trips tracking alarm mid-travel on this CL57R. Use half HOME_SPD (cap).
+    const uint16_t home = calib_speed_rpm();
+    uint16_t rpm = home / 2;
+    if (rpm < 300) {
+        rpm = (home < 300) ? home : 300;
+    }
+    if (rpm > 1000) {
+        rpm = 1000;
+    }
+    return rpm;
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -423,9 +432,10 @@ void AP_ModbusSteering::start_home()
     _follow_last_enc = 0;
     _follow_last_spd = 0;
     _follow_progress_ms = 0;
-    _follow_dir_flipped = false;
+    _follow_mid_retried = false;
     _follow_halted = false;
     _follow_alarm_count = 0;
+    _follow_peak_toward = 0;
     _queued_motion = 0;
     _home_retry_pending = false;
     _state = DriveState::HOME_CLEAR_ALARM;
@@ -572,13 +582,14 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _follow_last_enc = 0;
     _follow_last_spd = 0;
     _follow_progress_ms = 0;
-    _follow_dir_flipped = false;
+    _follow_mid_retried = false;
     _follow_halted = false;
     _follow_alarm_count = 0;
+    _follow_peak_toward = 0;
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v4",
+                  "CL57R: cal@limit ofs %d v5",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -967,9 +978,10 @@ void AP_ModbusSteering::update(float steering_out)
                 _follow_slot = 0;
                 _follow_alarm_step = 0;
                 _follow_restore = 0;
-                _follow_dir_flipped = false;
+                _follow_mid_retried = false;
                 _follow_halted = false;
                 _follow_alarm_count = 0;
+                _follow_peak_toward = 0;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                               "CL57R: center fail, spd-follow %d",
                               (int)_steer_cmd_offset);
@@ -1091,6 +1103,14 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t arrive_db = MAX(pos_db.get(), 800);
             _last_target = target;
 
+            // Track peak progress toward mid (used to avoid false "no progress").
+            if (_steer_cmd_offset != 0) {
+                const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
+                if (toward > _follow_peak_toward) {
+                    _follow_peak_toward = toward;
+                }
+            }
+
             if (_follow_prep < 9) {
                 // Exit native home mode before commanding speed mode.
                 if (_follow_prep == 0) {
@@ -1172,22 +1192,26 @@ void AP_ModbusSteering::update(float steering_out)
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                     _follow_alarm_step = 4;
                 } else if (_follow_alarm_step == 4) {
-                    // Mid-return: early alarm usually means wrong direction into
-                    // the hard stop. Flip offset once; never hammer the same way.
+                    // Never reverse mid direction — leg sign was correct (log reached
+                    // -49k toward mid before an encoder glitch). On alarm: rebase
+                    // remaining mid distance and retry same way once at crawl RPM;
+                    // second alarm → halt (stick can take over).
                     const bool mid_return = (_steer_cmd_offset != 0);
-                    const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
-                    if (mid_return && !_follow_dir_flipped && toward < 20000) {
-                        _steer_cmd_offset = -_steer_cmd_offset;
-                        _center_move_target = _steer_cmd_offset;
+                    if (mid_return && !_follow_mid_retried) {
+                        const int32_t remain = target - enc;
                         _center_encoder_origin = _actual_pulses;
-                        _follow_dir_flipped = true;
+                        _steer_cmd_offset = remain;
+                        _center_move_target = remain;
+                        _follow_mid_retried = true;
                         _follow_moving = false;
                         _follow_sign = 0;
                         _follow_slot = 0;
+                        _follow_last_spd = 0;
                         _follow_alarm_step = 0;
+                        _follow_peak_toward = 0;
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                      "CL57R: mid dir flip ofs %d",
-                                      (int)_steer_cmd_offset);
+                                      "CL57R: mid rebase remain %d",
+                                      (int)remain);
                     } else if (mid_return) {
                         _follow_halted = true;
                         _follow_moving = false;
@@ -1195,7 +1219,7 @@ void AP_ModbusSteering::update(float steering_out)
                         _follow_slot = 0;
                         _follow_alarm_step = 0;
                         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                                      "CL57R: mid halt (alarm), power ok?");
+                                      "CL57R: mid halt after alarm");
                     } else if (_follow_alarm_count >= 3) {
                         _follow_halted = true;
                         _follow_moving = false;
@@ -1266,9 +1290,12 @@ void AP_ModbusSteering::update(float steering_out)
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: follow rebase (desync)");
             } else {
                 const int8_t want_sign = (err > 0) ? 1 : -1;
-                // Gentle crawl while returning to mid; run speed for stick after.
+                // Mid return: half HOME_SPD; after an alarm rebase use crawl RPM.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    mid_seek_speed_rpm() : run_speed_rpm();
+                if (_steer_cmd_offset != 0 && _follow_mid_retried) {
+                    max_rpm = calib_crawl_rpm();
+                }
                 // Brake into target over ~1s of travel at current max RPM.
                 const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60;
                 uint16_t rpm = max_rpm;
