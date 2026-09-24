@@ -367,6 +367,7 @@ void AP_ModbusSteering::start_home()
     _center_step_settling = false;
     _home_leg = 0;
     _measured_half_travel = 0;
+    _leg_peak_travel = 0;
     _center_move_target = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
@@ -448,7 +449,14 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     }
 
     if (dual_limit_home()) {
-        const int32_t full_travel = (_actual_pulses >= 0) ? _actual_pulses : -_actual_pulses;
+        // CL57R native home typically zeros the encoder at the limit, so the
+        // final reading after leg 2 is near 0. Use peak displacement tracked
+        // while seeking the second limit.
+        int32_t full_travel = _leg_peak_travel;
+        const int32_t abs_now = (_actual_pulses >= 0) ? _actual_pulses : -_actual_pulses;
+        if (abs_now > full_travel) {
+            full_travel = abs_now;
+        }
         if (full_travel < MIN_MEASURED_TRAVEL) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: travel %d pulses (min %d)",
                           (int)full_travel, (int)MIN_MEASURED_TRAVEL);
@@ -456,17 +464,25 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             return;
         }
         const int32_t expected = expected_full_travel_pulses();
-        if (expected >= 20000) {
-            const int32_t tol = expected / 4;
-            if (full_travel > expected + tol || full_travel < expected - tol) {
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
-                              (int)full_travel, (int)expected);
-                abort_home("measured travel implausible");
-                return;
-            }
+        // Only reject wildly wrong values; OUT_REV/RATIO are approximate until
+        // dual-limit measurement replaces them.
+        if (expected >= 20000 && full_travel > expected * 3) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
+                          (int)full_travel, (int)expected);
+            abort_home("measured travel implausible");
+            return;
+        }
+        if (expected >= 20000 && full_travel < expected / 4) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
+                          (int)full_travel, (int)expected);
+            abort_home("measured travel implausible");
+            return;
         }
         _measured_half_travel = full_travel / 2;
-        _center_move_target = _measured_half_travel;
+        // After leg 2 native home we sit at limit 2 with position ~0.
+        // Move toward mid-travel (opposite of the second home method).
+        _center_move_target = (home_method_reg() == 18) ?
+                              -_measured_half_travel : _measured_half_travel;
         max_steps.set_and_save(_measured_half_travel);
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d pulses, center %d",
                       (int)full_travel, (int)_center_move_target);
@@ -642,6 +658,7 @@ void AP_ModbusSteering::advance_home()
         _last_home_retry_ms = _home_start_ms;
         _last_home_progress_ms = _home_start_ms;
         _home_start_pulses = _actual_pulses;
+        _leg_peak_travel = 0;
         _home_read_encoder = false;
         _got_status = false;
         _saw_home_run = false;
@@ -733,6 +750,9 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t moved = (_actual_pulses > _home_start_pulses) ?
                               (_actual_pulses - _home_start_pulses) :
                               (_home_start_pulses - _actual_pulses);
+        if (moved > _leg_peak_travel) {
+            _leg_peak_travel = moved;
+        }
         if (_got_status && !home_bit) {
             _saw_home_clear = true;
         }

@@ -116,6 +116,7 @@ private:
     bool _center_step_settling = false;
     uint32_t _center_step_settle_ms = 0;
     int32_t _home_start_pulses = 0;
+    int32_t _leg_peak_travel = 0;
     int32_t _center_move_target = 0;
     int32_t _center_step_target = 0;
     int32_t _measured_half_travel = 0;

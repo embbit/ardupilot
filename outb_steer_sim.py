@@ -105,20 +105,24 @@ class Nema23Motor:
             # Мотор в alarm: не двигается, ждёт alarm-clear. Позиция заморожена.
             self.velocity = 0.0
         elif self.home_finish_at > 0.0:
-            if time.time() >= self.home_finish_at:
-                self.home_finish_at = 0.0
-                self.home_done = True
-                self.position = float(self.driver_target)
-                self.reported_position = self.position
-                self.velocity = 0.0
-            else:
-                self.velocity = self.max_vel * 0.4
+            error = self.driver_target - self.position
+            if abs(error) > 80.0:
+                direction = 1.0 if error > 0 else -1.0
+                self.velocity = self.max_vel * 0.4 * direction
                 new_pos = self.position + self.velocity * dt_s
-                if ((self.position - self.driver_target) * (new_pos - self.driver_target)) < 0:
+                if ((self.position - self.driver_target) * (new_pos - self.driver_target)) <= 0:
                     self.position = float(self.driver_target)
                     self.velocity = 0.0
                 else:
                     self.position = new_pos
+            else:
+                # Arrived at limit: CL57R native home zeros the position reference.
+                self.home_finish_at = 0.0
+                self.home_done = True
+                self.position = 0.0
+                self.reported_position = 0.0
+                self.driver_target = 0
+                self.velocity = 0.0
         elif not self.motor_enabled:
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
