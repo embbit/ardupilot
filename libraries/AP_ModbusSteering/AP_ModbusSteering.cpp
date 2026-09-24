@@ -196,6 +196,13 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("LIM_INV", 18, AP_ModbusSteering, lim_inv, 0),
 
+    // @Param: LIM_EN
+    // @DisplayName: Enforce DI limit blocking
+    // @Description: 0 = ignore P-OT/N-OT for motion blocking (DI still logged). 1 = refuse seek/follow into an active limit. JOG is never hard-blocked so you can recover. Enable only after DI bits look correct in the middle (both inactive).
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("LIM_EN", 19, AP_ModbusSteering, lim_en, 0),
+
     AP_GROUPEND
 };
 
@@ -332,6 +339,9 @@ bool AP_ModbusSteering::lim_neg_active() const
 
 bool AP_ModbusSteering::dir_blocked(int8_t sign) const
 {
+    if (lim_en.get() == 0) {
+        return false;
+    }
     if (sign > 0) {
         return lim_pos_active();
     }
@@ -558,11 +568,22 @@ void AP_ModbusSteering::start_jog(int8_t sign)
     if (sign == 0) {
         return;
     }
-    if (dir_blocked(sign)) {
+    // Never hard-block JOG on DI — false P-OT/N-OT (floating inputs) must not
+    // trap the rudder. Warn only so the operator can set LIM_INV / wiring.
+    if (_got_di && ((sign > 0 && lim_pos_active()) || (sign < 0 && lim_neg_active()))) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                      "CL57R: jog blocked, limit active (%s)",
-                      sign > 0 ? "P-OT" : "N-OT");
-        return;
+                      "CL57R: DI=0x%02x P=%u N=%u (jog anyway)",
+                      (unsigned)(_di_state & 0x7F),
+                      (unsigned)lim_pos_active(),
+                      (unsigned)lim_neg_active());
+    } else if (_got_di) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                      "CL57R: DI=0x%02x P=%u N=%u",
+                      (unsigned)(_di_state & 0x7F),
+                      (unsigned)lim_pos_active(),
+                      (unsigned)lim_neg_active());
+    } else {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: jog, DI not read yet");
     }
     int32_t need = jog_pulses.get();
     if (need < 100) {
@@ -758,7 +779,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v12",
+                  "CL57R: cal@limit ofs %d v13",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1368,10 +1389,9 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t moved = _actual_pulses - _jog_start_enc;
             const int32_t abs_moved = (moved >= 0) ? moved : -moved;
             if (dir_blocked(_jog_sign)) {
-                send_u16(REG_MOTION, MOTION_STOP);
-                _jog_active = false;
-                _jog_sign = 0;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: jog stop on DI limit");
+                // Soft warn only; keep jogging for recovery (LIM_EN may be on
+                // with a false DI bit). Do not stop mid-jog on DI.
+                send_u16(REG_MOTOR_ENABLE, 0x0001);
                 _state = DriveState::RUN_READ;
                 break;
             }

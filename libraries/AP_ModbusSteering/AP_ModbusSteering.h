@@ -197,6 +197,7 @@ private:
     AP_Int8  jog_trig;
     AP_Int32 jog_pulses;
     AP_Int8  lim_inv;
+    AP_Int8  lim_en;
     int8_t   _home_trig_last = 0;
     bool     _home_trig_inited = false;
     int8_t   _jog_trig_last = 0;
