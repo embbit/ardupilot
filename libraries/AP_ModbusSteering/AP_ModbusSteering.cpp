@@ -268,17 +268,8 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Soft mid return: half HOME_SPD, capped so we can still brake before the
-    // far limit. Raise with OB_STR_HOME_SPD (e.g. 1600 → mid ~800).
-    const uint16_t home = calib_speed_rpm();
-    uint16_t rpm = home / 2;
-    if (rpm < 300) {
-        rpm = (home < 300) ? home : 300;
-    }
-    if (rpm > 900) {
-        rpm = 900;
-    }
-    return rpm;
+    // Same cruise as dual-limit speed-mode seek (OB_STR_HOME_SPD).
+    return calib_speed_rpm();
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -438,6 +429,9 @@ void AP_ModbusSteering::start_home()
     _follow_peak_toward = 0;
     _queued_motion = 0;
     _home_retry_pending = false;
+    _home_stop_pending = false;
+    _home_clear_pending = false;
+    _home_speed_leg = false;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -589,7 +583,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v9",
+                  "CL57R: cal@limit ofs %d v10",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -771,6 +765,18 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_ENABLE;
         break;
     case DriveState::HOME_ENABLE:
+        // Dual-limit: drive toward the stop in speed mode so HOME_SPD is used.
+        // Native MOTION_HOME on this CL57R often crawls the whole travel at
+        // HOME_CRAWL (<=300) when the limit input is already seen.
+        if (dual_limit_home()) {
+            _home_speed_leg = true;
+            _state = DriveState::HOME_SEEK_SPD;
+        } else {
+            _home_speed_leg = false;
+            _state = DriveState::HOME_START;
+        }
+        break;
+    case DriveState::HOME_SEEK_SPD:
         _state = DriveState::HOME_START;
         break;
     case DriveState::HOME_START:
@@ -787,7 +793,13 @@ void AP_ModbusSteering::advance_home()
         _saw_home_motion = false;
         _saw_home_clear = false;
         _home_leg_settling = false;
-        if (dual_limit_home()) {
+        _home_stop_pending = false;
+        _home_clear_pending = false;
+        if (_home_speed_leg) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
+                          (unsigned)(_home_leg + 1),
+                          (unsigned)calib_speed_rpm());
+        } else if (dual_limit_home()) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
                           (unsigned)(_home_leg + 1), (int)home_method_reg());
         } else {
@@ -880,6 +892,7 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t moved = (delta >= 0) ? delta : -delta;
         if (moved > _leg_peak_travel) {
             _leg_peak_travel = moved;
+            _last_home_progress_ms = now;
             if (delta > 0) {
                 _leg_dir_sign = 1;
             } else if (delta < 0) {
@@ -897,6 +910,34 @@ void AP_ModbusSteering::update(float steering_out)
         }
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("home timeout");
+        } else if (_home_speed_leg) {
+            // Speed-mode limit seek: stop when we hit an alarm (hard stop /
+            // tracking) or stall after having moved.
+            const bool hit = _saw_home_motion && _got_status && alarmed();
+            const bool stalled = _saw_home_motion &&
+                                 (now - _last_home_progress_ms) > 1500 &&
+                                 !running;
+            if ((hit || stalled) && !_home_stop_pending && !_home_clear_pending) {
+                if (!_home_leg_settling) {
+                    _home_leg_settling = true;
+                    _home_leg_settle_ms = now + 250;
+                    _home_stop_pending = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: limit hit travel %d",
+                                  (int)_leg_peak_travel);
+                } else if (now >= _home_leg_settle_ms) {
+                    _home_leg_settling = false;
+                    home_leg_done(now);
+                }
+            } else if (_home_leg_settling &&
+                       !_home_stop_pending && !_home_clear_pending &&
+                       now >= _home_leg_settle_ms) {
+                _home_leg_settling = false;
+                home_leg_done(now);
+            } else if (!_saw_home_motion && (now - _last_home_progress_ms) > 10000) {
+                _last_home_progress_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek, no motion yet");
+            }
         } else if (home_bit && !running && !_saw_home_motion &&
                    (now - _home_start_ms) > 5000) {
             if (now - _last_home_retry_ms > 3000) {
@@ -1106,10 +1147,16 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t err = target - enc;
             const int32_t abs_err = (err >= 0) ? err : -err;
             const int32_t arrive_db = MAX(pos_db.get(), 800);
-            // Stop early enough that cruise RPM cannot coast into the far limit.
+            // Brake window ~125ms of cruise travel, capped so high HOME_SPD
+            // still reaches near mid (not stop 50k early).
             const uint16_t mid_rpm = mid_seek_speed_rpm();
-            const int32_t mid_stop = MAX(arrive_db,
-                                        (int32_t)mid_rpm * CL57R_STEPS_PER_REV / 60 / 4);
+            int32_t mid_stop = (int32_t)mid_rpm * CL57R_STEPS_PER_REV / 60 / 8;
+            if (mid_stop < arrive_db) {
+                mid_stop = arrive_db;
+            }
+            if (mid_stop > 12000) {
+                mid_stop = 12000;
+            }
             _last_target = target;
 
             // Track peak progress toward mid (used to avoid false "no progress").
@@ -1368,17 +1415,19 @@ void AP_ModbusSteering::update(float steering_out)
                     }
                 }
                 const int8_t want_sign = (err > 0) ? 1 : -1;
-                // Mid return: half HOME_SPD; after an alarm rebase use crawl RPM.
+                // Mid return: full HOME_SPD; after an alarm rebase use crawl RPM.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    mid_seek_speed_rpm() : run_speed_rpm();
                 if (_steer_cmd_offset != 0 && _follow_mid_retried) {
                     max_rpm = calib_crawl_rpm();
                 }
-                // Brake into target over ~1s of travel at current max RPM.
-                const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60;
+                // Soft approach only in the last ~0.25s of travel (not a full
+                // second — that made mid crawl for most of the half-travel).
+                const int32_t slow_zone = MAX((int32_t)2000,
+                                             (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60 / 4);
                 uint16_t rpm = max_rpm;
                 if (slow_zone > 0 && abs_err < slow_zone) {
-                    const uint16_t min_rpm = (_steer_cmd_offset != 0) ? 40 : 80;
+                    const uint16_t min_rpm = (_steer_cmd_offset != 0) ? 80 : 80;
                     rpm = (uint16_t)MAX((int32_t)min_rpm,
                                         (int32_t)max_rpm * abs_err / slow_zone);
                 }
@@ -1496,14 +1545,50 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_ENABLE:
         send_u16(REG_MOTOR_ENABLE, 0x0001);
         break;
+    case DriveState::HOME_SEEK_SPD: {
+        // Signed MAX_SPD toward the method's limit (M17 +, M18 -).
+        int16_t spd = (int16_t)calib_speed_rpm();
+        if (home_method_reg() == 18) {
+            spd = (int16_t)(-spd);
+        }
+        send_u16(REG_MAX_SPD, (uint16_t)spd);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write seek spd=%d", (int)spd);
+        break;
+    }
     case DriveState::HOME_START:
-        send_u16(REG_MOTION, MOTION_HOME);
+        if (_home_speed_leg) {
+            send_u16(REG_MOTION, MOTION_SPEED);
+        } else {
+            send_u16(REG_MOTION, MOTION_HOME);
+        }
         break;
     case DriveState::HOME_WAIT:
+        if (_home_stop_pending) {
+            _home_stop_pending = false;
+            send_u16(REG_MOTION, MOTION_STOP);
+            _home_clear_pending = true;
+            break;
+        }
+        if (_home_clear_pending) {
+            _home_clear_pending = false;
+            send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+            break;
+        }
         if (_home_retry_pending) {
             // Dedicated slot: never piggy-back home restart on a status read.
             _home_retry_pending = false;
-            send_u16(REG_MOTION, MOTION_HOME);
+            if (_home_speed_leg) {
+                int16_t spd = (int16_t)calib_speed_rpm();
+                if (home_method_reg() == 18) {
+                    spd = (int16_t)(-spd);
+                }
+                send_u16(REG_MAX_SPD, (uint16_t)spd);
+                // Next retry will re-issue MOTION_SPEED via a second pass —
+                // queue speed command immediately after MAX_SPD write echo.
+                _queued_motion = MOTION_SPEED;
+            } else {
+                send_u16(REG_MOTION, MOTION_HOME);
+            }
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
             break;
         }

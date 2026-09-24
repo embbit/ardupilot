@@ -38,6 +38,7 @@ private:
         HOME_SET_CRAWL,
         HOME_SET_ACCEL,
         HOME_ENABLE,
+        HOME_SEEK_SPD,
         HOME_START,
         HOME_WAIT,
         HOME_ZERO_AT_L1,
@@ -144,6 +145,9 @@ private:
     int32_t _center_encoder_origin = 0;
     int32_t _measured_half_travel = 0;
     uint8_t _home_leg = 0;
+    bool _home_stop_pending = false;
+    bool _home_clear_pending = false;
+    bool _home_speed_leg = false;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
     uint8_t _follow_alarm_count = 0;
