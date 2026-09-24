@@ -13,6 +13,8 @@ CL57R_STEPS_PER_REV = 4000
 DEFAULT_MAX_RPM = 120
 DEFAULT_ACCEL_MS = 400
 DEFAULT_DECEL_MS = 400
+# Soft mechanical stops for speed-mode limit seek (dual-limit cal).
+SPEED_HARD_STOP = 194000
 
 # NEMA23 + 25:1 gearbox + rudder load (reflected inertia at motor shaft)
 NEMA23_INERTIA_FACTOR = 1.35
@@ -160,6 +162,17 @@ class Nema23Motor:
                 self.velocity = max(target_vel, self.velocity - self.max_accel * dt_s)
             self.position += self.velocity * dt_s
             self.driver_target = int(round(self.position))
+            # Hard stop models hitting a mechanical limit during dual-limit seek.
+            if self.position >= SPEED_HARD_STOP:
+                self.position = float(SPEED_HARD_STOP)
+                self.driver_target = SPEED_HARD_STOP
+                self.raise_alarm()
+                print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
+            elif self.position <= -SPEED_HARD_STOP:
+                self.position = float(-SPEED_HARD_STOP)
+                self.driver_target = -SPEED_HARD_STOP
+                self.raise_alarm()
+                print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
         elif link_active:
             self._track_target(dt_s)
             new_pos = self.position + self.velocity * dt_s
