@@ -268,15 +268,15 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Speed-mode mid must leave room to brake before the far limit. Cap below
-    // native HOME_SPD (full HOME_SPD overshoots mid into the opposite stop).
+    // Soft mid return: half HOME_SPD, capped so we can still brake before the
+    // far limit. Raise with OB_STR_HOME_SPD (e.g. 1600 → mid ~800).
     const uint16_t home = calib_speed_rpm();
     uint16_t rpm = home / 2;
     if (rpm < 300) {
         rpm = (home < 300) ? home : 300;
     }
-    if (rpm > 500) {
-        rpm = 500;
+    if (rpm > 900) {
+        rpm = 900;
     }
     return rpm;
 }
@@ -589,7 +589,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v8",
+                  "CL57R: cal@limit ofs %d v9",
                   (int)_steer_cmd_offset);
     finish_home();
 }

@@ -575,6 +575,11 @@ void GCS_MAVLINK_Rover::handle_manual_control_axes(const mavlink_manual_control_
     if (packet.r != INT16_MAX && yaw_mag > roll_mag) {
         steer_in = packet.r;
     }
+    // Direct path for Modbus steering (survives RC failsafe clearing overrides).
+    if (steer_in != INT16_MAX) {
+        rover.gcs_steering_norm = constrain_float(steer_in / 1000.0f, -1.0f, 1.0f);
+        rover.gcs_steering_ms = tnow;
+    }
     manual_override(rover.channel_steer, steer_in, 1000, 2000, tnow);
     manual_override(rover.channel_throttle, packet.z, 1000, 2000, tnow);
 }
