@@ -48,8 +48,6 @@ constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
 constexpr uint16_t MID_SEEK_ACCEL_MS = 1500;
 constexpr uint16_t MID_SEEK_DECEL_MS = 1500;
-constexpr uint16_t MID_SEEK_RPM_MIN = 200;
-constexpr uint16_t MID_SEEK_RPM_MAX = 600;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
@@ -270,17 +268,8 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Direction is known from leg sign; use ~half HOME_SPD (clamped) so mid
-    // return is not crawl-slow but still below calib approach speed.
-    const uint16_t home = calib_speed_rpm();
-    uint16_t rpm = home / 2;
-    if (rpm < MID_SEEK_RPM_MIN) {
-        rpm = MID_SEEK_RPM_MIN;
-    }
-    if (rpm > MID_SEEK_RPM_MAX) {
-        rpm = MID_SEEK_RPM_MAX;
-    }
-    return rpm;
+    // Same speed as dual-limit home approach (OB_STR_HOME_SPD / calib MAX_SPD).
+    return calib_speed_rpm();
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -589,7 +578,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d spd-follow",
+                  "CL57R: cal@limit ofs %d v4",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1280,9 +1269,8 @@ void AP_ModbusSteering::update(float steering_out)
                 // Gentle crawl while returning to mid; run speed for stick after.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    mid_seek_speed_rpm() : run_speed_rpm();
-                // Scale RPM with remaining error so high stick speed does not
-                // overshoot and chatter through the arrive deadband (~0.5s zone).
-                const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 120;
+                // Brake into target over ~1s of travel at current max RPM.
+                const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60;
                 uint16_t rpm = max_rpm;
                 if (slow_zone > 0 && abs_err < slow_zone) {
                     const uint16_t min_rpm = (_steer_cmd_offset != 0) ? 40 : 80;
