@@ -415,6 +415,19 @@ def run_param_trigger():
         if not wait_for_log(sim_lines, "HOME START", 2):
             print("FAIL: simulator did not see HOME START")
             return 1
+        mid_done = False
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.5, events)
+            if any("at mid-travel" in t for t in events):
+                mid_done = True
+                break
+            if any("mid seek" in t and "offset" in t for t in events):
+                mid_done = True
+                break
+        if not mid_done:
+            print("FAIL: mid-seek did not finish after HOME_TRIG calibration")
+            return 1
         print("PASS: HOME_TRIG=1 calibrated steering")
 
         set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
@@ -533,6 +546,24 @@ def run_rc_buttons():
         if not any("HOME_SPD=1800" in line for line in sim_lines):
             print("FAIL: homing did not write HOME_SPD=1800")
             return 1
+        # Mid-seek runs after "calibrated" via speed mode; wait for it to finish
+        # and restore armed run speed.
+        mid_done = False
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
+            if any("at mid-travel" in t for t in events):
+                mid_done = True
+                break
+            if any("mid seek" in t and "offset" in t for t in events):
+                mid_done = True
+                break
+        if not mid_done:
+            print("FAIL: mid-seek did not finish after calibration")
+            return 1
+        if not wait_for_log(sim_lines, "SPEED START", 2):
+            print("FAIL: simulator did not see speed-mode mid-seek")
+            return 1
         after_home = False
         restored = False
         for line in sim_lines:
@@ -543,7 +574,7 @@ def run_rc_buttons():
         if not restored:
             print("FAIL: run speed 1300 not restored after home")
             return 1
-        print("PASS: home speed 1800, run speed restored to 1300")
+        print("PASS: home speed 1800, mid-seek done, run speed restored to 1300")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
