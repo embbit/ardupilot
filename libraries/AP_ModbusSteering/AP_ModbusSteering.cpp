@@ -589,7 +589,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v7",
+                  "CL57R: cal@limit ofs %d v8",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1357,6 +1357,17 @@ void AP_ModbusSteering::update(float steering_out)
 
             // Stick deflected (or still seeking mid): speed-mode follow.
             {
+                // One-shot notice so the GCS can confirm stick input reached the driver.
+                if (_steer_cmd_offset == 0 && !_follow_moving) {
+                    static int32_t last_stick_log;
+                    if (stick_pulses != last_stick_log &&
+                        (stick_pulses > arrive_db || stick_pulses < -arrive_db)) {
+                        last_stick_log = stick_pulses;
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: stick cmd %d",
+                                      (int)stick_pulses);
+                    }
+                }
                 const int8_t want_sign = (err > 0) ? 1 : -1;
                 // Mid return: half HOME_SPD; after an alarm rebase use crawl RPM.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
