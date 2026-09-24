@@ -342,6 +342,10 @@ bool AP_ModbusSteering::dir_blocked(int8_t sign) const
     if (lim_en.get() == 0) {
         return false;
     }
+    // Both bits active ⇒ floating/unused DI, not real limits — ignore.
+    if (lim_pos_active() && lim_neg_active()) {
+        return false;
+    }
     if (sign > 0) {
         return lim_pos_active();
     }
@@ -779,7 +783,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v13",
+                  "CL57R: cal@limit ofs %d v14",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1116,37 +1120,10 @@ void AP_ModbusSteering::update(float steering_out)
         } else if (_home_speed_leg) {
             // Speed-mode limit seek: stop on alarm/stall, but treat a short
             // "hit" as tracking fault (retry crawl) — not a real endstop.
+            // Do NOT finish a leg on DI alone — floating X1/X2 bits caused
+            // false "DI limit hit" with ~7k travel and aborted calibration.
             const int32_t expected = expected_full_travel_pulses();
             const int32_t min_real = (expected >= 20000) ? (expected / 8) : 20000;
-            // Seek sign: M18 commands negative RPM, M17 positive (our speed map).
-            const int8_t seek_sign = (home_method_reg() == 18) ? -1 : 1;
-            // Hardware limit already active in seek direction — stop, do not push in.
-            if (_got_di && dir_blocked(seek_sign) && _saw_home_motion &&
-                !_home_stop_pending && !_home_clear_pending && !_home_crawl_pending) {
-                if (!_home_leg_settling) {
-                    _home_leg_settling = true;
-                    _home_leg_settle_ms = now + 200;
-                    _home_stop_pending = true;
-                    _home_crawl_pending = false;
-                    _home_crawl_away = false;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: DI limit hit travel %d",
-                                  (int)_leg_peak_travel);
-                } else if (now >= _home_leg_settle_ms) {
-                    _home_leg_settling = false;
-                    home_leg_done(now);
-                }
-            } else if (_got_di && dir_blocked(seek_sign) && !_saw_home_motion &&
-                       !_home_stop_pending && !_home_clear_pending &&
-                       !_home_crawl_pending && _home_early_retries < 3) {
-                // Started with limit already pressed — crawl the other way once.
-                _home_early_retries++;
-                _home_stop_pending = true;
-                _home_crawl_pending = true;
-                _home_crawl_away = true;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: limit already active, crawl away");
-            }
             const bool hit = _saw_home_motion && _got_status && alarmed();
             const bool stalled = _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
@@ -1157,6 +1134,7 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_leg_settling = false;
                     _home_stop_pending = true;
                     _home_crawl_pending = true;
+                    _home_crawl_away = false;
                     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                   "CL57R: early alarm %d, crawl retry %u",
                                   (int)_leg_peak_travel,
@@ -1906,11 +1884,8 @@ void AP_ModbusSteering::update(float steering_out)
             if (neg) {
                 spd = (int16_t)(-spd);
             }
-            if (dir_blocked(spd >= 0 ? 1 : -1)) {
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: crawl blocked by DI limit");
-                send_u16(REG_MOTION, MOTION_STOP);
-                break;
-            }
+            // Crawl resume is for tracking recovery — never refuse on DI here
+            // (false dual-active bits used to deadlock both directions).
             send_u16(REG_MAX_SPD, (uint16_t)spd);
             _queued_motion = MOTION_SPEED;
             _leg_peak_travel = 0;
