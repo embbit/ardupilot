@@ -1190,8 +1190,11 @@ void AP_ModbusSteering::update(float steering_out)
                 _mid_seek_prep = 15;
             } else if (_mid_seek_prep == 15) {
                 send_u16(0x0032, DECEL_DEFAULT);
+                _mid_seek_prep = 16;
+            } else if (_mid_seek_prep == 16) {
+                send_u16(REG_MAX_SPD, run_speed_rpm());
                 _pending_mid_seek = false;
-                _pending_run_spd = true;
+                _pending_run_spd = false;
             }
             _state = DriveState::RUN_READ;
             break;
