@@ -366,8 +366,10 @@ def handle_write_single(reg_addr, val):
         if motor.home_rpm:
             motor.max_rpm = motor.home_rpm
         print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs}")
+    elif reg_addr == 0x0036 and (val & 0x0007):
+        print(f"[CL57R Modbus Sim] MOTION START 0x{val:04X} target={motor.driver_target}")
     elif reg_addr == 0x0036:
-        pass  # other motion bits handled via 0x10 position write
+        pass  # other motion bits
 
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,

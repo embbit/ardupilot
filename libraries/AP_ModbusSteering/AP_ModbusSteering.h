@@ -76,6 +76,7 @@ private:
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_abs_move(int32_t target);
+    void send_pos_then_motion(int32_t target, uint16_t motion);
     void finish_home();
     void abort_home(const char *reason);
 
@@ -112,6 +113,8 @@ private:
     bool _home_read_encoder = false;
     bool _home_center_run_spd = false;
     uint8_t _home_center_prep = 0;
+    bool _center_resend = false;
+    int32_t _steer_cmd_offset = 0;
     bool _home_leg_settling = false;
     uint32_t _home_leg_settle_ms = 0;
     bool _center_step_settling = false;

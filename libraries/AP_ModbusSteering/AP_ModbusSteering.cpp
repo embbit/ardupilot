@@ -43,7 +43,7 @@ constexpr uint32_t HOME_TIMEOUT_MS = 90000;
 constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
 constexpr uint32_t HOME_RX_LOST_WARN_MS = 5000;
 constexpr uint32_t HOME_RX_ABORT_MS = 8000;
-constexpr int32_t CENTER_MOVE_STEP = 40000;
+constexpr int32_t CENTER_MOVE_STEP = 5000;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
@@ -298,13 +298,20 @@ void AP_ModbusSteering::send_u16(uint16_t reg, uint16_t value)
 
 void AP_ModbusSteering::send_abs_move(int32_t target)
 {
+    send_pos_then_motion(target, MOTION_START_ABS_IRQ);
+}
+
+void AP_ModbusSteering::send_pos_then_motion(int32_t target, uint16_t motion)
+{
+    // Split position + motion: some CL57R builds ignore a 3-register FC10
+    // burst that includes 0x0036 after native home.
     uint8_t tx_packet[16];
-    uint16_t values[3];
+    uint16_t values[2];
     values[0] = (uint16_t)((target >> 16) & 0xFFFF);
     values[1] = (uint16_t)(target & 0xFFFF);
-    values[2] = MOTION_START_ABS_IRQ;
-    modbus_create_write_multiple_packet((uint8_t)slave_id.get(), REG_TARGET_POS, 3, values, tx_packet);
-    _uart->write(tx_packet, 15);
+    modbus_create_write_multiple_packet((uint8_t)slave_id.get(), REG_TARGET_POS, 2, values, tx_packet);
+    _uart->write(tx_packet, 13);
+    send_u16(REG_MOTION, motion);
     _last_target = target;
     _have_target = true;
 }
@@ -369,6 +376,8 @@ void AP_ModbusSteering::start_home()
     _measured_half_travel = 0;
     _leg_peak_travel = 0;
     _center_move_target = 0;
+    _steer_cmd_offset = 0;
+    _center_resend = false;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -705,6 +714,7 @@ void AP_ModbusSteering::advance_home()
         _last_home_progress_ms = _home_start_ms;
         break;
     case DriveState::HOME_ZERO:
+        _steer_cmd_offset = 0;
         finish_home();
         break;
     default:
@@ -839,25 +849,37 @@ void AP_ModbusSteering::update(float steering_out)
                     _got_echo = false;
                     _init_attempts = 0;
                 } else {
+                    _center_resend = false;
                     _state = DriveState::HOME_MOVE_CENTER;
-                    _home_center_prep = 4;
+                    _home_center_prep = 5;
                     _home_center_run_spd = true;
                 }
             }
         } else if (_center_step_settling && (step_err > arrive || running)) {
             _center_step_settling = false;
         } else if (!running && step_err > arrive &&
-                   (now - _last_home_retry_ms) > 1500) {
-            // Resend absolute command if the drive did not start/progress.
+                   (now - _last_home_retry_ms) > 2000) {
+            // Resend the SAME command — do not advance the target.
             _last_home_retry_ms = now;
+            _center_resend = true;
             _state = DriveState::HOME_MOVE_CENTER;
-            _home_center_prep = 4;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center retry (enc %d want %d)",
-                          (int)enc_from_origin, (int)_center_step_target);
+            _home_center_prep = 5;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center resend %d (enc %d)",
+                          (int)_center_step_target, (int)enc_from_origin);
         } else if ((now - _last_home_progress_ms) > 3000) {
             _last_home_progress_ms = now;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering enc %d / %d",
                           (int)enc_from_origin, (int)_center_move_target);
+            // If encoder never leaves the limit, finish with a command offset so
+            // stick-center maps to mid-travel without a physical center move.
+            if ((enc_from_origin > -500 && enc_from_origin < 500) &&
+                (now - _home_start_ms) > 12000) {
+                _steer_cmd_offset = _center_move_target;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: center move failed, using cmd offset %d",
+                              (int)_steer_cmd_offset);
+                finish_home();
+            }
         }
     }
 
@@ -958,7 +980,7 @@ void AP_ModbusSteering::update(float steering_out)
             _state = DriveState::RUN_READ;
             break;
         }
-        const int32_t target = stick_pulses;
+        const int32_t target = stick_pulses + _steer_cmd_offset;
         const int32_t deadband = pos_db.get();
         const int32_t delta = (target > _last_target) ? (target - _last_target) : (_last_target - target);
         const bool send_pos = !_have_target || (delta > deadband);
@@ -1039,7 +1061,7 @@ void AP_ModbusSteering::update(float steering_out)
         }
         if (_home_center_prep == 2) {
             send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
-            _home_center_prep = 4;
+            _home_center_prep = 3;
             break;
         }
         if (_home_center_prep == 3) {
@@ -1048,9 +1070,13 @@ void AP_ModbusSteering::update(float steering_out)
             _home_center_run_spd = true;
             break;
         }
+        if (_home_center_prep == 4) {
+            // Sync command origin at the current limit before abs moves.
+            send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+            _home_center_prep = 5;
+            break;
+        }
         {
-            // Command space starts at 0 after native home. Encoder feedback is
-            // measured as delta from limit-2 origin.
             const int32_t enc_from_origin = _actual_pulses - _center_encoder_origin;
             const int32_t err = _center_move_target - enc_from_origin;
             const int32_t abs_err = (err >= 0) ? err : -err;
@@ -1061,42 +1087,44 @@ void AP_ModbusSteering::update(float steering_out)
             if (abs_err <= arrive) {
                 _center_step_target = _center_move_target;
                 _center_step_settling = false;
+                _center_resend = false;
                 _state = DriveState::HOME_WAIT_CENTER;
                 break;
             }
-            int32_t step = CENTER_MOVE_STEP;
-            if (abs_err < step) {
-                step = abs_err;
-            }
-            // Next absolute command position (command space, origin at limit 2).
-            const int32_t next_cmd = (err > 0) ?
-                                     (_center_step_target + step) :
-                                     (_center_step_target - step);
-            // Clamp to final center target.
-            int32_t cmd = next_cmd;
-            if (_center_move_target >= 0) {
-                if (cmd > _center_move_target) {
-                    cmd = _center_move_target;
-                }
-                if (cmd < 0) {
-                    cmd = 0;
-                }
+
+            int32_t cmd;
+            if (_center_resend && _center_step_target != 0) {
+                cmd = _center_step_target;
             } else {
-                if (cmd < _center_move_target) {
-                    cmd = _center_move_target;
+                int32_t step = CENTER_MOVE_STEP;
+                if (abs_err < step) {
+                    step = abs_err;
                 }
-                if (cmd > 0) {
-                    cmd = 0;
+                // Advance from encoder progress, not from a phantom command ratchet.
+                if (err > 0) {
+                    cmd = enc_from_origin + step;
+                    if (cmd > _center_move_target) {
+                        cmd = _center_move_target;
+                    }
+                } else {
+                    cmd = enc_from_origin - step;
+                    if (cmd < _center_move_target) {
+                        cmd = _center_move_target;
+                    }
                 }
             }
-            send_abs_move(cmd);
+            _center_resend = false;
+
+            // Alternate motion codes: some firmwares want 0x0001, others 0x0007.
+            const uint16_t motion = ((now / 2000) & 1) ? (uint16_t)0x0001 : MOTION_START_ABS_IRQ;
+            send_pos_then_motion(cmd, motion);
             _center_step_target = cmd;
             _center_step_settling = false;
             _got_status = false;
             _last_home_retry_ms = now;
             _state = DriveState::HOME_WAIT_CENTER;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center cmd %d (enc %d)",
-                          (int)cmd, (int)enc_from_origin);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center cmd %d mot=0x%02x enc %d",
+                          (int)cmd, (unsigned)motion, (int)enc_from_origin);
         }
         break;
     case DriveState::HOME_WAIT_CENTER:
