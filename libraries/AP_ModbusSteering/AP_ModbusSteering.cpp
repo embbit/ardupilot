@@ -81,15 +81,16 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     AP_GROUPINFO("MAX_STEPS", 3, AP_ModbusSteering, max_steps, 200000),
 
     // @Param: START_SPD
-    // @DisplayName: Start Speed
-    // @Description: CL57R start speed in RPM (register 0x0030), written once at init
+    // @DisplayName: Positioning start speed
+    // @Description: CL57R trapezoid start speed (register 0x0030) for positioning/speed moves after init
     // @Units: RPM
+    // @Range: 2 300
     // @User: Standard
     AP_GROUPINFO("START_SPD", 4, AP_ModbusSteering, start_speed, 15),
 
     // @Param: MAX_SPD
     // @DisplayName: Armed run speed
-    // @Description: CL57R max speed in RPM (register 0x0033) used after calibration and while armed
+    // @Description: CL57R max speed (register 0x0033) while armed / normal stick steering after calibration
     // @Units: RPM
     // @Range: 1 3000
     // @User: Standard
@@ -147,10 +148,10 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     AP_GROUPINFO("HOME_MTH", 12, AP_ModbusSteering, home_mth, 17),
 
     // @Param: HOME_SPD
-    // @DisplayName: Homing speed
-    // @Description: CL57R speed in RPM during calibration and centering (0x0041 / 0x0033)
+    // @DisplayName: Homing approach speed
+    // @Description: CL57R fast approach speed during calibration (register 0x0041). Crawl near the limit is separate (0x0042, capped at 300 RPM). Also used as the calib MAX_SPD write; mid-seek to center uses a slower crawl-range speed.
     // @Units: RPM
-    // @Range: 1 3000
+    // @Range: 5 3000
     // @User: Standard
     AP_GROUPINFO("HOME_SPD", 13, AP_ModbusSteering, home_speed, 1800),
 
@@ -422,7 +423,7 @@ void AP_ModbusSteering::start_home()
     _mid_seek_cmd = 0;
     _mid_seek_last_enc = 0;
     _mid_seek_sign = 1;
-    _mid_seek_flipped = false;
+    _mid_seek_retried = false;
     _queued_motion = 0;
     _home_retry_pending = false;
     _state = DriveState::HOME_CLEAR_ALARM;
@@ -556,7 +557,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _mid_seek_cmd = 0;
     _mid_seek_last_enc = 0;
     _mid_seek_sign = (_center_move_target >= 0) ? 1 : -1;
-    _mid_seek_flipped = false;
+    _mid_seek_retried = false;
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
@@ -1087,7 +1088,7 @@ void AP_ModbusSteering::update(float steering_out)
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                               "CL57R: mid speed %d rpm, goal %d%s",
                               (int)spd, (int)goal,
-                              _mid_seek_flipped ? " (rev)" : "");
+                              _mid_seek_retried ? " (retry)" : "");
                 _mid_seek_prep = 10;
             } else if (_mid_seek_prep == 10) {
                 send_u16(REG_MOTION, MOTION_SPEED);
@@ -1123,7 +1124,6 @@ void AP_ModbusSteering::update(float steering_out)
                                           (enc - _mid_seek_last_enc) :
                                           (_mid_seek_last_enc - enc);
                     _mid_seek_last_enc = enc;
-                    // No progress for 3s after soft start window: give up quietly.
                     if (moved < 300 && (now - _home_start_ms) > 8000) {
                         send_u16(REG_MOTION, MOTION_STOP);
                         _mid_seek_prep = 30;
@@ -1138,11 +1138,15 @@ void AP_ModbusSteering::update(float steering_out)
                 send_u16(REG_MOTOR_ENABLE, 0x0001);
                 _mid_seek_prep = 22;
             } else if (_mid_seek_prep == 22) {
-                if (!_mid_seek_flipped) {
-                    _mid_seek_sign = (int8_t)(-_mid_seek_sign);
-                    _mid_seek_flipped = true;
+                // First direction was correct in field logs (enc rose toward
+                // goal). Never reverse — that drives back into the limit.
+                // One same-direction retry after clear, then abandon.
+                if (!_mid_seek_retried && toward > 1000) {
+                    _mid_seek_retried = true;
                     _mid_seek_prep = 9;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: mid reverse once");
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: mid retry same dir enc %d",
+                                  (int)enc);
                 } else {
                     _mid_seek_prep = 30;
                     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,

@@ -123,7 +123,7 @@ private:
     int32_t _mid_seek_cmd = 0;
     int32_t _mid_seek_last_enc = 0;
     int8_t _mid_seek_sign = 1;
-    bool _mid_seek_flipped = false;
+    bool _mid_seek_retried = false;
     uint16_t _queued_motion = 0;
     bool _home_retry_pending = false;
     bool _home_leg_settling = false;
