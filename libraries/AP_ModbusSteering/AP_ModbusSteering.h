@@ -148,6 +148,7 @@ private:
     bool _follow_halted = false;
     uint8_t _follow_alarm_count = 0;
     int32_t _follow_peak_toward = 0;
+    int32_t _last_stick_log = 0;
     bool _read_status_next = false;
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;

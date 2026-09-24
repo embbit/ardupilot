@@ -1359,10 +1359,9 @@ void AP_ModbusSteering::update(float steering_out)
             {
                 // One-shot notice so the GCS can confirm stick input reached the driver.
                 if (_steer_cmd_offset == 0 && !_follow_moving) {
-                    static int32_t last_stick_log;
-                    if (stick_pulses != last_stick_log &&
+                    if (stick_pulses != _last_stick_log &&
                         (stick_pulses > arrive_db || stick_pulses < -arrive_db)) {
-                        last_stick_log = stick_pulses;
+                        _last_stick_log = stick_pulses;
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                                       "CL57R: stick cmd %d",
                                       (int)stick_pulses);
