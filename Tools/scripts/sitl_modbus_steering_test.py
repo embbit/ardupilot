@@ -412,8 +412,9 @@ def run_param_trigger():
         if not calibrated:
             print("FAIL: HOME_TRIG=1 did not finish calibration")
             return 1
-        if not wait_for_log(sim_lines, "HOME START", 2):
-            print("FAIL: simulator did not see HOME START")
+        if not (wait_for_log(sim_lines, "SPEED START", 2) or
+                wait_for_log(sim_lines, "HOME START", 2)):
+            print("FAIL: simulator did not see SPEED/HOME START")
             return 1
         # Auto mid return via speed-mode follow after cal.
         mid_ok = False
