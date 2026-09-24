@@ -422,6 +422,9 @@ def run_param_trigger():
             if any("at mid-travel" in t for t in events):
                 mid_done = True
                 break
+            if any("mid seek incomplete" in t or "mid abandon" in t for t in events):
+                mid_done = True
+                break
             if any("mid seek" in t and "offset" in t for t in events):
                 mid_done = True
                 break
@@ -553,6 +556,9 @@ def run_rc_buttons():
         while time.time() < deadline:
             hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
             if any("at mid-travel" in t for t in events):
+                mid_done = True
+                break
+            if any("mid seek incomplete" in t or "mid abandon" in t for t in events):
                 mid_done = True
                 break
             if any("mid seek" in t and "offset" in t for t in events):
