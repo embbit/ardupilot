@@ -30,6 +30,11 @@ constexpr uint16_t REG_POS_MODE = 0x003A;
 constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t AUX_POS_ZERO = 0x0008;
+// CL57R 0x0036 bits (official Modbus doc):
+// Bit0 start positioning, Bit1 abs(1)/rel(0), Bit2 interrupt, Bit4 home.
+// Example start is 0x0001. Bit1 alone (0x0002) does NOT start motion.
+constexpr uint16_t MOTION_START_REL = 0x0001;
+constexpr uint16_t MOTION_START_ABS = 0x0003;
 constexpr uint16_t MOTION_START_ABS_IRQ = 0x0007;
 constexpr uint16_t MOTION_HOME = 0x0010;
 constexpr uint16_t STATUS_HOME_DONE = (1U << 1);
@@ -41,9 +46,9 @@ constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
 constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
-constexpr uint32_t HOME_RX_LOST_WARN_MS = 5000;
-constexpr uint32_t HOME_RX_ABORT_MS = 8000;
-constexpr int32_t CENTER_MOVE_STEP = 5000;
+constexpr uint32_t HOME_RX_LOST_WARN_MS = 10000;
+constexpr uint32_t HOME_RX_ABORT_MS = 20000;
+constexpr uint32_t HOME_RX_SILENCE_MS = 8000;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
@@ -231,18 +236,25 @@ uint16_t AP_ModbusSteering::run_speed_rpm() const
 uint16_t AP_ModbusSteering::calib_speed_rpm() const
 {
     const int16_t rpm = home_speed.get();
-    if (rpm < 1) {
+    if (rpm < 5) {
         return 1800;
+    }
+    if (rpm > 3000) {
+        return 3000;
     }
     return (uint16_t)rpm;
 }
 
 uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 {
+    // Register 0x0042 is limited to 5..300 RPM per the CL57R Modbus manual.
     const uint16_t home = calib_speed_rpm();
-    uint16_t crawl = home / 4;
-    if (crawl < 150) {
-        crawl = 150;
+    uint16_t crawl = home / 10;
+    if (crawl < 30) {
+        crawl = 30;
+    }
+    if (crawl > 300) {
+        crawl = 300;
     }
     return crawl;
 }
@@ -296,24 +308,31 @@ void AP_ModbusSteering::send_u16(uint16_t reg, uint16_t value)
     _uart->write(tx_packet, 8);
 }
 
-void AP_ModbusSteering::send_abs_move(int32_t target)
+void AP_ModbusSteering::send_target_pos(int32_t target)
 {
-    send_pos_then_motion(target, MOTION_START_ABS_IRQ);
-}
-
-void AP_ModbusSteering::send_pos_then_motion(int32_t target, uint16_t motion)
-{
-    // Split position + motion: some CL57R builds ignore a 3-register FC10
-    // burst that includes 0x0036 after native home.
     uint8_t tx_packet[16];
     uint16_t values[2];
     values[0] = (uint16_t)((target >> 16) & 0xFFFF);
     values[1] = (uint16_t)(target & 0xFFFF);
     modbus_create_write_multiple_packet((uint8_t)slave_id.get(), REG_TARGET_POS, 2, values, tx_packet);
     _uart->write(tx_packet, 13);
-    send_u16(REG_MOTION, motion);
     _last_target = target;
     _have_target = true;
+}
+
+void AP_ModbusSteering::queue_motion(uint16_t motion)
+{
+    _queued_motion = motion;
+}
+
+bool AP_ModbusSteering::flush_queued_motion()
+{
+    if (_queued_motion == 0) {
+        return false;
+    }
+    send_u16(REG_MOTION, _queued_motion);
+    _queued_motion = 0;
+    return true;
 }
 
 bool AP_ModbusSteering::rc_rising_edge(int8_t ch, bool &was_high) const
@@ -381,6 +400,8 @@ void AP_ModbusSteering::start_home()
     _pending_mid_seek = false;
     _mid_seek_prep = 0;
     _mid_seek_cmd = 0;
+    _queued_motion = 0;
+    _home_retry_pending = false;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -555,7 +576,6 @@ void AP_ModbusSteering::consume_rx()
         }
         _rx_buf[_rx_len++] = _uart->read();
         available--;
-        _last_rx_ms = AP_HAL::millis();
     }
 
     uint16_t offset = 0;
@@ -579,9 +599,13 @@ void AP_ModbusSteering::consume_rx()
         }
 
         _ever_got_rx = true;
+        _last_rx_ms = AP_HAL::millis();
 
         const uint8_t fn = _rx_buf[offset + 1];
         if (fn == 0x06) {
+            _got_echo = true;
+        } else if (fn == 0x10) {
+            // FC16 echo (write-multiple) also counts as a successful exchange.
             _got_echo = true;
         } else if ((fn & 0x80) != 0) {
             // Exception response still proves the slave heard us; advance so an
@@ -673,9 +697,7 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_SET_RUN_SPD;
         break;
     case DriveState::HOME_SET_RUN_SPD:
-        // Skip HOME_CRAWL (0x0042): many CL57R builds do not implement it and
-        // never echo, which previously stalled calibration on step 15.
-        _state = DriveState::HOME_SET_ACCEL;
+        _state = DriveState::HOME_SET_CRAWL;
         break;
     case DriveState::HOME_SET_CRAWL:
         _state = DriveState::HOME_SET_ACCEL;
@@ -760,17 +782,20 @@ void AP_ModbusSteering::update(float steering_out)
                 GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
                               "CL57R: no Modbus RX from CL57R (check RS485 A/B RX)");
             }
-        } else if (_last_rx_ms == 0 || (now - _last_rx_ms) > 3000) {
+        } else if (_last_rx_ms == 0 || (now - _last_rx_ms) > HOME_RX_SILENCE_MS) {
             if (_home_rx_lost_ms == 0) {
                 _home_rx_lost_ms = now;
             }
+            // Only abort if we never saw motion — long home legs can go quiet while
+            // the drive is busy seeking a limit. Do not abort mid-travel on silence.
             if ((now - _home_rx_lost_ms) >= HOME_RX_ABORT_MS &&
+                !_saw_home_motion &&
                 (_state == DriveState::HOME_WAIT || _state == DriveState::HOME_WAIT_CENTER)) {
                 abort_home("Modbus RX lost, abort home");
             } else if (_last_home_norx_ms == 0 ||
                        (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS) {
                 _last_home_norx_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus RX lost during home");
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus RX quiet during home");
             }
         } else {
             _home_rx_lost_ms = 0;
@@ -894,6 +919,11 @@ void AP_ModbusSteering::update(float steering_out)
     }
     _last_send_ms = now;
 
+    // Half-duplex RS485: never send more than one Modbus frame per slot.
+    if (flush_queued_motion()) {
+        return;
+    }
+
     if (_state < DriveState::RUN_WRITE) {
         if (_got_echo) {
             advance_init();
@@ -984,12 +1014,14 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         }
         if (_pending_mid_seek) {
-            // Quiet post-home seek to mid-travel using command offset.
+            // Post-home seek to mid-travel. One Modbus frame per 50 ms slot.
+            // Official doc: write target pulses, then 0x0036=0x0001 to start
+            // (relative). 0x0002 alone never starts motion.
             if (_mid_seek_prep == 0) {
                 send_u16(REG_MOTOR_ENABLE, 0x0001);
                 _mid_seek_prep = 1;
             } else if (_mid_seek_prep == 1) {
-                send_u16(REG_POS_MODE, 0x0001);
+                send_u16(REG_POS_MODE, 0x0000);  // relative path mode
                 _mid_seek_prep = 2;
             } else if (_mid_seek_prep == 2) {
                 send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
@@ -1001,42 +1033,47 @@ void AP_ModbusSteering::update(float steering_out)
                 send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
                 _mid_seek_prep = 5;
                 _center_encoder_origin = _actual_pulses;
+            } else if (_mid_seek_prep == 5) {
+                // Full remaining distance in one relative command.
+                const int32_t enc = _actual_pulses - _center_encoder_origin;
+                const int32_t goal = _steer_cmd_offset;
+                const int32_t rel = goal - enc;
+                send_target_pos(rel);
+                queue_motion(MOTION_START_REL);
+                _mid_seek_cmd = rel;
+                _mid_seek_prep = 6;
+                _last_home_progress_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "CL57R: mid rel %d enc %d/%d",
+                              (int)rel, (int)enc, (int)goal);
             } else {
                 const int32_t enc = _actual_pulses - _center_encoder_origin;
                 const int32_t goal = _steer_cmd_offset;
                 const int32_t err = (enc > goal) ? (enc - goal) : (goal - enc);
                 if (err <= 800) {
-                    send_u16(REG_POS_MODE, 0x0001);
                     send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
                     _steer_cmd_offset = 0;
                     _pending_mid_seek = false;
                     _pending_run_spd = true;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, zeroed");
                 } else if ((now - _home_start_ms) > 45000) {
-                    // Keep offset so stick-center still commands mid-travel.
                     _pending_mid_seek = false;
                     _pending_run_spd = true;
                     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                   "CL57R: mid seek timeout, offset %d remains",
                                   (int)_steer_cmd_offset);
-                } else {
-                    // Relative steps: abs moves after native home often do nothing
-                    // on CL57R, while relative path-control still runs.
-                    int32_t step = CENTER_MOVE_STEP;
-                    if (err < step) {
-                        step = err;
+                } else if ((now - _last_home_progress_ms) > 2000) {
+                    _last_home_progress_ms = now;
+                    // Resend remaining relative distance if still stuck.
+                    const int32_t rel = goal - enc;
+                    if (rel != 0) {
+                        send_target_pos(rel);
+                        queue_motion(MOTION_START_REL);
+                        _mid_seek_cmd = rel;
                     }
-                    const int32_t rel = (goal >= enc) ? step : -step;
-                    send_u16(REG_POS_MODE, 0x0000);
-                    send_u16(REG_MOTION, 0x0000);
-                    send_pos_then_motion(rel, 0x0002);
-                    _mid_seek_cmd = rel;
-                    if ((now - _last_home_progress_ms) > 2000) {
-                        _last_home_progress_ms = now;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: mid rel %d enc %d/%d",
-                                      (int)rel, (int)enc, (int)goal);
-                    }
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: mid rel %d enc %d/%d",
+                                  (int)rel, (int)enc, (int)goal);
                 }
             }
             _state = DriveState::RUN_READ;
@@ -1047,8 +1084,9 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t delta = (target > _last_target) ? (target - _last_target) : (_last_target - target);
         const bool send_pos = !_have_target || (delta > deadband);
         if (send_pos) {
-            send_u16(REG_MOTION, 0x0000);
-            send_pos_then_motion(target, 0x0001);
+            // Absolute stick target; Bit2 interrupts in-progress moves.
+            send_target_pos(target);
+            queue_motion(MOTION_START_ABS_IRQ);
         } else {
             send_u16(REG_MOTOR_ENABLE, 0x0001);
         }
@@ -1085,10 +1123,12 @@ void AP_ModbusSteering::update(float steering_out)
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write MAX_SPD=%u (calib)", (unsigned)spd);
         break;
     }
-    case DriveState::HOME_SET_CRAWL:
-        // Unused: advance_home skips this state. Kept for enum stability.
-        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
+    case DriveState::HOME_SET_CRAWL: {
+        const uint16_t crawl = calib_crawl_rpm();
+        send_u16(REG_HOME_CRAWL, crawl);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write HOME_CRAWL=%u", (unsigned)crawl);
         break;
+    }
     case DriveState::HOME_SET_ACCEL:
         send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
         break;
@@ -1099,6 +1139,13 @@ void AP_ModbusSteering::update(float steering_out)
         send_u16(REG_MOTION, MOTION_HOME);
         break;
     case DriveState::HOME_WAIT:
+        if (_home_retry_pending) {
+            // Dedicated slot: never piggy-back home restart on a status read.
+            _home_retry_pending = false;
+            send_u16(REG_MOTION, MOTION_HOME);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
+            break;
+        }
         if (_home_read_encoder) {
             _rx_expect = RxExpect::ENCODER;
             modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
@@ -1109,11 +1156,9 @@ void AP_ModbusSteering::update(float steering_out)
         _home_read_encoder = !_home_read_encoder;
         _uart->write(tx_packet, 8);
         if (!_saw_home_motion && (now - _home_start_ms) > 3000 &&
-            (now - _last_home_retry_ms) > 3000 && _uart->txspace() >= 16) {
+            (now - _last_home_retry_ms) > 3000) {
             _last_home_retry_ms = now;
-            send_u16(REG_MOTOR_ENABLE, 0x0001);
-            send_u16(REG_MOTION, MOTION_HOME);
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
+            _home_retry_pending = true;
         }
         break;
     case DriveState::HOME_MOVE_CENTER:
@@ -1165,35 +1210,20 @@ void AP_ModbusSteering::update(float steering_out)
             if (_center_resend && _center_step_target != 0) {
                 cmd = _center_step_target;
             } else {
-                int32_t step = CENTER_MOVE_STEP;
-                if (abs_err < step) {
-                    step = abs_err;
-                }
-                // Advance from encoder progress, not from a phantom command ratchet.
-                if (err > 0) {
-                    cmd = enc_from_origin + step;
-                    if (cmd > _center_move_target) {
-                        cmd = _center_move_target;
-                    }
-                } else {
-                    cmd = enc_from_origin - step;
-                    if (cmd < _center_move_target) {
-                        cmd = _center_move_target;
-                    }
-                }
+                // One absolute command for the remaining distance.
+                cmd = _center_move_target;
             }
             _center_resend = false;
 
-            // Alternate motion codes: some firmwares want 0x0001, others 0x0007.
-            const uint16_t motion = ((now / 2000) & 1) ? (uint16_t)0x0001 : MOTION_START_ABS_IRQ;
-            send_pos_then_motion(cmd, motion);
+            send_target_pos(cmd);
+            queue_motion(MOTION_START_ABS);
             _center_step_target = cmd;
             _center_step_settling = false;
             _got_status = false;
             _last_home_retry_ms = now;
             _state = DriveState::HOME_WAIT_CENTER;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center cmd %d mot=0x%02x enc %d",
-                          (int)cmd, (unsigned)motion, (int)enc_from_origin);
+                          (int)cmd, (unsigned)MOTION_START_ABS, (int)enc_from_origin);
         }
         break;
     case DriveState::HOME_WAIT_CENTER:

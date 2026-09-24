@@ -26,6 +26,7 @@ class Nema23Motor:
         self.position = 0.0
         self.velocity = 0.0
         self.driver_target = 0
+        self.pending_cmd = 0
         self.max_rpm = DEFAULT_MAX_RPM
         self.accel_ms = DEFAULT_ACCEL_MS
         self.decel_ms = DEFAULT_DECEL_MS
@@ -85,6 +86,22 @@ class Nema23Motor:
 
     def set_driver_target(self, pos):
         self.driver_target = pos
+
+    def set_pending_cmd(self, pos):
+        # Target register write alone must not start motion (CL57R needs 0x0036 Bit0).
+        self.pending_cmd = int(pos)
+
+    def apply_motion_start(self, motion_word):
+        """Start positioning only when Bit0 is set (official CL57R Modbus doc)."""
+        if (motion_word & 0x0001) == 0:
+            return False
+        if (motion_word & 0x0002) != 0:
+            # Absolute
+            self.driver_target = self.pending_cmd
+        else:
+            # Relative
+            self.driver_target = int(round(self.position)) + self.pending_cmd
+        return True
 
     def clear_alarm(self):
         self.alarmed = False
@@ -349,6 +366,7 @@ def handle_write_single(reg_addr, val):
         motor.position = 0.0
         motor.reported_position = 0.0
         motor.driver_target = 0
+        motor.pending_cmd = 0
         motor.velocity = 0.0
         motor.home_done = False
         print("[CL57R Modbus Sim] POSITION ZEROED")
@@ -366,10 +384,12 @@ def handle_write_single(reg_addr, val):
         if motor.home_rpm:
             motor.max_rpm = motor.home_rpm
         print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs}")
-    elif reg_addr == 0x0036 and (val & 0x0007):
-        print(f"[CL57R Modbus Sim] MOTION START 0x{val:04X} target={motor.driver_target}")
+    elif reg_addr == 0x0036 and (val & 0x0001):
+        if motor.apply_motion_start(val):
+            print(f"[CL57R Modbus Sim] MOTION START 0x{val:04X} target={motor.driver_target}")
     elif reg_addr == 0x0036:
-        pass  # other motion bits
+        # Bit1 alone (0x0002) or other bits without Bit0 must not start motion.
+        print(f"[CL57R Modbus Sim] MOTION write 0x{val:04X} (no start)")
 
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
@@ -474,7 +494,7 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                     elif func_code == 0x10:
                         if reg_addr == 0x0034 and len(req) >= 13:
                             cmd = decode_position_write(req)
-                            motor.set_driver_target(cmd)
+                            motor.set_pending_cmd(cmd)
                             sim_state["last_cmd_target"] = cmd
                             _log_telemetry(now, cmd)
                         response.append(slave_id)

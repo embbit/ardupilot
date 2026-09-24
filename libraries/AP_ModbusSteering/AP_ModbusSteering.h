@@ -75,8 +75,10 @@ private:
     uint16_t calib_crawl_rpm() const;
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
-    void send_abs_move(int32_t target);
-    void send_pos_then_motion(int32_t target, uint16_t motion);
+    void send_target_pos(int32_t target);
+    // Queue a 0x0036 write for the next 50 ms slot (never TX with another frame).
+    void queue_motion(uint16_t motion);
+    bool flush_queued_motion();
     void finish_home();
     void abort_home(const char *reason);
 
@@ -118,6 +120,8 @@ private:
     bool _pending_mid_seek = false;
     uint8_t _mid_seek_prep = 0;
     int32_t _mid_seek_cmd = 0;
+    uint16_t _queued_motion = 0;
+    bool _home_retry_pending = false;
     bool _home_leg_settling = false;
     uint32_t _home_leg_settle_ms = 0;
     bool _center_step_settling = false;
