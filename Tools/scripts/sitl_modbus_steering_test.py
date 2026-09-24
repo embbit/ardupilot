@@ -385,7 +385,7 @@ def run_param_trigger():
         time.sleep(0.5)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_HOME_SPD", 900, int16)
+        set_param(mavlink, "OB_STR_HOME_SPD", 1800, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -491,7 +491,7 @@ def run_rc_buttons():
         set_param(mavlink, "OB_STR_HOME_CH", 7, int8)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_HOME_SPD", 900, int16)
+        set_param(mavlink, "OB_STR_HOME_SPD", 1800, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -527,8 +527,8 @@ def run_rc_buttons():
             return 1
         print("PASS: home button calibrated (alarm clear + home + center)")
 
-        if not any("HOME_SPD=900" in line for line in sim_lines):
-            print("FAIL: homing did not write HOME_SPD=900")
+        if not any("HOME_SPD=1800" in line for line in sim_lines):
+            print("FAIL: homing did not write HOME_SPD=1800")
             return 1
         after_home = False
         restored = False
@@ -540,7 +540,7 @@ def run_rc_buttons():
         if not restored:
             print("FAIL: run speed 1300 not restored after home")
             return 1
-        print("PASS: home speed 900, run speed restored to 1300")
+        print("PASS: home speed 1800, run speed restored to 1300")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)

@@ -120,6 +120,7 @@ private:
     int32_t _leg_peak_travel = 0;
     int32_t _center_move_target = 0;
     int32_t _center_step_target = 0;
+    int32_t _center_encoder_origin = 0;
     int32_t _measured_half_travel = 0;
     uint8_t _home_leg = 0;
     bool _read_status_next = false;
