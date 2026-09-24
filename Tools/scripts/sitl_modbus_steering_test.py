@@ -423,10 +423,10 @@ def run_param_trigger():
             if any("at mid-travel" in t for t in events):
                 mid_ok = True
                 break
-            if any("speed follow" in t for t in events) or any("SPEED START" in line for line in sim_lines):
+            if any("spd-follow" in t for t in events) or any("SPEED START" in line for line in sim_lines):
                 # Keep waiting for arrive
                 pass
-        if not mid_ok and not any("speed follow" in t for t in events):
+        if not mid_ok and not any("spd-follow" in t for t in events):
             print("FAIL: missing speed-follow mid return after cal")
             return 1
         print("PASS: HOME_TRIG=1 calibrated steering")
@@ -547,10 +547,10 @@ def run_rc_buttons():
         if not any("HOME_SPD=1800" in line for line in sim_lines):
             print("FAIL: homing did not write HOME_SPD=1800")
             return 1
-        if not any("cal done at limit" in t for t in events):
+        if not any("cal@limit" in t or "cal done at limit" in t for t in events):
             print("FAIL: missing cal done at limit message")
             return 1
-        if not any("speed follow" in t for t in events):
+        if not any("spd-follow" in t for t in events):
             print("FAIL: missing speed-follow mid return message")
             return 1
 

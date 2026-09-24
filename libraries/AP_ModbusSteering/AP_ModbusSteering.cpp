@@ -560,7 +560,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal done at limit, mid offset %d (speed follow)",
+                  "CL57R: cal@limit ofs %d spd-follow",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -942,7 +942,7 @@ void AP_ModbusSteering::update(float steering_out)
                 _follow_alarm_step = 0;
                 _follow_restore = 0;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: center move failed, speed follow offset %d",
+                              "CL57R: center fail, spd-follow %d",
                               (int)_steer_cmd_offset);
                 finish_home();
             }
@@ -1086,7 +1086,7 @@ void AP_ModbusSteering::update(float steering_out)
                     _follow_last_enc = 0;
                     _follow_progress_ms = now;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: speed follow eng, mid offset %d",
+                                  "CL57R: spd-follow on, ofs %d",
                                   (int)_steer_cmd_offset);
                 }
                 _follow_prep++;
@@ -1127,7 +1127,7 @@ void AP_ModbusSteering::update(float steering_out)
                     _follow_slot = 0;
                     _follow_alarm_step = 0;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: follow resume enc %d tgt %d",
+                                  "CL57R: follow resume %d->%d",
                                   (int)enc, (int)target);
                 }
                 _state = DriveState::RUN_READ;
@@ -1141,7 +1141,7 @@ void AP_ModbusSteering::update(float steering_out)
                 _follow_alarm_step = 1;
                 send_u16(REG_MOTION, MOTION_STOP);
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: follow alarm enc %d tgt %d",
+                              "CL57R: follow alarm %d->%d",
                               (int)enc, (int)target);
                 _state = DriveState::RUN_READ;
                 break;
@@ -1169,12 +1169,21 @@ void AP_ModbusSteering::update(float steering_out)
             } else {
                 const int8_t want_sign = (err > 0) ? 1 : -1;
                 // Gentle crawl while returning to mid; run speed for stick after.
-                const uint16_t rpm = (_steer_cmd_offset != 0) ?
-                                     mid_seek_speed_rpm() : run_speed_rpm();
+                uint16_t max_rpm = (_steer_cmd_offset != 0) ?
+                                   mid_seek_speed_rpm() : run_speed_rpm();
+                // Scale RPM with remaining error so high stick speed does not
+                // overshoot and chatter through the arrive deadband.
+                const int32_t slow_zone = (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60;
+                uint16_t rpm = max_rpm;
+                if (slow_zone > 0 && abs_err < slow_zone) {
+                    const uint16_t min_rpm = (_steer_cmd_offset != 0) ? 40 : 80;
+                    rpm = (uint16_t)MAX((int32_t)min_rpm,
+                                        (int32_t)max_rpm * abs_err / slow_zone);
+                }
+                const int16_t signed_spd = (int16_t)((int32_t)rpm * (int32_t)want_sign);
                 if (!_follow_moving || _follow_sign != want_sign) {
                     if (_follow_slot == 0) {
-                        const int16_t spd = (int16_t)((int32_t)rpm * (int32_t)want_sign);
-                        send_u16(REG_MAX_SPD, (uint16_t)spd);
+                        send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
                         _follow_sign = want_sign;
                         _follow_slot = 1;
                     } else {
@@ -1184,8 +1193,8 @@ void AP_ModbusSteering::update(float steering_out)
                         _follow_progress_ms = now;
                         _follow_last_enc = enc;
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: follow spd %d enc %d/%d",
-                                      (int)((int32_t)rpm * want_sign),
+                                      "CL57R: follow %drpm %d/%d",
+                                      (int)signed_spd,
                                       (int)enc, (int)target);
                     }
                 } else if ((now - _follow_progress_ms) > 2500) {
@@ -1201,8 +1210,12 @@ void AP_ModbusSteering::update(float steering_out)
                         // Drive dropped speed mode — reassert without reversing.
                         send_u16(REG_MOTION, MOTION_SPEED);
                     } else {
-                        send_u16(REG_MOTOR_ENABLE, 0x0001);
+                        // Refresh approach speed as error shrinks.
+                        send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
                     }
+                } else if (abs_err < slow_zone) {
+                    // Keep updating signed MAX_SPD while braking into target.
+                    send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
                 } else {
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                 }
