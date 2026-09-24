@@ -46,8 +46,9 @@ constexpr uint16_t STATUS_RUNNING = (1U << 2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
-constexpr uint16_t MID_SEEK_ACCEL_MS = 800;
-constexpr uint16_t MID_SEEK_DECEL_MS = 800;
+constexpr uint16_t MID_SEEK_ACCEL_MS = 2000;
+constexpr uint16_t MID_SEEK_DECEL_MS = 2000;
+constexpr uint16_t MID_SEEK_RPM = 100;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
 constexpr uint32_t HOME_TIMEOUT_MS = 90000;
@@ -268,16 +269,9 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Return-to-center after home: HOME_SPD is too fast and trips tracking
-    // alarm on this steering load. Cap to crawl-range RPM.
-    uint16_t spd = calib_crawl_rpm();
-    if (spd < 150) {
-        spd = 150;
-    }
-    if (spd > 300) {
-        spd = 300;
-    }
-    return spd;
+    // Gentle center return — faster values trip tracking alarm and sound harsh.
+    (void)calib_crawl_rpm();
+    return MID_SEEK_RPM;
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -1081,7 +1075,14 @@ void AP_ModbusSteering::update(float steering_out)
                 // Do not AUX_POS_ZERO on the pressed limit — it aggravates faults.
                 _center_encoder_origin = _actual_pulses;
                 _mid_seek_last_enc = 0;
-                _mid_seek_prep = 9;
+                // Settle after leaving native home before commanding speed mode.
+                _mid_seek_prep = 40;
+            } else if (_mid_seek_prep >= 40 && _mid_seek_prep < 50) {
+                send_u16(REG_MOTOR_ENABLE, 0x0001);
+                _mid_seek_prep++;
+                if (_mid_seek_prep >= 50) {
+                    _mid_seek_prep = 9;
+                }
             } else if (_mid_seek_prep == 9) {
                 const int16_t spd = (int16_t)((int32_t)mid_seek_speed_rpm() * _mid_seek_sign);
                 send_u16(REG_MAX_SPD, (uint16_t)spd);
@@ -1104,12 +1105,13 @@ void AP_ModbusSteering::update(float steering_out)
                     send_u16(REG_MOTION, MOTION_STOP);
                     _mid_seek_prep = 12;
                 } else if (_got_status && alarmed()) {
-                    send_u16(REG_MOTION, MOTION_ESTOP);
+                    // Soft stop only — e-stop is what sounded harsh.
+                    send_u16(REG_MOTION, MOTION_STOP);
                     _mid_seek_prep = 20;
                     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                   "CL57R: mid alarm at enc %d",
                                   (int)enc);
-                } else if ((now - _home_start_ms) > 90000) {
+                } else if ((now - _home_start_ms) > 120000) {
                     send_u16(REG_MOTION, MOTION_STOP);
                     _mid_seek_prep = 30;
                     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
@@ -1124,7 +1126,7 @@ void AP_ModbusSteering::update(float steering_out)
                                           (enc - _mid_seek_last_enc) :
                                           (_mid_seek_last_enc - enc);
                     _mid_seek_last_enc = enc;
-                    if (moved < 300 && (now - _home_start_ms) > 8000) {
+                    if (moved < 300 && (now - _home_start_ms) > 12000) {
                         send_u16(REG_MOTION, MOTION_STOP);
                         _mid_seek_prep = 30;
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
@@ -1138,10 +1140,8 @@ void AP_ModbusSteering::update(float steering_out)
                 send_u16(REG_MOTOR_ENABLE, 0x0001);
                 _mid_seek_prep = 22;
             } else if (_mid_seek_prep == 22) {
-                // First direction was correct in field logs (enc rose toward
-                // goal). Never reverse — that drives back into the limit.
-                // One same-direction retry after clear, then abandon.
-                if (!_mid_seek_retried && toward > 1000) {
+                // Always one same-direction retry (direction was correct in logs).
+                if (!_mid_seek_retried) {
                     _mid_seek_retried = true;
                     _mid_seek_prep = 9;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
@@ -1154,7 +1154,7 @@ void AP_ModbusSteering::update(float steering_out)
                                   (int)_steer_cmd_offset);
                 }
             } else if (_mid_seek_prep == 30) {
-                send_u16(REG_MOTION, MOTION_ESTOP);
+                send_u16(REG_MOTION, MOTION_STOP);
                 _mid_seek_prep = 31;
             } else if (_mid_seek_prep == 31) {
                 send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
@@ -1163,12 +1163,20 @@ void AP_ModbusSteering::update(float steering_out)
                 send_u16(REG_MOTION, 0x0000);
                 _mid_seek_prep = 33;
             } else if (_mid_seek_prep == 33) {
-                send_u16(REG_MOTOR_ENABLE, 0x0001);
-                _mid_seek_prep = 14;  // restore accel path (skip success zero)
-                // Keep offset; do not claim mid-travel.
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: mid seek incomplete, offset %d remains",
-                              (int)_steer_cmd_offset);
+                // Re-base offset from current encoder so stick-center still
+                // targets true mid even if we stopped part-way.
+                if (toward > 500 && abs_goal > toward) {
+                    _steer_cmd_offset = goal - enc;
+                    send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: mid incomplete, remain offset %d",
+                                  (int)_steer_cmd_offset);
+                } else {
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: mid seek incomplete, offset %d remains",
+                                  (int)_steer_cmd_offset);
+                }
+                _mid_seek_prep = 14;
             } else if (_mid_seek_prep == 12) {
                 send_u16(REG_MOTION, 0x0000);
                 _mid_seek_prep = 13;
