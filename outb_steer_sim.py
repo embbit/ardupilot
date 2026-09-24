@@ -48,6 +48,7 @@ class Nema23Motor:
         self.home_rpm = 0
         self.home_finish_at = 0.0
         self.home_runs = 0
+        self.di_state = 0
         # Alarm/stall: когда True, мотор НЕ исполняет команды позиции,
         # пока не придёт alarm-clear (0x0037=0x0004). Моделирует tracking error.
         self.alarmed = False
@@ -65,6 +66,13 @@ class Nema23Motor:
         if self.motor_enabled:
             status |= 1 << 4
         self.status_word = status
+        # X1=P-OT (bit1) near +hard stop, X2=N-OT (bit2) near -hard stop.
+        di = 0
+        if self.position >= SPEED_HARD_STOP - 500:
+            di |= (1 << 1)
+        if self.position <= -SPEED_HARD_STOP + 500:
+            di |= (1 << 2)
+        self.di_state = di
 
     @property
     def max_vel(self):
@@ -573,6 +581,13 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                             if qty >= 2:
                                 response.append(0)
                                 response.append(motor.error_code & 0xFF)
+                        elif reg_addr == 0x0005:
+                            motor.refresh_status()
+                            response.append(slave_id)
+                            response.append(0x03)
+                            response.append(0x02)
+                            response.append((motor.di_state >> 8) & 0xFF)
+                            response.append(motor.di_state & 0xFF)
 
                     if len(response) > 0 and addr is not None:
                         crc = modbus_crc(response)

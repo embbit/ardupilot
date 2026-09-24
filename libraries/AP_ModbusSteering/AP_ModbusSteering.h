@@ -51,6 +51,7 @@ private:
         NONE = 0,
         ENCODER,
         STATUS,
+        DI,
     };
 
     int32_t travel_limit_pulses() const;
@@ -61,6 +62,8 @@ private:
     void advance_home();
     void poll_rc_buttons();
     void poll_param_trigger();
+    void poll_jog_trigger();
+    void start_jog(int8_t sign);
     bool rc_rising_edge(int8_t ch, bool &was_high) const;
     void request_alarm_clear();
     void start_home();
@@ -76,6 +79,9 @@ private:
     uint16_t calib_crawl_rpm() const;
     uint16_t mid_seek_speed_rpm() const;
     uint16_t track_err_limit() const;
+    bool lim_pos_active() const;
+    bool lim_neg_active() const;
+    bool dir_blocked(int8_t sign) const;
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_target_pos(int32_t target);
@@ -150,8 +156,17 @@ private:
     bool _home_clear_pending = false;
     bool _home_speed_leg = false;
     bool _home_crawl_pending = false;   // resume seek at crawl after early alarm
+    bool _home_crawl_away = false;      // crawl opposite of method (limit already on)
     uint8_t _home_early_retries = 0;
     int32_t _leg1_travel = 0;           // peak travel of dual-limit leg 1
+    bool _jog_active = false;
+    int8_t _jog_sign = 0;
+    uint8_t _jog_slot = 0;
+    int32_t _jog_start_enc = 0;
+    int32_t _jog_need = 0;
+    uint16_t _di_state = 0;
+    bool _got_di = false;
+    uint8_t _read_phase = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
     uint8_t _follow_alarm_count = 0;
@@ -179,6 +194,11 @@ private:
     AP_Int16 home_speed;
     AP_Int8  home_trig;
     AP_Int8  home_mode;
+    AP_Int8  jog_trig;
+    AP_Int32 jog_pulses;
+    AP_Int8  lim_inv;
     int8_t   _home_trig_last = 0;
     bool     _home_trig_inited = false;
+    int8_t   _jog_trig_last = 0;
+    bool     _jog_trig_inited = false;
 };
