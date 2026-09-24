@@ -43,7 +43,7 @@ constexpr uint32_t HOME_TIMEOUT_MS = 90000;
 constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
 constexpr uint32_t HOME_RX_LOST_WARN_MS = 5000;
 constexpr uint32_t HOME_RX_ABORT_MS = 8000;
-constexpr int32_t CENTER_MOVE_STEP = 10000;
+constexpr int32_t CENTER_MOVE_STEP = 40000;
 constexpr uint16_t TRACK_ERR_LIMIT = 50000;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
@@ -490,9 +490,18 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _center_move_target = center_target_pulses();
     }
 
+    // CL57R native home zeros the position reference at the limit. Our last
+    // encoder sample may still hold the pre-zero peak; force 0 before center.
+    _actual_pulses = 0;
+    _center_step_target = 0;
     _home_center_run_spd = false;
+    _home_center_prep = 0;
+    _center_step_settling = false;
+    _home_start_ms = AP_HAL::millis();
+    _last_home_progress_ms = _home_start_ms;
     _state = DriveState::HOME_MOVE_CENTER;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home");
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering after home to %d",
+                  (int)_center_move_target);
 }
 
 void AP_ModbusSteering::finish_home()
@@ -803,6 +812,8 @@ void AP_ModbusSteering::update(float steering_out)
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("center timeout");
+        } else if (_got_status && alarmed()) {
+            abort_home("alarm during center");
         } else if (step_err <= arrive && !running) {
             if (!_center_step_settling) {
                 _center_step_settling = true;
@@ -815,6 +826,7 @@ void AP_ModbusSteering::update(float steering_out)
                     _init_attempts = 0;
                 } else {
                     _state = DriveState::HOME_MOVE_CENTER;
+                    _home_center_prep = 3;
                     _home_center_run_spd = true;
                 }
             }
@@ -987,8 +999,20 @@ void AP_ModbusSteering::update(float steering_out)
         }
         break;
     case DriveState::HOME_MOVE_CENTER:
-        if (!_home_center_run_spd) {
-            send_u16(REG_MAX_SPD, calib_crawl_rpm());
+        // Re-arm absolute positioning after native home before stepping.
+        if (_home_center_prep == 0) {
+            send_u16(REG_MOTOR_ENABLE, 0x0001);
+            _home_center_prep = 1;
+            break;
+        }
+        if (_home_center_prep == 1) {
+            send_u16(REG_POS_MODE, 0x0001);
+            _home_center_prep = 2;
+            break;
+        }
+        if (_home_center_prep == 2) {
+            send_u16(REG_MAX_SPD, calib_speed_rpm());
+            _home_center_prep = 3;
             _home_center_run_spd = true;
             break;
         }
@@ -1017,6 +1041,11 @@ void AP_ModbusSteering::update(float steering_out)
             _home_start_ms = now;
             _got_status = false;
             _state = DriveState::HOME_WAIT_CENTER;
+            if ((now - _last_home_progress_ms) > 2000) {
+                _last_home_progress_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center step %d -> %d",
+                              (int)_actual_pulses, (int)next_target);
+            }
         }
         break;
     case DriveState::HOME_WAIT_CENTER:

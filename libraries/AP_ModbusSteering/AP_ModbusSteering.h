@@ -111,6 +111,7 @@ private:
     bool _saw_home_clear = false;
     bool _home_read_encoder = false;
     bool _home_center_run_spd = false;
+    uint8_t _home_center_prep = 0;
     bool _home_leg_settling = false;
     uint32_t _home_leg_settle_ms = 0;
     bool _center_step_settling = false;
