@@ -533,8 +533,10 @@ def run_rc_buttons():
         if not calibrated:
             print("FAIL: homing button did not finish calibration")
             return 1
-        if not wait_for_log(sim_lines, "HOME START", 2):
-            print("FAIL: simulator did not see HOME START")
+        # Dual-limit uses speed-mode seek (SPEED START); legacy native home used HOME START.
+        if not (wait_for_log(sim_lines, "SPEED START", 2) or
+                wait_for_log(sim_lines, "HOME START", 2)):
+            print("FAIL: simulator did not see SPEED/HOME START")
             return 1
         if not wait_for_log(sim_lines, "POSITION ZEROED", 2):
             print("FAIL: simulator did not zero after limit 1")
