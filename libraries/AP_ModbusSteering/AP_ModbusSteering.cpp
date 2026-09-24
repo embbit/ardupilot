@@ -589,7 +589,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v6",
+                  "CL57R: cal@limit ofs %d v7",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1137,7 +1137,9 @@ void AP_ModbusSteering::update(float steering_out)
                 } else if (_follow_prep == 6) {
                     send_u16(0x0032, MID_SEEK_DECEL_MS);
                 } else if (_follow_prep == 7) {
-                    send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
+                    // Do not rewrite TRACK_ERR here — 0xFFFF can raise Modbus
+                    // exception code 3 (illegal data) on this CL57R.
+                    send_u16(REG_MOTOR_ENABLE, 0x0001);
                 } else {
                     // Do not AUX_POS_ZERO on the pressed limit — it aggravates faults.
                     _center_encoder_origin = _actual_pulses;
@@ -1307,17 +1309,15 @@ void AP_ModbusSteering::update(float steering_out)
                 ((_follow_sign < 0 && enc <= target) ||
                  (_follow_sign > 0 && enc >= target));
             const int32_t stop_db = (_steer_cmd_offset != 0) ? mid_stop : arrive_db;
-            if (crossed_mid || abs_err <= stop_db) {
+            if (_steer_cmd_offset != 0 && (crossed_mid || abs_err <= stop_db)) {
                 if (_follow_moving) {
                     send_u16(REG_MOTION, MOTION_STOP);
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
-                } else if (_steer_cmd_offset != 0 &&
-                           (stick_pulses <= arrive_db && stick_pulses >= -arrive_db)) {
-                    // Physical mid: re-base command frame to current encoder.
-                    // Do NOT AUX_POS_ZERO here — the drive zero races Modbus reads
-                    // and caused a phantom ±200k chase at run MAX_SPD (broke sticks).
+                } else if (stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                    // Physical mid: re-base. Do NOT AUX_POS_ZERO (drive may also
+                    // spontaneously re-zero — stick-center must HOLD, not chase 0).
                     _center_encoder_origin = _actual_pulses;
                     _steer_cmd_offset = 0;
                     _have_target = true;
@@ -1329,17 +1329,34 @@ void AP_ModbusSteering::update(float steering_out)
                 } else {
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                 }
-            } else if (_steer_cmd_offset == 0 &&
-                       abs_err > (travel_limit_pulses() + arrive_db)) {
-                // Encoder frame desync — never chase at run speed across full travel.
-                send_u16(REG_MOTION, MOTION_STOP);
-                _center_encoder_origin = _actual_pulses;
-                _follow_moving = false;
-                _follow_sign = 0;
-                _follow_slot = 0;
-                _last_target = stick_pulses;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: follow rebase (desync)");
-            } else {
+                _state = DriveState::RUN_READ;
+                break;
+            }
+
+            // After mid: stick-center means HOLD pose. Never chase encoder zero —
+            // a drive re-zero after ready made v6 drive back into the limit at
+            // run RPM (enc≈+193k, target 0) and crunch the gearbox.
+            if (_steer_cmd_offset == 0 &&
+                stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                if (_follow_moving) {
+                    send_u16(REG_MOTION, MOTION_STOP);
+                    _follow_moving = false;
+                    _follow_sign = 0;
+                    _follow_slot = 0;
+                    _follow_last_spd = 0;
+                } else if (abs_err > arrive_db) {
+                    _center_encoder_origin = _actual_pulses;
+                    _last_target = 0;
+                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                } else {
+                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                }
+                _state = DriveState::RUN_READ;
+                break;
+            }
+
+            // Stick deflected (or still seeking mid): speed-mode follow.
+            {
                 const int8_t want_sign = (err > 0) ? 1 : -1;
                 // Mid return: half HOME_SPD; after an alarm rebase use crawl RPM.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
