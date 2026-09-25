@@ -13,6 +13,10 @@ CL57R_STEPS_PER_REV = 4000
 DEFAULT_MAX_RPM = 120
 DEFAULT_ACCEL_MS = 400
 DEFAULT_DECEL_MS = 400
+# Soft mechanical stops for speed-mode limit seek (dual-limit cal).
+# Full travel ≈ 2 * SPEED_HARD_STOP; keep in line with SITL OUT_REV*RATIO*PPR
+# (2*10*4000=80000) so measured travel passes the plausibility check.
+SPEED_HARD_STOP = 40000
 
 # NEMA23 + 25:1 gearbox + rudder load (reflected inertia at motor shaft)
 NEMA23_INERTIA_FACTOR = 1.35
@@ -26,7 +30,10 @@ class Nema23Motor:
         self.position = 0.0
         self.velocity = 0.0
         self.driver_target = 0
+        self.pending_cmd = 0
         self.max_rpm = DEFAULT_MAX_RPM
+        self.max_rpm_signed = DEFAULT_MAX_RPM
+        self.speed_mode = False
         self.accel_ms = DEFAULT_ACCEL_MS
         self.decel_ms = DEFAULT_DECEL_MS
         self.motor_enabled = False
@@ -37,9 +44,35 @@ class Nema23Motor:
         self.track_err_limit = 8000
         self.encoder_lag_s = 0.0
         self.reported_position = 0.0
+        self.home_done = False
+        self.home_rpm = 0
+        self.home_finish_at = 0.0
+        self.home_runs = 0
+        self.di_state = 0
         # Alarm/stall: когда True, мотор НЕ исполняет команды позиции,
         # пока не придёт alarm-clear (0x0037=0x0004). Моделирует tracking error.
         self.alarmed = False
+
+    def refresh_status(self):
+        status = 0
+        if abs(self.position - self.driver_target) < 80 and abs(self.velocity) < 1:
+            status |= 1 << 0
+        if self.home_done:
+            status |= 1 << 1
+        if abs(self.velocity) > 1:
+            status |= 1 << 2
+        if self.alarmed:
+            status |= 1 << 3
+        if self.motor_enabled:
+            status |= 1 << 4
+        self.status_word = status
+        # X1=P-OT (bit1) near +hard stop, X2=N-OT (bit2) near -hard stop.
+        di = 0
+        if self.position >= SPEED_HARD_STOP - 500:
+            di |= (1 << 1)
+        if self.position <= -SPEED_HARD_STOP + 500:
+            di |= (1 << 2)
+        self.di_state = di
 
     @property
     def max_vel(self):
@@ -68,10 +101,26 @@ class Nema23Motor:
     def set_driver_target(self, pos):
         self.driver_target = pos
 
+    def set_pending_cmd(self, pos):
+        # Target register write alone must not start motion (CL57R needs 0x0036 Bit0).
+        self.pending_cmd = int(pos)
+
+    def apply_motion_start(self, motion_word):
+        """Start positioning only when Bit0 is set (official CL57R Modbus doc)."""
+        if (motion_word & 0x0001) == 0:
+            return False
+        if (motion_word & 0x0002) != 0:
+            # Absolute
+            self.driver_target = self.pending_cmd
+        else:
+            # Relative
+            self.driver_target = int(round(self.position)) + self.pending_cmd
+        return True
+
     def clear_alarm(self):
         self.alarmed = False
         self.error_code = 0
-        self.status_word &= ~(1 << 3)
+        self.refresh_status()
 
     def raise_alarm(self):
         self.alarmed = True
@@ -86,15 +135,70 @@ class Nema23Motor:
         if self.alarmed:
             # Мотор в alarm: не двигается, ждёт alarm-clear. Позиция заморожена.
             self.velocity = 0.0
+            self.speed_mode = False
+        elif self.home_finish_at > 0.0:
+            self.speed_mode = False
+            error = self.driver_target - self.position
+            if abs(error) > 80.0:
+                direction = 1.0 if error > 0 else -1.0
+                self.velocity = self.max_vel * 0.4 * direction
+                new_pos = self.position + self.velocity * dt_s
+                if ((self.position - self.driver_target) * (new_pos - self.driver_target)) <= 0:
+                    self.position = float(self.driver_target)
+                    self.velocity = 0.0
+                else:
+                    self.position = new_pos
+            else:
+                # Arrived at limit: CL57R native home zeros the position reference.
+                self.home_finish_at = 0.0
+                self.home_done = True
+                self.position = 0.0
+                self.reported_position = 0.0
+                self.driver_target = 0
+                self.velocity = 0.0
         elif not self.motor_enabled:
+            self.speed_mode = False
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
+        elif self.speed_mode and link_active:
+            # Continuous speed mode (0x0036 Bit3): run at signed MAX_SPD.
+            direction = 1.0 if self.max_rpm_signed >= 0 else -1.0
+            target_vel = self.max_vel * direction
+            if abs(self.velocity - target_vel) < 1.0:
+                self.velocity = target_vel
+            elif self.velocity < target_vel:
+                self.velocity = min(target_vel, self.velocity + self.max_accel * dt_s)
+            else:
+                self.velocity = max(target_vel, self.velocity - self.max_accel * dt_s)
+            self.position += self.velocity * dt_s
+            self.driver_target = int(round(self.position))
+            # Hard stop models hitting a mechanical limit during dual-limit seek.
+            if self.position >= SPEED_HARD_STOP:
+                self.position = float(SPEED_HARD_STOP)
+                self.driver_target = SPEED_HARD_STOP
+                self.raise_alarm()
+                print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
+            elif self.position <= -SPEED_HARD_STOP:
+                self.position = float(-SPEED_HARD_STOP)
+                self.driver_target = -SPEED_HARD_STOP
+                self.raise_alarm()
+                print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
         elif link_active:
             self._track_target(dt_s)
-            self.position += self.velocity * dt_s
+            new_pos = self.position + self.velocity * dt_s
+            if ((self.position - self.driver_target) * (new_pos - self.driver_target)) < 0:
+                self.position = float(self.driver_target)
+                self.velocity = 0.0
+            else:
+                self.position = new_pos
         else:
             self._coast(dt_s)
-            self.position += self.velocity * dt_s
+            new_pos = self.position + self.velocity * dt_s
+            if ((self.position - self.driver_target) * (new_pos - self.driver_target)) < 0:
+                self.position = float(self.driver_target)
+                self.velocity = 0.0
+            else:
+                self.position = new_pos
 
         lag = max(self.encoder_lag_s, 0.0)
         if lag > 0.0:
@@ -122,6 +226,10 @@ class Nema23Motor:
         if abs(error) < 0.5 and abs(self.velocity) < 1.0:
             self.velocity = 0.0
             self.position = float(self.driver_target)
+            return
+        if abs(error) <= max(abs(self.velocity) * dt_s * 1.5, 80.0):
+            self.position = float(self.driver_target)
+            self.velocity = 0.0
             return
 
         direction = 1.0 if error > 0 else -1.0
@@ -275,24 +383,70 @@ def handle_write_single(reg_addr, val):
     if reg_addr == 0x0030:
         pass  # start speed
     elif reg_addr == 0x0033:
-        motor.max_rpm = val
+        # Signed RPM (-3000..3000) per CL57R doc.
+        if val >= 0x8000:
+            motor.max_rpm_signed = val - 0x10000
+        else:
+            motor.max_rpm_signed = val
+        motor.max_rpm = abs(motor.max_rpm_signed)
+        print(f"[CL57R Modbus Sim] MAX_SPD={motor.max_rpm_signed}")
     elif reg_addr == 0x0031:
         motor.accel_ms = val
     elif reg_addr == 0x0032:
         motor.decel_ms = val
+    elif reg_addr == 0x0041:
+        motor.home_rpm = val
+        print(f"[CL57R Modbus Sim] HOME_SPD={val}")
     elif reg_addr == 0x0038:
         motor.motor_enabled = (val == 0x0001)
         if not motor.motor_enabled:
             motor.velocity = 0.0
+            motor.speed_mode = False
             print("[CL57R Modbus Sim] MOTOR DISABLE")
     elif reg_addr == 0x0037 and val == 0x0004:
+        print("[CL57R Modbus Sim] ALARM CLEAR write")
         if motor.alarmed:
             print("[CL57R Modbus Sim] ALARM CLEARED by driver")
         motor.clear_alarm()
+    elif reg_addr == 0x0037 and val == 0x0008:
+        motor.position = 0.0
+        motor.reported_position = 0.0
+        motor.driver_target = 0
+        motor.pending_cmd = 0
+        motor.velocity = 0.0
+        motor.home_done = False
+        print("[CL57R Modbus Sim] POSITION ZEROED")
     elif reg_addr == 0x0052:
         motor.track_err_limit = val
+    elif reg_addr == 0x0036 and (val & 0x0010):
+        motor.clear_alarm()
+        motor.speed_mode = False
+        motor.home_done = False
+        motor.home_runs += 1
+        motor.home_finish_at = time.time() + 1.5
+        if motor.home_runs == 1:
+            motor.driver_target = 0
+        else:
+            motor.driver_target = 80000
+        if motor.home_rpm:
+            motor.max_rpm = motor.home_rpm
+            motor.max_rpm_signed = motor.home_rpm
+        print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs}")
+    elif reg_addr == 0x0036 and (val & 0x0008):
+        motor.speed_mode = True
+        print(f"[CL57R Modbus Sim] SPEED START rpm={motor.max_rpm_signed}")
+    elif reg_addr == 0x0036 and (val & 0x0020):
+        motor.speed_mode = False
+        motor.velocity = 0.0
+        motor.driver_target = int(round(motor.position))
+        print("[CL57R Modbus Sim] MOTION STOP")
+    elif reg_addr == 0x0036 and (val & 0x0001):
+        motor.speed_mode = False
+        if motor.apply_motion_start(val):
+            print(f"[CL57R Modbus Sim] MOTION START 0x{val:04X} target={motor.driver_target}")
     elif reg_addr == 0x0036:
-        pass  # motion trigger handled via 0x10 position write
+        # Bit1 alone (0x0002) or other bits without Bit0 must not start motion.
+        print(f"[CL57R Modbus Sim] MOTION write 0x{val:04X} (no start)")
 
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
@@ -397,7 +551,7 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                     elif func_code == 0x10:
                         if reg_addr == 0x0034 and len(req) >= 13:
                             cmd = decode_position_write(req)
-                            motor.set_driver_target(cmd)
+                            motor.set_pending_cmd(cmd)
                             sim_state["last_cmd_target"] = cmd
                             _log_telemetry(now, cmd)
                         response.append(slave_id)
@@ -417,13 +571,23 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                             response.append((low_word >> 8) & 0xFF)
                             response.append(low_word & 0xFF)
                         elif reg_addr == 0x0003:
+                            motor.refresh_status()
+                            qty = (req[4] << 8) | req[5]
                             response.append(slave_id)
                             response.append(0x03)
-                            response.append(0x04)
+                            response.append(0x02 if qty <= 1 else 0x04)
                             response.append(0)
                             response.append(motor.status_word & 0xFF)
-                            response.append(0)
-                            response.append(motor.error_code & 0xFF)
+                            if qty >= 2:
+                                response.append(0)
+                                response.append(motor.error_code & 0xFF)
+                        elif reg_addr == 0x0005:
+                            motor.refresh_status()
+                            response.append(slave_id)
+                            response.append(0x03)
+                            response.append(0x02)
+                            response.append((motor.di_state >> 8) & 0xFF)
+                            response.append(motor.di_state & 0xFF)
 
                     if len(response) > 0 and addr is not None:
                         crc = modbus_crc(response)

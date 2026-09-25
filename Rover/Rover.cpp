@@ -569,10 +569,13 @@ void Rover::modbus_steering_update()
 {
     float current_steering = 0.0f;
 
-    // MANUAL: read channel_steer (RCMAP roll) via get_radio_in()/norm_input()
-    // so physical RC, RC_CHANNELS_OVERRIDE and QGC joystick all work.
-    // motors.get_steering() is not used here: throttle failsafe zeros that path.
-    if (control_mode == &mode_manual) {
+    // Prefer fresh MANUAL_CONTROL from QGC — RC overrides are cleared on Radio
+    // Failsafe, which always trips when no physical TX is present.
+    const uint32_t now_ms = AP_HAL::millis();
+    if (gcs_steering_ms != 0 && (now_ms - gcs_steering_ms) < 500) {
+        current_steering = gcs_steering_norm;
+    } else if (control_mode == &mode_manual) {
+        // Physical RC / RC_CHANNELS_OVERRIDE path.
         RC_Channel *steer_ch = channel_steer;
         if (steer_ch != nullptr) {
             const uint16_t raw_pwm = steer_ch->get_radio_in();
@@ -587,10 +590,8 @@ void Rover::modbus_steering_update()
 
     modbus_steering.update(current_steering);
 
-    // STR_IN is independent of Modbus telemetry: if it stays 0 while moving
-    // sticks, the problem is RC/RCMAP/override, not the CL57R driver.
+    // STR_IN: if this stays 0 while moving QGC sticks, joystick is not reaching us.
     static uint32_t last_str_in_ms;
-    const uint32_t now_ms = AP_HAL::millis();
     if (now_ms - last_str_in_ms >= 100) {
         last_str_in_ms = now_ms;
         gcs().send_named_float("STR_IN", current_steering);
