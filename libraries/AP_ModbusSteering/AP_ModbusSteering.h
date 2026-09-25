@@ -173,6 +173,7 @@ private:
     bool _leg1_recovered = false; // L1 found DI after an alarm overshoot
     bool _recover_saw_motion = false;
     uint32_t _recover_start_ms = 0;
+    bool _di_extreme_latched = false; // this leg finished via DI latch
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;

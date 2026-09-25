@@ -338,6 +338,7 @@ void AP_ModbusSteering::latch_di_extreme_and_finish(uint32_t now)
     _home_leg_settle_ms = now + 120;
     _home_stop_pending = true;
     _home_crawl_resume_pending = false;
+    _di_extreme_latched = true;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                   "CL57R: DI extreme travel %d di=0x%04x",
                   (int)_leg_peak_travel, (unsigned)_di_word);
@@ -663,8 +664,10 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         }
         const int32_t expected = expected_full_travel_pulses();
         // POS_ZERO race finished leg2 in ~100ms with peak≈leg1 travel.
+        // Skip when this leg latched a real DI extreme.
         const uint32_t leg2_ms = AP_HAL::millis() - _home_start_ms;
-        if (leg2_ms < 1500 &&
+        if (!_di_extreme_latched &&
+            leg2_ms < 1500 &&
             expected >= 20000 &&
             full_travel >= expected / 3) {
             GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
@@ -969,7 +972,9 @@ void AP_ModbusSteering::advance_home()
         _home_clear_pending = false;
         _home_soft_spd_pending = false;
         _home_crawl_resume_pending = false;
+        _home_soft_spd_pending = false;
         _recover_saw_motion = false;
+        _di_extreme_latched = false;
         if (_home_speed_leg) {
             const char *phase = "crawl";
             if (_cal_phase == CalPhase::LEG2_SEEK) {
@@ -1124,6 +1129,9 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t min_hit = (expected >= 20000)
                 ? MIN(expected / 10, (int32_t)15000)
                 : 8000;
+            // Leg2 must not latch a mid-stroke DI glitch; require ~40% estimate.
+            const int32_t min_di = (_home_leg == 0) ? min_hit :
+                ((expected >= 20000) ? MAX(min_hit, (expected * 2) / 5) : min_hit);
             const bool busy = _home_stop_pending || _home_clear_pending ||
                               _home_soft_spd_pending || _home_crawl_resume_pending;
             if (_got_di && !target_limit_di_active()) {
@@ -1160,7 +1168,14 @@ void AP_ModbusSteering::update(float steering_out)
                                    !opposite_limit_di_active() && !both_limits_di;
                 const bool recover_ready = (now - _recover_start_ms) > 600;
                 if (di_on && recover_ready) {
-                    latch_di_extreme_and_finish(now);
+                    const int32_t rec_delta = _actual_pulses - _home_start_pulses;
+                    const int32_t at = (rec_delta >= 0) ? rec_delta : -rec_delta;
+                    // Ignore premature DI during leg2 recover (need real stroke).
+                    if (_home_leg == 1 && at < min_di) {
+                        // keep recovering
+                    } else {
+                        latch_di_extreme_and_finish(now);
+                    }
                 } else if (recover_ready && (now - _recover_start_ms) > 2500 &&
                            _got_status && alarmed() &&
                            (now - _last_home_progress_ms) > 1000) {
@@ -1200,7 +1215,7 @@ void AP_ModbusSteering::update(float steering_out)
                                 !opposite_limit_di_active() &&
                                 !both_limits_di &&
                                 _saw_home_motion &&
-                                _leg_peak_travel >= min_hit;
+                                _leg_peak_travel >= min_di;
             const bool alarm_past =
                 approach && seek_armed &&
                 ((_saw_home_motion && _got_status && alarmed()) || start_jam) &&
