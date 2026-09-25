@@ -1168,47 +1168,55 @@ void AP_ModbusSteering::update(float steering_out)
             if ((hit || stalled || past_expected) &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_crawl_resume_pending && !_home_leave_spd_pending) {
-                if (!past_expected && !di_hit && _leg_peak_travel < short_jam &&
-                    _home_early_retries < 6) {
+                if (!past_expected && !di_hit && _leg_peak_travel < short_jam) {
+                    // Peak frozen across continues = still jammed (v10j @5515 loop).
+                    const int32_t peak = _leg_peak_travel;
+                    const int32_t dp = (_home_stuck_peak >= 0)
+                        ? ((peak > _home_stuck_peak) ? (peak - _home_stuck_peak)
+                                                     : (_home_stuck_peak - peak))
+                        : 100000;
+                    if (_home_stuck_peak >= 0 && dp < 1000) {
+                        _home_stuck_hits++;
+                    } else {
+                        _home_stuck_peak = peak;
+                        _home_stuck_hits = 1;
+                    }
                     _home_early_retries++;
                     _home_leg_settling = false;
                     _home_stop_pending = true;
-                    if (_home_leg == 0 && !_home_dir_flip) {
+                    if (_home_stuck_hits >= 3) {
+                        if (_home_flip_count >= 4) {
+                            abort_home("stuck both directions");
+                        } else {
+                            _home_dir_flip = !_home_dir_flip;
+                            _home_flip_count++;
+                            _home_stuck_hits = 0;
+                            _home_stuck_peak = -1;
+                            _home_early_retries = 0;
+                            _home_leave_overshoot = false;
+                            _home_leave_spd_pending = false;
+                            _home_crawl_resume_pending = true;
+                            _home_start_pulses = _actual_pulses;
+                            _leg_peak_travel = 0;
+                            _saw_home_motion = false;
+                            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                                          "CL57R: stuck @%d, flip again #%u",
+                                          (int)peak, (unsigned)_home_flip_count);
+                        }
+                    } else if (_home_leg == 0 && !_home_dir_flip &&
+                               _home_early_retries <= 6) {
                         _home_leave_overshoot = true;
                         _home_leave_spd_pending = true;
                         _home_crawl_resume_pending = false;
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                       "CL57R: early hit %d, leave reverse %u",
-                                      (int)_leg_peak_travel,
-                                      (unsigned)_home_early_retries);
+                                      (int)peak, (unsigned)_home_early_retries);
                     } else {
-                        // Already flipped or leg2: keep same direction (don't undo flip).
                         _home_crawl_resume_pending = true;
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                       "CL57R: early hit %d, continue %u",
-                                      (int)_leg_peak_travel,
-                                      (unsigned)_home_early_retries);
+                                      (int)peak, (unsigned)_home_early_retries);
                     }
-                } else if (!past_expected && !di_hit && _leg_peak_travel < short_jam &&
-                           _home_leg == 0 && !_home_dir_flip) {
-                    _home_leg_settling = false;
-                    _home_leave_overshoot = true;
-                    _home_stop_pending = true;
-                    _home_leave_spd_pending = true;
-                    _home_crawl_resume_pending = false;
-                    _home_early_retries = 0;
-                    GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                                  "CL57R: refuse short L1 %d, keep leave",
-                                  (int)_leg_peak_travel);
-                } else if (!past_expected && !di_hit && _leg_peak_travel < short_jam) {
-                    // Flipped already but still short: clear and keep crawling same way.
-                    _home_leg_settling = false;
-                    _home_stop_pending = true;
-                    _home_crawl_resume_pending = true;
-                    _home_early_retries = 0;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: short hit %d after flip, continue",
-                                  (int)_leg_peak_travel);
                 } else if (!_home_leg_settling) {
                     _home_leg_settling = true;
                     _home_leg_settle_ms = now + 120;
