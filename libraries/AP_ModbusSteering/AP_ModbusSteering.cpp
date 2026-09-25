@@ -532,6 +532,17 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             full_travel = abs_now;
         }
         const int32_t expected = expected_full_travel_pulses();
+        // v10e: POS_ZERO race finished leg2 in ~100ms with peak≈leg1 travel.
+        const uint32_t leg2_ms = AP_HAL::millis() - _home_start_ms;
+        if (leg2_ms < 1500 &&
+            expected >= 20000 &&
+            full_travel >= expected / 3) {
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                          "CL57R: leg2 fake hit %d in %ums",
+                          (int)full_travel, (unsigned)leg2_ms);
+            abort_home("leg2 enc race, abort");
+            return;
+        }
         // After overshooting L1, leg2 often alarms on L1 again (~few k). Prefer
         // a plausible leg1 measurement over aborting cal.
         if (expected >= 20000 && full_travel < expected / 4 &&
@@ -604,7 +615,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10e",
+                  "CL57R: cal@limit ofs %d v10f",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -832,7 +843,8 @@ void AP_ModbusSteering::advance_home()
         }
         break;
     case DriveState::HOME_ZERO_AT_L1:
-        _state = DriveState::HOME_SET_METHOD;
+        // Clear residual L1 alarm before leg2 seek (v10e finish-on-stale-alarm).
+        _state = DriveState::HOME_CLEAR_ALARM;
         _got_echo = false;
         _init_attempts = 0;
         _saw_home_motion = false;
@@ -915,22 +927,39 @@ void AP_ModbusSteering::update(float steering_out)
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
         const int32_t delta = _actual_pulses - _home_start_pulses;
         const int32_t moved = (delta >= 0) ? delta : -delta;
+        bool enc_rebase = false;
         if (moved > _leg_peak_travel) {
-            _leg_peak_travel = moved;
-            _last_home_progress_ms = now;
-            if (delta > 0) {
-                _leg_dir_sign = 1;
-            } else if (delta < 0) {
-                _leg_dir_sign = -1;
+            // AUX_POS_ZERO after L1 can race: start_pulses captured pre-zero then
+            // encoder snaps → false peak ≈ full travel and instant "limit hit".
+            const int32_t expected_chk = expected_full_travel_pulses();
+            const int32_t jump = moved - _leg_peak_travel;
+            if (expected_chk >= 20000 && jump > expected_chk / 2 &&
+                (now - _home_start_ms) < 2500) {
+                _home_start_pulses = _actual_pulses;
+                _leg_peak_travel = 0;
+                _saw_home_motion = false;
+                _saw_home_run = false;
+                enc_rebase = true;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: seek enc jump, rebase");
+            } else {
+                _leg_peak_travel = moved;
+                _last_home_progress_ms = now;
+                if (delta > 0) {
+                    _leg_dir_sign = 1;
+                } else if (delta < 0) {
+                    _leg_dir_sign = -1;
+                }
             }
         }
         if (_got_status && !home_bit) {
             _saw_home_clear = true;
         }
-        if (moved >= MIN_HOME_LEG_MOTION) {
+        // After enc rebase, ignore stale moved from this cycle (would re-arm saw).
+        if (!enc_rebase && moved >= MIN_HOME_LEG_MOTION) {
             _saw_home_motion = true;
         }
-        if (running && moved >= 50) {
+        if (!enc_rebase && running && moved >= 50) {
             _saw_home_run = true;
         }
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
@@ -940,14 +969,18 @@ void AP_ModbusSteering::update(float steering_out)
             // never on OUT_REV alone — that ended leg2 before the 2nd switch.
             const int32_t expected = expected_full_travel_pulses();
             const int32_t soft_at = (expected >= 20000)
-                ? ((_home_leg == 0) ? (expected / 8) : (expected / 3))
+                ? ((_home_leg == 0) ? (expected / 4) : (expected / 2))
                 : 50000;
             // Reject short hits (esp. leg2 re-hitting overshot L1 at ~8k).
             const int32_t min_real = (expected >= 20000)
                 ? ((_home_leg == 0) ? (expected / 3) : (expected / 2))
                 : 20000;
+            // Soft approach only after real motion this leg (not a zero-race peak).
             if (!_home_soft_approaching && expected >= 20000 &&
-                _saw_home_motion && _leg_peak_travel >= soft_at &&
+                _saw_home_motion &&
+                _leg_peak_travel >= soft_at &&
+                _leg_peak_travel < (expected + expected / 2) &&
+                (now - _home_start_ms) > 500 &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_crawl_resume_pending) {
                 _home_soft_approaching = true;
@@ -960,9 +993,12 @@ void AP_ModbusSteering::update(float steering_out)
             const bool past_expected =
                 (expected >= 20000) &&
                 _saw_home_motion &&
+                (now - _home_start_ms) > 800 &&
                 (_leg_peak_travel >= expected + expected / 4);
-            const bool hit = _saw_home_motion && _got_status && alarmed();
-            const bool stalled = _saw_home_motion &&
+            // Residual L1 alarm + enc race must not finish leg2 in <1s (v10e).
+            const bool seek_armed = (now - _home_start_ms) > 800;
+            const bool hit = seek_armed && _saw_home_motion && _got_status && alarmed();
+            const bool stalled = seek_armed && _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
             if ((hit || stalled || past_expected) &&
@@ -1348,6 +1384,19 @@ void AP_ModbusSteering::update(float steering_out)
                         _follow_halted = false;
                         _follow_restore = 1;
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
+                    } else if (mid_return &&
+                               _follow_peak_toward < abs_goal / 8 &&
+                               _follow_alarm_count < 5) {
+                        // Still on the post-cal limit — leave at crawl, keep goal.
+                        // Force crawl RPM via mid_retried; keep alarm_count.
+                        _follow_mid_retried = true;
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_last_spd = 0;
+                        _follow_alarm_step = 0;
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: mid leave limit, crawl");
                     } else if (mid_return && !_follow_mid_retried) {
                         const int32_t remain = target - enc;
                         // Refuse a near-full-travel rebase after encoder wipe.
