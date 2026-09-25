@@ -604,7 +604,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10c",
+                  "CL57R: cal@limit ofs %d v10d",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -936,9 +936,9 @@ void AP_ModbusSteering::update(float steering_out)
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("home timeout");
         } else if (_home_speed_leg) {
-            // Speed-mode limit seek: stop on alarm/stall, or at OUT_REV estimate.
+            // Speed-mode limit seek: finish only on alarm/stall (real stop),
+            // never on OUT_REV alone — that ended leg2 before the 2nd switch.
             const int32_t expected = expected_full_travel_pulses();
-            // Soft approach earlier — switch crawl before the first switch.
             const int32_t soft_at = (expected >= 20000)
                 ? ((_home_leg == 0) ? (expected / 5) : (expected / 2))
                 : 50000;
@@ -956,19 +956,19 @@ void AP_ModbusSteering::update(float steering_out)
                               "CL57R: soft approach @%d",
                               (int)_leg_peak_travel);
             }
-            // Soft end at OUT_REV — do not grind past the estimate into a stop.
-            const bool at_expected =
+            // Emergency only: well past OUT_REV estimate (wrong params / missed switch).
+            const bool past_expected =
                 (expected >= 20000) &&
                 _saw_home_motion &&
-                (_leg_peak_travel >= (expected * 95) / 100);
+                (_leg_peak_travel >= expected + expected / 4);
             const bool hit = _saw_home_motion && _got_status && alarmed();
             const bool stalled = _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
-            if ((hit || stalled || at_expected) &&
+            if ((hit || stalled || past_expected) &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_crawl_resume_pending) {
-                if (!at_expected && _leg_peak_travel < min_real &&
+                if (!past_expected && _leg_peak_travel < min_real &&
                     _home_early_retries < 6) {
                     // Short alarm: leave limit / pass overshot L1, keep seeking.
                     _home_early_retries++;
@@ -984,9 +984,9 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_leg_settle_ms = now + 400;
                     _home_stop_pending = true;
                     _home_crawl_resume_pending = false;
-                    if (at_expected && !hit) {
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: seek at expected %d, stop",
+                    if (past_expected && !hit) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: seek past expected %d, stop",
                                       (int)_leg_peak_travel);
                     } else {
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
