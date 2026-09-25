@@ -432,6 +432,11 @@ void AP_ModbusSteering::start_home()
     _home_stop_pending = false;
     _home_clear_pending = false;
     _home_speed_leg = false;
+    _home_soft_approaching = false;
+    _home_soft_spd_pending = false;
+    _home_crawl_resume_pending = false;
+    _home_early_retries = 0;
+    _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
 }
@@ -503,13 +508,16 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
 {
     (void)now;
     if (dual_limit_home() && _home_leg == 0) {
+        _leg1_travel = _leg_peak_travel;
         _home_leg = 1;
+        _home_early_retries = 0;
         _state = DriveState::HOME_ZERO_AT_L1;
         _got_echo = false;
         _init_attempts = 0;
         _home_stop_pending = false;
         _home_clear_pending = false;
         _home_leg_settling = false;
+        _home_crawl_resume_pending = false;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 reached, zero and seek limit 2");
         return;
     }
@@ -523,13 +531,22 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         if (abs_now > full_travel) {
             full_travel = abs_now;
         }
+        const int32_t expected = expected_full_travel_pulses();
+        // After overshooting L1, leg2 often alarms on L1 again (~few k). Prefer
+        // a plausible leg1 measurement over aborting cal.
+        if (expected >= 20000 && full_travel < expected / 4 &&
+            _leg1_travel >= expected / 4 && _leg1_travel <= expected * 2) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "CL57R: leg2 short %d, use leg1 %d",
+                          (int)full_travel, (int)_leg1_travel);
+            full_travel = _leg1_travel;
+        }
         if (full_travel < MIN_MEASURED_TRAVEL) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: travel %d pulses (min %d)",
                           (int)full_travel, (int)MIN_MEASURED_TRAVEL);
             abort_home("measured travel too small (need both limits?)");
             return;
         }
-        const int32_t expected = expected_full_travel_pulses();
         // Only reject wildly wrong values; OUT_REV/RATIO are approximate until
         // dual-limit measurement replaces them. Speed-mode seek can measure
         // larger travel than a rough OUT_REV*RATIO estimate — allow 5x.
@@ -587,7 +604,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10b",
+                  "CL57R: cal@limit ofs %d v10c",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -801,6 +818,8 @@ void AP_ModbusSteering::advance_home()
         _home_clear_pending = false;
         _home_soft_approaching = false;
         _home_soft_spd_pending = false;
+        _home_crawl_resume_pending = false;
+        _home_early_retries = 0;
         if (_home_speed_leg) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
                           (unsigned)(_home_leg + 1),
@@ -917,39 +936,57 @@ void AP_ModbusSteering::update(float steering_out)
         if (now - _home_start_ms > HOME_TIMEOUT_MS) {
             abort_home("home timeout");
         } else if (_home_speed_leg) {
-            // Speed-mode limit seek: stop when we hit an alarm (hard stop /
-            // tracking) or stall after having moved.
+            // Speed-mode limit seek: stop on alarm/stall, or at OUT_REV estimate.
             const int32_t expected = expected_full_travel_pulses();
-            // Soft approach: drop to crawl before the far end so we do not
-            // overshoot the switch into the mechanical stop.
+            // Soft approach earlier — switch crawl before the first switch.
             const int32_t soft_at = (expected >= 20000)
-                ? ((_home_leg == 0) ? (expected / 3) : ((expected * 2) / 3))
+                ? ((_home_leg == 0) ? (expected / 5) : (expected / 2))
                 : 50000;
+            // Reject short hits (esp. leg2 re-hitting overshot L1 at ~8k).
+            const int32_t min_real = (expected >= 20000)
+                ? ((_home_leg == 0) ? (expected / 3) : (expected / 2))
+                : 20000;
             if (!_home_soft_approaching && expected >= 20000 &&
                 _saw_home_motion && _leg_peak_travel >= soft_at &&
-                !_home_stop_pending && !_home_clear_pending) {
+                !_home_stop_pending && !_home_clear_pending &&
+                !_home_crawl_resume_pending) {
                 _home_soft_approaching = true;
                 _home_soft_spd_pending = true;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                               "CL57R: soft approach @%d",
                               (int)_leg_peak_travel);
             }
-            const bool past_expected =
+            // Soft end at OUT_REV — do not grind past the estimate into a stop.
+            const bool at_expected =
                 (expected >= 20000) &&
                 _saw_home_motion &&
-                (_leg_peak_travel >= expected + expected / 10);
+                (_leg_peak_travel >= (expected * 95) / 100);
             const bool hit = _saw_home_motion && _got_status && alarmed();
             const bool stalled = _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
-            if ((hit || stalled || past_expected) && !_home_stop_pending && !_home_clear_pending) {
-                if (!_home_leg_settling) {
+            if ((hit || stalled || at_expected) &&
+                !_home_stop_pending && !_home_clear_pending &&
+                !_home_crawl_resume_pending) {
+                if (!at_expected && _leg_peak_travel < min_real &&
+                    _home_early_retries < 6) {
+                    // Short alarm: leave limit / pass overshot L1, keep seeking.
+                    _home_early_retries++;
+                    _home_leg_settling = false;
+                    _home_stop_pending = true;
+                    _home_crawl_resume_pending = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: early hit %d, continue %u",
+                                  (int)_leg_peak_travel,
+                                  (unsigned)_home_early_retries);
+                } else if (!_home_leg_settling) {
                     _home_leg_settling = true;
                     _home_leg_settle_ms = now + 400;
                     _home_stop_pending = true;
-                    if (past_expected && !hit) {
-                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                      "CL57R: seek past expected %d, stop",
+                    _home_crawl_resume_pending = false;
+                    if (at_expected && !hit) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: seek at expected %d, stop",
                                       (int)_leg_peak_travel);
                     } else {
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
@@ -962,6 +999,7 @@ void AP_ModbusSteering::update(float steering_out)
                 }
             } else if (_home_leg_settling &&
                        !_home_stop_pending && !_home_clear_pending &&
+                       !_home_crawl_resume_pending &&
                        now >= _home_leg_settle_ms) {
                 _home_leg_settling = false;
                 home_leg_done(now);
@@ -1644,6 +1682,21 @@ void AP_ModbusSteering::update(float steering_out)
             }
             send_u16(REG_MAX_SPD, (uint16_t)spd);
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: seek crawl spd=%d", (int)spd);
+            break;
+        }
+        if (_home_crawl_resume_pending) {
+            // After early short hit: clear done — resume crawl same direction
+            // (pass overshot L1 toward the real far limit).
+            _home_crawl_resume_pending = false;
+            int16_t spd = (int16_t)calib_crawl_rpm();
+            if (home_method_reg() == 18) {
+                spd = (int16_t)(-spd);
+            }
+            send_u16(REG_MAX_SPD, (uint16_t)spd);
+            _queued_motion = MOTION_SPEED;
+            _saw_home_motion = true;
+            _last_home_progress_ms = AP_HAL::millis();
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: continue crawl spd=%d", (int)spd);
             break;
         }
         if (_home_retry_pending) {

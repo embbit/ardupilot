@@ -150,6 +150,9 @@ private:
     bool _home_speed_leg = false;
     bool _home_soft_approaching = false;
     bool _home_soft_spd_pending = false;
+    bool _home_crawl_resume_pending = false;
+    uint8_t _home_early_retries = 0;
+    int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
     uint8_t _follow_alarm_count = 0;
