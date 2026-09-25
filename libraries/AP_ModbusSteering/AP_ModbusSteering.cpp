@@ -527,6 +527,7 @@ void AP_ModbusSteering::start_home()
     _home_crawl_pending = false;
     _home_crawl_away = false;
     _home_early_retries = 0;
+    _home_early_peak = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
@@ -696,6 +697,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _leg1_travel = _leg_peak_travel;
         _home_leg = 1;
         _home_early_retries = 0;
+        _home_early_peak = 0;
         _home_crawl_pending = false;
         _state = DriveState::HOME_ZERO_AT_L1;
         _got_echo = false;
@@ -820,7 +822,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v16",
+                  "CL57R: cal@limit ofs %d v17",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1046,6 +1048,7 @@ void AP_ModbusSteering::advance_home()
         _home_crawl_pending = false;
         _home_crawl_away = false;
         _home_early_retries = 0;
+        _home_early_peak = 0;
         _home_ignore_alarm_ms = 0;
         if (_home_speed_leg) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
@@ -1188,6 +1191,12 @@ void AP_ModbusSteering::update(float steering_out)
                 (_leg_peak_travel >= expected + expected / 8);
             if ((hit || stalled || past_expected) &&
                 !_home_stop_pending && !_home_clear_pending && !_home_crawl_pending) {
+                // Crawl made no further progress ⇒ jammed on a real stop/switch
+                // (started near that limit). Do not abort as "early only".
+                const bool stuck_on_stop =
+                    (_home_early_retries >= 1) &&
+                    (_leg_peak_travel >= 5000) &&
+                    (_leg_peak_travel <= _home_early_peak + 2000);
                 if (past_expected && !hit && !stalled) {
                     if (!_home_leg_settling) {
                         _home_leg_settling = true;
@@ -1202,7 +1211,9 @@ void AP_ModbusSteering::update(float steering_out)
                         _home_leg_settling = false;
                         home_leg_done(now);
                     }
-                } else if (_leg_peak_travel < min_real && _home_early_retries < 6) {
+                } else if (_leg_peak_travel < min_real && !stuck_on_stop &&
+                           _home_early_retries < 6) {
+                    _home_early_peak = _leg_peak_travel;
                     _home_early_retries++;
                     _home_leg_settling = false;
                     _home_stop_pending = true;
@@ -1212,9 +1223,7 @@ void AP_ModbusSteering::update(float steering_out)
                                   "CL57R: early alarm %d, crawl retry %u",
                                   (int)_leg_peak_travel,
                                   (unsigned)_home_early_retries);
-                } else if (_leg_peak_travel < min_real) {
-                    // Do not accept a short hit as an endstop — that placed mid
-                    // on a hard stop (TRACK_ERR too tight / no real limit).
+                } else if (_leg_peak_travel < min_real && !stuck_on_stop) {
                     abort_home("early limits only; raise TRACK_ERR / check mech");
                 } else if (!_home_leg_settling) {
                     _home_leg_settling = true;
@@ -1222,9 +1231,15 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_stop_pending = true;
                     _home_crawl_pending = false;
                     _home_crawl_away = false;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: limit hit travel %d",
-                                  (int)_leg_peak_travel);
+                    if (stuck_on_stop && _leg_peak_travel < min_real) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: limit hit (stuck) %d",
+                                      (int)_leg_peak_travel);
+                    } else {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: limit hit travel %d",
+                                      (int)_leg_peak_travel);
+                    }
                 } else if (now >= _home_leg_settle_ms) {
                     _home_leg_settling = false;
                     home_leg_done(now);

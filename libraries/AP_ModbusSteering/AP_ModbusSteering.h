@@ -162,6 +162,7 @@ private:
     bool _home_crawl_pending = false;   // resume seek at crawl after early alarm
     bool _home_crawl_away = false;      // crawl opposite of method (limit already on)
     uint8_t _home_early_retries = 0;
+    int32_t _home_early_peak = 0;       // peak travel at last early-alarm crawl
     int32_t _leg1_travel = 0;           // peak travel of dual-limit leg 1
     bool _jog_active = false;
     int8_t _jog_sign = 0;
