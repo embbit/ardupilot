@@ -604,7 +604,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10d",
+                  "CL57R: cal@limit ofs %d v10e",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -940,7 +940,7 @@ void AP_ModbusSteering::update(float steering_out)
             // never on OUT_REV alone — that ended leg2 before the 2nd switch.
             const int32_t expected = expected_full_travel_pulses();
             const int32_t soft_at = (expected >= 20000)
-                ? ((_home_leg == 0) ? (expected / 5) : (expected / 2))
+                ? ((_home_leg == 0) ? (expected / 8) : (expected / 3))
                 : 50000;
             // Reject short hits (esp. leg2 re-hitting overshot L1 at ~8k).
             const int32_t min_real = (expected >= 20000)
@@ -980,8 +980,9 @@ void AP_ModbusSteering::update(float steering_out)
                                   (int)_leg_peak_travel,
                                   (unsigned)_home_early_retries);
                 } else if (!_home_leg_settling) {
+                    // Real endstop: hard STOP immediately, short settle only.
                     _home_leg_settling = true;
-                    _home_leg_settle_ms = now + 400;
+                    _home_leg_settle_ms = now + 120;
                     _home_stop_pending = true;
                     _home_crawl_resume_pending = false;
                     if (past_expected && !hit) {
@@ -1521,15 +1522,36 @@ void AP_ModbusSteering::update(float steering_out)
                         max_rpm = gentle;
                     }
                 }
-                // Soft approach only in the last ~0.25s of travel (not a full
-                // second — that made mid crawl for most of the half-travel).
-                const int32_t slow_zone = MAX((int32_t)2000,
-                                             (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60 / 4);
+                // Brake before target: ~0.75s of cruise travel for stick-center
+                // return (was ~0.25s and overshot mid to -7k). Mid-cal seek uses
+                // ~0.5s so HOME_SPD still covers most of the half-travel.
+                const int32_t brake_div =
+                    (_steer_cmd_offset == 0 &&
+                     stick_pulses <= arrive_db && stick_pulses >= -arrive_db) ? 1 : 2;
+                const int32_t slow_zone = MAX((int32_t)4000,
+                                             (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60 / brake_div);
                 uint16_t rpm = max_rpm;
                 if (slow_zone > 0 && abs_err < slow_zone) {
-                    const uint16_t min_rpm = (_steer_cmd_offset != 0) ? 80 : 80;
+                    const uint16_t min_rpm = 60;
                     rpm = (uint16_t)MAX((int32_t)min_rpm,
                                         (int32_t)max_rpm * abs_err / slow_zone);
+                }
+                // Already crossed mid while returning — hard stop, do not hunt.
+                if (_steer_cmd_offset == 0 &&
+                    stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
+                    _follow_moving &&
+                    ((_follow_sign < 0 && enc <= 0) ||
+                     (_follow_sign > 0 && enc >= 0))) {
+                    send_u16(REG_MOTION, MOTION_STOP);
+                    _follow_moving = false;
+                    _follow_sign = 0;
+                    _follow_slot = 0;
+                    _follow_last_spd = 0;
+                    _center_encoder_origin = _actual_pulses;
+                    _last_target = 0;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: mid cross stop");
+                    _state = DriveState::RUN_READ;
+                    break;
                 }
                 const int16_t signed_spd = (int16_t)((int32_t)rpm * (int32_t)want_sign);
                 if (_follow_moving && _follow_sign != want_sign) {
@@ -1640,7 +1662,12 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     }
     case DriveState::HOME_SET_ACCEL:
-        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
+        // Speed-mode dual-limit seek uses run accel/decel regs (not native home).
+        if (dual_limit_home()) {
+            send_u16(0x0032, MID_SEEK_DECEL_MS);
+        } else {
+            send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
+        }
         break;
     case DriveState::HOME_ENABLE:
         send_u16(REG_MOTOR_ENABLE, 0x0001);
