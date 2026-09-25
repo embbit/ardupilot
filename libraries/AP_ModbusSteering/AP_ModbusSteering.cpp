@@ -587,7 +587,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10a",
+                  "CL57R: cal@limit ofs %d v10b",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1411,24 +1411,42 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
-            // After mid is locked (_steer_cmd_offset==0): stick-center means
-            // return to / hold physical mid (enc==0 vs origin). Do NOT rebase
-            // the origin on stick-center — that left the rudder wherever the
-            // stick was released (no spring-back to zero).
+            // After mid is locked (_steer_cmd_offset==0): stick-center returns
+            // to physical mid — but NEVER chase a near-full-travel error while
+            // stick is centered. CL57R often re-zeros after mid-ready; chasing
+            // phantom enc≈±half→0 slams the far stop (v6 / v10a).
             if (_steer_cmd_offset == 0 &&
-                stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
-                abs_err <= arrive_db) {
-                if (_follow_moving) {
-                    send_u16(REG_MOTION, MOTION_STOP);
+                stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                const int32_t half = travel_limit_pulses();
+                if (half > 5000 && abs_err > (half * 3) / 4) {
+                    if (_follow_moving) {
+                        send_u16(REG_MOTION, MOTION_STOP);
+                    }
+                    _center_encoder_origin = _actual_pulses;
+                    _last_target = 0;
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
                     _follow_last_spd = 0;
-                } else {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    _follow_alarm_count = 0;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: mid enc jump %d, hold", (int)enc);
+                    _state = DriveState::RUN_READ;
+                    break;
                 }
-                _state = DriveState::RUN_READ;
-                break;
+                if (abs_err <= arrive_db) {
+                    if (_follow_moving) {
+                        send_u16(REG_MOTION, MOTION_STOP);
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_last_spd = 0;
+                    } else {
+                        send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    }
+                    _state = DriveState::RUN_READ;
+                    break;
+                }
             }
 
             // Stick deflected, or stick centered but off mid → speed-mode follow
@@ -1451,11 +1469,19 @@ void AP_ModbusSteering::update(float steering_out)
                     }
                 }
                 const int8_t want_sign = (err > 0) ? 1 : -1;
-                // Mid return: full HOME_SPD; after an alarm rebase use crawl RPM.
+                // Mid return: HOME_SPD; stick-center return to mid: gentle.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    mid_seek_speed_rpm() : run_speed_rpm();
                 if (_steer_cmd_offset != 0 && _follow_mid_retried) {
                     max_rpm = calib_crawl_rpm();
+                }
+                if (_steer_cmd_offset == 0 &&
+                    stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                    const uint16_t gentle = (uint16_t)MAX((int)calib_crawl_rpm(),
+                                                          (int)run_speed_rpm() / 2);
+                    if (max_rpm > gentle) {
+                        max_rpm = gentle;
+                    }
                 }
                 // Soft approach only in the last ~0.25s of travel (not a full
                 // second — that made mid crawl for most of the half-travel).
