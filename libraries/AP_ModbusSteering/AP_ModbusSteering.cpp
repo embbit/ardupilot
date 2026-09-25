@@ -1024,10 +1024,12 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t soft_at = (expected >= 20000)
                 ? ((_home_leg == 0) ? (expected / 4) : (expected / 2))
                 : 50000;
-            // Reject short hits (esp. leg2 re-hitting overshot L1 at ~8k).
-            const int32_t min_real = (expected >= 20000)
-                ? ((_home_leg == 0) ? (expected / 3) : (expected / 2))
-                : 20000;
+            // Soft approach only after real motion this leg (not a zero-race peak).
+            // short_jam: only reverse-leave when travel is tiny (hardware ~6k past switch).
+            // Do not key off OUT_REV/3 — estimate can dwarf the true stroke.
+            const int32_t short_jam = (expected >= 20000)
+                ? MIN(expected / 10, (int32_t)15000)
+                : 8000;
             // Soft approach only after real motion this leg (not a zero-race peak).
             if (!_home_soft_approaching && !_home_leave_overshoot && expected >= 20000 &&
                 _saw_home_motion &&
@@ -1105,21 +1107,31 @@ void AP_ModbusSteering::update(float steering_out)
             if ((hit || stalled || past_expected) &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_crawl_resume_pending && !_home_leave_spd_pending) {
-                if (!past_expected && !di_hit && _leg_peak_travel < min_real &&
+                if (!past_expected && !di_hit && _leg_peak_travel < short_jam &&
                     _home_early_retries < 6) {
-                    // Short alarm past a switch into hard stop: reverse leave.
                     _home_early_retries++;
                     _home_leg_settling = false;
-                    _home_leave_overshoot = true;
                     _home_stop_pending = true;
-                    _home_leave_spd_pending = true;
-                    _home_crawl_resume_pending = false;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: early hit %d, leave reverse %u",
-                                  (int)_leg_peak_travel,
-                                  (unsigned)_home_early_retries);
-                } else if (!past_expected && !di_hit && _leg_peak_travel < min_real) {
-                    // Never accept a few-k false L1 after exhausted retries.
+                    if (_home_leg == 0) {
+                        // Leg1 start jammed past a switch: reverse toward the other stop.
+                        _home_leave_overshoot = true;
+                        _home_leave_spd_pending = true;
+                        _home_crawl_resume_pending = false;
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: early hit %d, leave reverse %u",
+                                      (int)_leg_peak_travel,
+                                      (unsigned)_home_early_retries);
+                    } else {
+                        // Leg2: still on/past L1 — crawl same way toward L2.
+                        _home_crawl_resume_pending = true;
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: early hit %d, continue %u",
+                                      (int)_leg_peak_travel,
+                                      (unsigned)_home_early_retries);
+                    }
+                } else if (!past_expected && !di_hit && _leg_peak_travel < short_jam &&
+                           _home_leg == 0) {
+                    // Never accept a few-k false L1 after exhausted reverse leaves.
                     _home_leg_settling = false;
                     _home_leave_overshoot = true;
                     _home_stop_pending = true;
