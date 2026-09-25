@@ -53,11 +53,13 @@ class Nema23Motor:
         self.alarmed = False
 
     def di_word(self):
-        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT (pressed at soft mechanical stops).
+        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT. Assert slightly before hard stop
+        # so firmware can stop on DI ahead of TRACK_ERR/alarm.
         word = 0
-        if self.position >= SPEED_HARD_STOP - 50:
+        margin = max(int(SPEED_HARD_STOP * 0.05), 200)
+        if self.position >= SPEED_HARD_STOP - margin:
             word |= (1 << 1)
-        if self.position <= -SPEED_HARD_STOP + 50:
+        if self.position <= -SPEED_HARD_STOP + margin:
             word |= (1 << 2)
         return word
 
