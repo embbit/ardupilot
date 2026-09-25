@@ -16,6 +16,7 @@ extern const AP_HAL::HAL &hal;
 namespace {
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
+constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
 constexpr uint16_t REG_HOME_METHOD = 0x0040;
 constexpr uint16_t REG_HOME_SPD = 0x0041;
@@ -43,6 +44,9 @@ constexpr uint16_t MOTION_STOP = 0x0020;
 constexpr uint16_t MOTION_ESTOP = 0x0040;
 constexpr uint16_t STATUS_HOME_DONE = (1U << 1);
 constexpr uint16_t STATUS_RUNNING = (1U << 2);
+// CL57R 0x0005: Bit1=X1 (default P-OT), Bit2=X2 (default N-OT).
+constexpr uint16_t DI_X1 = (1U << 1);
+constexpr uint16_t DI_X2 = (1U << 2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
@@ -229,6 +233,18 @@ uint16_t AP_ModbusSteering::home_method_reg() const
         return first == 17 ? 18 : 17;
     }
     return first;
+}
+
+bool AP_ModbusSteering::target_limit_di_active() const
+{
+    if (!_got_di) {
+        return false;
+    }
+    // M17 homes to negative limit (X2 N-OT); M18 to positive (X1 P-OT).
+    if (home_method_reg() == 18) {
+        return (_di_word & DI_X1) != 0;
+    }
+    return (_di_word & DI_X2) != 0;
 }
 
 uint16_t AP_ModbusSteering::run_speed_rpm() const
@@ -615,7 +631,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10f",
+                  "CL57R: cal@limit ofs %d v10g",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -712,6 +728,9 @@ void AP_ModbusSteering::consume_rx()
             if (_rx_expect == RxExpect::STATUS && byte_count >= 2) {
                 _status_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 _got_status = true;
+            } else if (_rx_expect == RxExpect::DI_INPUT && byte_count >= 2) {
+                _di_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
+                _got_di = true;
             } else if (_rx_expect == RxExpect::ENCODER && byte_count == 0x04 && frame_len >= 9) {
                 const uint16_t high_word = (_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 const uint16_t low_word = (_rx_buf[offset + 5] << 8) | _rx_buf[offset + 6];
@@ -820,7 +839,11 @@ void AP_ModbusSteering::advance_home()
         _leg_peak_travel = 0;
         _leg_dir_sign = 0;
         _home_read_encoder = false;
+        _home_poll_phase = 0;
         _got_status = false;
+        _got_di = false;
+        _di_word = 0;
+        _saw_target_di_clear = false;
         _saw_home_run = false;
         _saw_home_motion = false;
         _saw_home_clear = false;
@@ -850,6 +873,9 @@ void AP_ModbusSteering::advance_home()
         _saw_home_motion = false;
         _saw_home_run = false;
         _saw_home_clear = false;
+        _got_di = false;
+        _saw_target_di_clear = false;
+        _home_poll_phase = 0;
         _home_start_ms = AP_HAL::millis();
         _last_home_progress_ms = _home_start_ms;
         break;
@@ -989,6 +1015,14 @@ void AP_ModbusSteering::update(float steering_out)
                               "CL57R: soft approach @%d",
                               (int)_leg_peak_travel);
             }
+            if (_got_di && !target_limit_di_active()) {
+                _saw_target_di_clear = true;
+            }
+            // Primary: stop on the limit DI we are seeking (X1 P-OT / X2 N-OT).
+            // Require DI clear first so we do not finish while still on the start stop.
+            const bool di_hit = _got_di && _saw_target_di_clear &&
+                                target_limit_di_active() && _saw_home_motion &&
+                                _leg_peak_travel >= MIN_HOME_LEG_MOTION;
             // Emergency only: well past OUT_REV estimate (wrong params / missed switch).
             const bool past_expected =
                 (expected >= 20000) &&
@@ -996,15 +1030,17 @@ void AP_ModbusSteering::update(float steering_out)
                 (now - _home_start_ms) > 800 &&
                 (_leg_peak_travel >= expected + expected / 4);
             // Residual L1 alarm + enc race must not finish leg2 in <1s (v10e).
+            // Alarm is fallback when DI is missing/miswired — not the primary stop.
             const bool seek_armed = (now - _home_start_ms) > 800;
-            const bool hit = seek_armed && _saw_home_motion && _got_status && alarmed();
+            const bool alarm_hit = seek_armed && _saw_home_motion && _got_status && alarmed();
+            const bool hit = di_hit || alarm_hit;
             const bool stalled = seek_armed && _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
             if ((hit || stalled || past_expected) &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_crawl_resume_pending) {
-                if (!past_expected && _leg_peak_travel < min_real &&
+                if (!past_expected && !di_hit && _leg_peak_travel < min_real &&
                     _home_early_retries < 6) {
                     // Short alarm: leave limit / pass overshot L1, keep seeking.
                     _home_early_retries++;
@@ -1021,7 +1057,11 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_leg_settle_ms = now + 120;
                     _home_stop_pending = true;
                     _home_crawl_resume_pending = false;
-                    if (past_expected && !hit) {
+                    if (di_hit) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: DI limit hit travel %d di=0x%04x",
+                                      (int)_leg_peak_travel, (unsigned)_di_word);
+                    } else if (past_expected && !hit) {
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                       "CL57R: seek past expected %d, stop",
                                       (int)_leg_peak_travel);
@@ -1793,14 +1833,29 @@ void AP_ModbusSteering::update(float steering_out)
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
             break;
         }
-        if (_home_read_encoder) {
+        // Speed-mode dual-limit: poll encoder / status / DI(0x0005) round-robin
+        // so we can stop on X1/X2 before TRACK_ERR/alarm.
+        if (_home_speed_leg) {
+            if (_home_poll_phase == 0) {
+                _rx_expect = RxExpect::ENCODER;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+            } else if (_home_poll_phase == 1) {
+                _rx_expect = RxExpect::STATUS;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
+            } else {
+                _rx_expect = RxExpect::DI_INPUT;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_DI_STATUS, 1, tx_packet);
+            }
+            _home_poll_phase = (uint8_t)((_home_poll_phase + 1) % 3);
+        } else if (_home_read_encoder) {
             _rx_expect = RxExpect::ENCODER;
             modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+            _home_read_encoder = false;
         } else {
             _rx_expect = RxExpect::STATUS;
             modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
+            _home_read_encoder = true;
         }
-        _home_read_encoder = !_home_read_encoder;
         _uart->write(tx_packet, 8);
         if (!_saw_home_motion && (now - _home_start_ms) > 3000 &&
             (now - _last_home_retry_ms) > 3000) {

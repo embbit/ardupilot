@@ -51,6 +51,7 @@ private:
         NONE = 0,
         ENCODER,
         STATUS,
+        DI_INPUT,
     };
 
     int32_t travel_limit_pulses() const;
@@ -70,6 +71,7 @@ private:
     uint16_t home_first_method() const;
     uint16_t home_method_reg() const;
     bool dual_limit_home() const;
+    bool target_limit_di_active() const;
     void home_leg_done(uint32_t now);
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
@@ -115,6 +117,10 @@ private:
     bool _saw_home_motion = false;
     bool _saw_home_clear = false;
     bool _home_read_encoder = false;
+    uint8_t _home_poll_phase = 0; // 0=enc, 1=status, 2=DI(0x0005)
+    bool _got_di = false;
+    uint16_t _di_word = 0;
+    bool _saw_target_di_clear = false;
     bool _home_center_run_spd = false;
     uint8_t _home_center_prep = 0;
     bool _center_resend = false;
