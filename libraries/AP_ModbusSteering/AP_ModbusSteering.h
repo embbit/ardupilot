@@ -162,6 +162,8 @@ private:
     // Past a limit into the hard stop: crawl opposite to leave, then resume seek.
     bool _home_leave_overshoot = false;
     bool _home_leave_spd_pending = false;
+    // Start jammed into a stop with no encoder motion: invert seek/DI for this leg.
+    bool _home_dir_flip = false;
     uint8_t _home_early_retries = 0;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;

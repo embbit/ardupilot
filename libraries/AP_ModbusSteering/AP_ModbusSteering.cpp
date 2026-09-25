@@ -240,8 +240,9 @@ bool AP_ModbusSteering::target_limit_di_active() const
     if (!_got_di) {
         return false;
     }
-    // M17 homes to negative limit (X2 N-OT); M18 to positive (X1 P-OT).
-    if (home_method_reg() == 18) {
+    // M17 → X2 N-OT; M18 → X1 P-OT. _home_dir_flip swaps after a start jam.
+    const bool want_x1 = (home_method_reg() == 18) != _home_dir_flip;
+    if (want_x1) {
         return (_di_word & DI_X1) != 0;
     }
     return (_di_word & DI_X2) != 0;
@@ -252,8 +253,8 @@ bool AP_ModbusSteering::opposite_limit_di_active() const
     if (!_got_di) {
         return false;
     }
-    // The limit we are NOT seeking this leg (overshoot / start-on-stop).
-    if (home_method_reg() == 18) {
+    const bool want_x1 = (home_method_reg() == 18) != _home_dir_flip;
+    if (want_x1) {
         return (_di_word & DI_X2) != 0;
     }
     return (_di_word & DI_X1) != 0;
@@ -262,7 +263,9 @@ bool AP_ModbusSteering::opposite_limit_di_active() const
 int16_t AP_ModbusSteering::seek_speed_signed(uint16_t rpm) const
 {
     int16_t spd = (int16_t)rpm;
-    if (home_method_reg() == 18) {
+    // M18 default is negative seek; flip inverts after start jam.
+    const bool neg = (home_method_reg() == 18) != _home_dir_flip;
+    if (neg) {
         spd = (int16_t)(-spd);
     }
     return spd;
@@ -474,6 +477,7 @@ void AP_ModbusSteering::start_home()
     _home_crawl_resume_pending = false;
     _home_leave_overshoot = false;
     _home_leave_spd_pending = false;
+    _home_dir_flip = false;
     _home_early_retries = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
@@ -559,6 +563,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _home_crawl_resume_pending = false;
         _home_leave_overshoot = false;
         _home_leave_spd_pending = false;
+        _home_dir_flip = false;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 reached, zero and seek limit 2");
         return;
     }
@@ -656,7 +661,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10h",
+                  "CL57R: cal@limit ofs %d v10i",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -880,6 +885,7 @@ void AP_ModbusSteering::advance_home()
         _home_crawl_resume_pending = false;
         _home_leave_overshoot = false;
         _home_leave_spd_pending = false;
+        _home_dir_flip = false;
         _home_early_retries = 0;
         if (_home_speed_leg) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
@@ -1046,6 +1052,25 @@ void AP_ModbusSteering::update(float steering_out)
             }
             if (_got_di && !target_limit_di_active()) {
                 _saw_target_di_clear = true;
+            }
+            // Jammed into a hard stop from boot: no encoder motion, often already alarmed.
+            // Flip seek+DI and crawl the other way (do not keep retrying into the jam).
+            if (!_home_leave_overshoot && !_home_dir_flip &&
+                !_saw_home_motion && _home_leg == 0 &&
+                !_home_stop_pending && !_home_clear_pending &&
+                !_home_crawl_resume_pending && !_home_leave_spd_pending &&
+                (now - _home_start_ms) > 1500) {
+                const bool stuck_alarm = _got_status && alarmed();
+                const bool stuck_quiet = (now - _home_start_ms) > 2500;
+                if (stuck_alarm || stuck_quiet) {
+                    _home_dir_flip = true;
+                    _home_leg_settling = false;
+                    _home_stop_pending = true;
+                    _home_crawl_resume_pending = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                                  "CL57R: no motion, flip seek%s",
+                                  stuck_alarm ? " (alarm)" : "");
+                }
             }
             // Leaving an overshoot: crawl toward the other stop. Accept that DI as L1,
             // or resume original seek once free of the jam / wrong-limit DI.
@@ -1913,6 +1938,16 @@ void AP_ModbusSteering::update(float steering_out)
         if (_home_retry_pending) {
             // Dedicated slot: never piggy-back home restart on a status read.
             _home_retry_pending = false;
+            if (_home_speed_leg && !_saw_home_motion && _home_leg == 0 &&
+                !_home_dir_flip) {
+                // Same-dir retry into a hard stop never moves — flip instead.
+                _home_dir_flip = true;
+                send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+                _home_crawl_resume_pending = true;
+                GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                              "CL57R: home retry→flip seek");
+                break;
+            }
             if (_home_speed_leg) {
                 const int16_t spd = seek_speed_signed(calib_speed_rpm());
                 send_u16(REG_MAX_SPD, (uint16_t)spd);
