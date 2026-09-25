@@ -66,6 +66,7 @@ constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
+    // --- link ---
     // @Param: SLAVE_ID
     // @DisplayName: Modbus Slave ID
     // @Description: CL57R Modbus slave address
@@ -79,12 +80,29 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("REG_ADDR", 2, AP_ModbusSteering, reg_address, 52),
 
+    // --- geometry ---
+    // @Param: OUT_REV
+    // @DisplayName: Rudder Lock-to-Lock Turns
+    // @Description: Output-shaft turns lock-to-lock. If >0, travel limit is OUT_REV*RATIO*4000/2 pulses.
+    // @Units: rev
+    // @Range: 0 20
+    // @User: Standard
+    AP_GROUPINFO("OUT_REV", 8, AP_ModbusSteering, out_rev, 4),
+
+    // @Param: RATIO
+    // @DisplayName: Gearbox Ratio
+    // @Description: Gearbox ratio (motor rev per output rev)
+    // @Range: 1 200
+    // @User: Standard
+    AP_GROUPINFO("RATIO", 9, AP_ModbusSteering, ratio, 25),
+
     // @Param: MAX_STEPS
     // @DisplayName: Maximum Steering Steps
-    // @Description: Pulses at full stick (+/-1) when OUT_REV=0. Otherwise OUT_REV*RATIO*4000/2.
+    // @Description: Pulses at full stick (+/-1) when OUT_REV=0. Dual-limit cal overwrites with measured half-travel.
     // @User: Standard
     AP_GROUPINFO("MAX_STEPS", 3, AP_ModbusSteering, max_steps, 200000),
 
+    // --- armed run ---
     // @Param: START_SPD
     // @DisplayName: Positioning start speed
     // @Description: CL57R trapezoid start speed (register 0x0030) for positioning/speed moves after init
@@ -115,21 +133,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("RET_SLEW", 7, AP_ModbusSteering, ret_slew, 0),
 
-    // @Param: OUT_REV
-    // @DisplayName: Rudder Lock-to-Lock Turns
-    // @Description: Output-shaft turns lock-to-lock. If >0, travel limit is OUT_REV*RATIO*4000/2 pulses.
-    // @Units: rev
-    // @Range: 0 20
-    // @User: Standard
-    AP_GROUPINFO("OUT_REV", 8, AP_ModbusSteering, out_rev, 4),
-
-    // @Param: RATIO
-    // @DisplayName: Gearbox Ratio
-    // @Description: Gearbox ratio (motor rev per output rev)
-    // @Range: 1 200
-    // @User: Standard
-    AP_GROUPINFO("RATIO", 9, AP_ModbusSteering, ratio, 25),
-
+    // --- RC ---
     // @Param: RST_CH
     // @DisplayName: Alarm reset RC channel
     // @Description: RC channel that clears the CL57R alarm on a rising edge (PWM above 1800). 0 disables the button.
@@ -137,50 +141,51 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("RST_CH", 10, AP_ModbusSteering, rst_ch, 0),
 
-    // @Param: HOME_CH
-    // @DisplayName: Homing RC channel
-    // @Description: RC channel that starts CL57R homing on a rising edge (PWM above 1800). Clears the alarm first, then homes to the limit and shifts zero to mid-travel. Ignored while armed. 0 disables the button.
+    // @Param: CAL_CH
+    // @DisplayName: Calibration RC channel
+    // @Description: RC channel that starts dual-limit calibration on a rising edge (PWM above 1800). Ignored while armed. 0 disables.
     // @Range: 0 16
     // @User: Standard
-    AP_GROUPINFO("HOME_CH", 11, AP_ModbusSteering, home_ch, 0),
+    AP_GROUPINFO("CAL_CH", 11, AP_ModbusSteering, cal_ch, 0),
 
-    // @Param: HOME_MTH
-    // @DisplayName: CL57R first home method
-    // @Description: First limit for homing. 17 searches the negative limit (X2 N-OT). 18 searches the positive limit (X1 P-OT). In DualLimit mode the driver homes to the opposite limit second and measures travel.
+    // --- calibration ---
+    // @Param: CAL_MODE
+    // @DisplayName: Calibration mode
+    // @Description: 0 uses one limit switch and OUT_REV/RATIO for center. 1 seeks both limits, measures lock-to-lock travel, centers at mid, saves half-travel to MAX_STEPS.
+    // @Values: 0:SingleLimit,1:DualLimit
+    // @User: Standard
+    AP_GROUPINFO("CAL_MODE", 15, AP_ModbusSteering, cal_mode, 1),
+
+    // @Param: CAL_MTH
+    // @DisplayName: First limit method
+    // @Description: First limit for calibration. 17 = negative limit (X2 N-OT). 18 = positive limit (X1 P-OT). DualLimit then seeks the opposite limit.
     // @Values: 17:NegativeLimit,18:PositiveLimit
     // @Range: 17 18
     // @User: Standard
-    AP_GROUPINFO("HOME_MTH", 12, AP_ModbusSteering, home_mth, 17),
+    AP_GROUPINFO("CAL_MTH", 12, AP_ModbusSteering, cal_mth, 17),
 
-    // @Param: HOME_SPD
-    // @DisplayName: Homing approach speed
-    // @Description: CL57R SEEK speed during dual-limit calibration (register 0x0041 and speed-mode MAX_SPD). Leg1 and the last ~20% of leg2 use CRAWL_SPD. Mid return after cal also uses this SEEK speed.
+    // @Param: SEEK_SPD
+    // @DisplayName: Calibration SEEK speed
+    // @Description: Fast SEEK RPM during dual-limit cal (CL57R 0x0041 and speed-mode MAX_SPD). Used for leg2 cruise and mid return. Near-limit crawl uses CRAWL_SPD.
     // @Units: RPM
     // @Range: 5 3000
     // @User: Standard
-    AP_GROUPINFO("HOME_SPD", 13, AP_ModbusSteering, home_speed, 1800),
-
-    // @Param: HOME_TRIG
-    // @DisplayName: Homing trigger
-    // @Description: Start CL57R actions from the GCS. Set to 1 to start calibration (alarm clear, home, center, zero). Set to 2 to clear the alarm only. Ignored while armed. Resets to 0 when the action completes or is rejected.
-    // @Values: 0:None,1:Calibrate,2:ClearAlarm
-    // @User: Standard
-    AP_GROUPINFO("HOME_TRIG", 14, AP_ModbusSteering, home_trig, 0),
-
-    // @Param: HOME_MODE
-    // @DisplayName: Homing mode
-    // @Description: 0 uses one limit switch and OUT_REV/RATIO for center and travel. 1 homes to both limits, measures encoder travel lock-to-lock, centers at the midpoint, and saves half-travel to MAX_STEPS.
-    // @Values: 0:SingleLimit,1:DualLimit
-    // @User: Standard
-    AP_GROUPINFO("HOME_MODE", 15, AP_ModbusSteering, home_mode, 1),
+    AP_GROUPINFO("SEEK_SPD", 13, AP_ModbusSteering, seek_speed, 1800),
 
     // @Param: CRAWL_SPD
-    // @DisplayName: Homing crawl speed
-    // @Description: Slow speed for dual-limit cal near the stops (leg1 whole travel, leg2 last ~20%, and pass-through after an alarm L1). Also written to CL57R HOME_CRAWL (0x0042, capped at 300).
+    // @DisplayName: Calibration crawl speed
+    // @Description: Slow RPM near the stops (leg1, leg2 last ~20%, pass after alarm L1). Also written to CL57R 0x0042 (capped at 300).
     // @Units: RPM
     // @Range: 5 300
     // @User: Standard
     AP_GROUPINFO("CRAWL_SPD", 16, AP_ModbusSteering, crawl_speed, 200),
+
+    // @Param: CAL_TRIG
+    // @DisplayName: Calibration trigger
+    // @Description: GCS trigger. 1 = start calibration. 2 = clear alarm only. Ignored while armed. Resets to 0 when done or rejected.
+    // @Values: 0:None,1:Calibrate,2:ClearAlarm
+    // @User: Standard
+    AP_GROUPINFO("CAL_TRIG", 14, AP_ModbusSteering, cal_trig, 0),
 
     AP_GROUPEND
 };
@@ -227,12 +232,12 @@ bool AP_ModbusSteering::home_prep_wait_echo() const
 
 bool AP_ModbusSteering::dual_limit_home() const
 {
-    return home_mode.get() == 1;
+    return cal_mode.get() == 1;
 }
 
 uint16_t AP_ModbusSteering::home_first_method() const
 {
-    return home_mth.get() == 18 ? 18 : 17;
+    return cal_mth.get() == 18 ? 18 : 17;
 }
 
 uint16_t AP_ModbusSteering::home_method_reg() const
@@ -249,7 +254,7 @@ bool AP_ModbusSteering::target_limit_di_active() const
     if (!_got_di) {
         return false;
     }
-    // M17 → X2 N-OT; M18 → X1 P-OT. First direction is always HOME_MTH.
+    // M17 → X2 N-OT; M18 → X1 P-OT. First direction is always CAL_MTH.
     const bool want_x1 = (home_method_reg() == 18);
     if (want_x1) {
         return (_di_word & DI_X1) != 0;
@@ -290,7 +295,7 @@ uint16_t AP_ModbusSteering::run_speed_rpm() const
 
 uint16_t AP_ModbusSteering::calib_speed_rpm() const
 {
-    const int16_t rpm = home_speed.get();
+    const int16_t rpm = seek_speed.get();
     if (rpm < 5) {
         return 1800;
     }
@@ -315,7 +320,7 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Same cruise as dual-limit speed-mode seek (OB_STR_HOME_SPD).
+    // Same cruise as dual-limit speed-mode seek (OB_STR_SEEK_SPD).
     return calib_speed_rpm();
 }
 
@@ -491,28 +496,28 @@ void AP_ModbusSteering::start_home()
 
 void AP_ModbusSteering::poll_param_trigger()
 {
-    const int8_t trig = home_trig.get();
-    if (!_home_trig_inited) {
-        _home_trig_last = trig;
-        _home_trig_inited = true;
+    const int8_t trig = cal_trig.get();
+    if (!_cal_trig_inited) {
+        _cal_trig_last = trig;
+        _cal_trig_inited = true;
         return;
     }
     if (trig == 0) {
-        _home_trig_last = 0;
+        _cal_trig_last = 0;
         return;
     }
 
     if (hal.util->get_soft_armed()) {
-        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: HOME_TRIG ignored, armed");
-        home_trig.set_and_save(0);
-        _home_trig_last = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: CAL_TRIG ignored, armed");
+        cal_trig.set_and_save(0);
+        _cal_trig_last = 0;
         return;
     }
 
-    if (trig == _home_trig_last) {
+    if (trig == _cal_trig_last) {
         return;
     }
-    _home_trig_last = trig;
+    _cal_trig_last = trig;
 
     if (trig == 1) {
         if (in_home()) {
@@ -524,12 +529,12 @@ void AP_ModbusSteering::poll_param_trigger()
             abort_home("alarm clear");
         }
         request_alarm_clear();
-        home_trig.set_and_save(0);
-        _home_trig_last = 0;
+        cal_trig.set_and_save(0);
+        _cal_trig_last = 0;
     } else {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: invalid HOME_TRIG %d", (int)trig);
-        home_trig.set_and_save(0);
-        _home_trig_last = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: invalid CAL_TRIG %d", (int)trig);
+        cal_trig.set_and_save(0);
+        _cal_trig_last = 0;
     }
 }
 
@@ -537,7 +542,7 @@ void AP_ModbusSteering::poll_rc_buttons()
 {
     const uint32_t now = AP_HAL::millis();
     const bool rst_edge = rc_rising_edge(rst_ch.get(), _rst_was_high);
-    const bool home_edge = rc_rising_edge(home_ch.get(), _home_was_high);
+    const bool home_edge = rc_rising_edge(cal_ch.get(), _home_was_high);
     if (now - _last_button_ms < BUTTON_LOCKOUT_MS) {
         return;
     }
@@ -695,8 +700,8 @@ void AP_ModbusSteering::finish_home()
     _alarm_clear_pending = true;
     _enable_after_alarm_clear = true;
     _rx_expect = RxExpect::NONE;
-    if (home_trig.get() == 1) {
-        home_trig.set_and_save(0);
+    if (cal_trig.get() == 1) {
+        cal_trig.set_and_save(0);
     }
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: calibrated");
 }
@@ -707,8 +712,8 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _state = DriveState::RUN_WRITE;
     _have_target = false;
     _rx_expect = RxExpect::NONE;
-    if (home_trig.get() == 1) {
-        home_trig.set_and_save(0);
+    if (cal_trig.get() == 1) {
+        cal_trig.set_and_save(0);
     }
 }
 
@@ -862,7 +867,7 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_ENABLE;
         break;
     case DriveState::HOME_ENABLE:
-        // Dual-limit: drive toward the stop in speed mode so HOME_SPD/CRAWL
+        // Dual-limit: drive toward the stop in speed mode so SEEK_SPD/CRAWL
         // are used. Native MOTION_HOME on this CL57R often ignores SEEK.
         if (dual_limit_home()) {
             _home_speed_leg = true;
@@ -1331,7 +1336,7 @@ void AP_ModbusSteering::update(float steering_out)
         if (!_speed_follow && _got_status && alarmed() &&
             (now - _last_alarm_warn_ms) > 5000) {
             _last_alarm_warn_ms = now;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: alarm latched, HOME_TRIG=2");
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: alarm latched, CAL_TRIG=2");
         }
     } else if (home_prep_wait_echo()) {
         if (_got_echo) {
@@ -1406,7 +1411,7 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t err = target - enc;
             const int32_t abs_err = (err >= 0) ? err : -err;
             const int32_t arrive_db = MAX(pos_db.get(), 800);
-            // Brake window ~125ms of cruise travel, capped so high HOME_SPD
+            // Brake window ~125ms of cruise travel, capped so high SEEK_SPD
             // still reaches near mid (not stop 50k early).
             const uint16_t mid_rpm = mid_seek_speed_rpm();
             int32_t mid_stop = (int32_t)mid_rpm * CL57R_STEPS_PER_REV / 60 / 8;
@@ -1710,7 +1715,7 @@ void AP_ModbusSteering::update(float steering_out)
                     }
                 }
                 const int8_t want_sign = (err > 0) ? 1 : -1;
-                // Mid return: HOME_SPD; stick-center return to mid: gentle.
+                // Mid return: SEEK_SPD; stick-center return to mid: gentle.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    mid_seek_speed_rpm() : run_speed_rpm();
                 if (_steer_cmd_offset != 0 && _follow_mid_retried) {
@@ -1726,7 +1731,7 @@ void AP_ModbusSteering::update(float steering_out)
                 }
                 // Brake before target: ~0.75s of cruise travel for stick-center
                 // return (was ~0.25s and overshot mid to -7k). Mid-cal seek uses
-                // ~0.5s so HOME_SPD still covers most of the half-travel.
+                // ~0.5s so SEEK_SPD still covers most of the half-travel.
                 const int32_t brake_div =
                     (_steer_cmd_offset == 0 &&
                      stick_pulses <= arrive_db && stick_pulses >= -arrive_db) ? 1 : 2;
@@ -1848,7 +1853,7 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_SET_SPD: {
         const uint16_t spd = calib_speed_rpm();
         send_u16(REG_HOME_SPD, spd);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write HOME_SPD=%u", (unsigned)spd);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write SEEK_SPD=%u", (unsigned)spd);
         break;
     }
     case DriveState::HOME_SET_RUN_SPD: {

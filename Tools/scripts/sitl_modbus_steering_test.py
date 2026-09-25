@@ -381,11 +381,11 @@ def run_param_trigger():
 
         int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
         int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
-        set_param(mavlink, "OB_STR_HOME_TRIG", 0, int8)
+        set_param(mavlink, "OB_STR_CAL_TRIG", 0, int8)
         time.sleep(0.5)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_HOME_SPD", 1800, int16)
+        set_param(mavlink, "OB_STR_SEEK_SPD", 1800, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -393,15 +393,15 @@ def run_param_trigger():
             print("FAIL: simulator did not raise tracking alarm")
             return 1
 
-        set_param(mavlink, "OB_STR_HOME_TRIG", 2, int8)
+        set_param(mavlink, "OB_STR_CAL_TRIG", 2, int8)
         time.sleep(1.0)
         collect_mavlink_events(mavlink, 2, events)
         if not wait_for_log(sim_lines, "ALARM CLEAR write", 5):
-            print("FAIL: HOME_TRIG=2 did not clear alarm")
+            print("FAIL: CAL_TRIG=2 did not clear alarm")
             return 1
-        print("PASS: HOME_TRIG=2 cleared alarm")
+        print("PASS: CAL_TRIG=2 cleared alarm")
 
-        set_param(mavlink, "OB_STR_HOME_TRIG", 1, int8)
+        set_param(mavlink, "OB_STR_CAL_TRIG", 1, int8)
         calibrated = False
         deadline = time.time() + 45
         while time.time() < deadline:
@@ -410,7 +410,7 @@ def run_param_trigger():
                 calibrated = True
                 break
         if not calibrated:
-            print("FAIL: HOME_TRIG=1 did not finish calibration")
+            print("FAIL: CAL_TRIG=1 did not finish calibration")
             return 1
         if not (wait_for_log(sim_lines, "SPEED START", 2) or
                 wait_for_log(sim_lines, "HOME START", 2)):
@@ -430,7 +430,7 @@ def run_param_trigger():
         if not mid_ok and not any("spd-follow" in t for t in events):
             print("FAIL: missing speed-follow mid return after cal")
             return 1
-        print("PASS: HOME_TRIG=1 calibrated steering")
+        print("PASS: CAL_TRIG=1 calibrated steering")
 
         set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
         try_arm(mavlink)
@@ -503,10 +503,10 @@ def run_rc_buttons():
         int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
         int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
         set_param(mavlink, "OB_STR_RST_CH", 6, int8)
-        set_param(mavlink, "OB_STR_HOME_CH", 7, int8)
+        set_param(mavlink, "OB_STR_CAL_CH", 7, int8)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_HOME_SPD", 1800, int16)
+        set_param(mavlink, "OB_STR_SEEK_SPD", 1800, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -687,7 +687,7 @@ def main():
             return rc
 
     if args.test in ("param-trigger", "all"):
-        print("=== HOME_TRIG PARAM TEST ===")
+        print("=== CAL_TRIG PARAM TEST ===")
         rc = run_param_trigger()
         if rc != 0:
             return rc
