@@ -52,6 +52,15 @@ class Nema23Motor:
         # пока не придёт alarm-clear (0x0037=0x0004). Моделирует tracking error.
         self.alarmed = False
 
+    def di_word(self):
+        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT (pressed at soft mechanical stops).
+        word = 0
+        if self.position >= SPEED_HARD_STOP - 50:
+            word |= (1 << 1)
+        if self.position <= -SPEED_HARD_STOP + 50:
+            word |= (1 << 2)
+        return word
+
     def refresh_status(self):
         status = 0
         if abs(self.position - self.driver_target) < 80 and abs(self.velocity) < 1:
@@ -573,6 +582,13 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                             if qty >= 2:
                                 response.append(0)
                                 response.append(motor.error_code & 0xFF)
+                        elif reg_addr == 0x0005:
+                            di = motor.di_word()
+                            response.append(slave_id)
+                            response.append(0x03)
+                            response.append(0x02)
+                            response.append((di >> 8) & 0xFF)
+                            response.append(di & 0xFF)
 
                     if len(response) > 0 and addr is not None:
                         crc = modbus_crc(response)
