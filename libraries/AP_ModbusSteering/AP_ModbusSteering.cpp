@@ -47,6 +47,7 @@ constexpr uint16_t STATUS_RUNNING = (1U << 2);
 // CL57R 0x0005: Bit1=X1 (default P-OT), Bit2=X2 (default N-OT).
 constexpr uint16_t DI_X1 = (1U << 1);
 constexpr uint16_t DI_X2 = (1U << 2);
+constexpr uint16_t DI_LIMIT_MASK = (DI_X1 | DI_X2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
@@ -551,6 +552,18 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
 {
     (void)now;
     if (dual_limit_home() && _home_leg == 0) {
+        // Refuse a few-k false L1 (leave-hit with both DI / hard-stop twitch).
+        const int32_t expected = expected_full_travel_pulses();
+        const int32_t min_l1 = (expected >= 20000)
+            ? MIN(expected / 10, (int32_t)15000)
+            : 8000;
+        if (_leg_peak_travel < min_l1) {
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                          "CL57R: refuse L1 travel %d (min %d)",
+                          (int)_leg_peak_travel, (int)min_l1);
+            abort_home("L1 travel too short");
+            return;
+        }
         _leg1_travel = _leg_peak_travel;
         _home_leg = 1;
         _home_early_retries = 0;
@@ -661,7 +674,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10i",
+                  "CL57R: cal@limit ofs %d v10j",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -1053,10 +1066,9 @@ void AP_ModbusSteering::update(float steering_out)
             if (_got_di && !target_limit_di_active()) {
                 _saw_target_di_clear = true;
             }
-            // Jammed into a hard stop from boot: no encoder motion, often already alarmed.
-            // Flip seek+DI and crawl the other way (do not keep retrying into the jam).
+            // Jammed into a hard stop: no encoder motion. Flip seek+DI and crawl out.
             if (!_home_leave_overshoot && !_home_dir_flip &&
-                !_saw_home_motion && _home_leg == 0 &&
+                !_saw_home_motion &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_crawl_resume_pending && !_home_leave_spd_pending &&
                 (now - _home_start_ms) > 1500) {
@@ -1072,14 +1084,19 @@ void AP_ModbusSteering::update(float steering_out)
                                   stuck_alarm ? " (alarm)" : "");
                 }
             }
-            // Leaving an overshoot: crawl toward the other stop. Accept that DI as L1,
-            // or resume original seek once free of the jam / wrong-limit DI.
+            // Both X1+X2 asserted is not a valid single-limit hit (v10i di=0x0006).
+            const bool both_limits_di = _got_di &&
+                ((_di_word & DI_LIMIT_MASK) == DI_LIMIT_MASK);
+            // Leaving an overshoot: crawl toward the other stop.
             if (_home_leave_overshoot &&
                 !_home_stop_pending && !_home_clear_pending &&
                 !_home_leave_spd_pending && !_home_crawl_resume_pending) {
-                const bool opp_di = opposite_limit_di_active() &&
+                const bool opp_only = opposite_limit_di_active() &&
+                                      !target_limit_di_active() &&
+                                      !both_limits_di;
+                const bool opp_di = opp_only &&
                                     _saw_home_motion &&
-                                    _leg_peak_travel >= MIN_HOME_LEG_MOTION;
+                                    _leg_peak_travel >= short_jam;
                 const bool left_free = _got_di && !target_limit_di_active() &&
                                        !opposite_limit_di_active() &&
                                        _got_status && !alarmed() &&
@@ -1092,9 +1109,16 @@ void AP_ModbusSteering::update(float steering_out)
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                                   "CL57R: leave hit other DI travel %d di=0x%04x",
                                   (int)_leg_peak_travel, (unsigned)_di_word);
+                } else if (both_limits_di && _saw_home_motion) {
+                    if ((now - _last_home_progress_ms) > 2000) {
+                        _last_home_progress_ms = now;
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: both DI set 0x%04x, keep leave",
+                                      (unsigned)_di_word);
+                    }
                 } else if (left_free ||
-                           (_leg_peak_travel >= (expected >= 20000 ? expected / 10 : 5000) &&
-                            _got_status && !alarmed())) {
+                           (_leg_peak_travel >= short_jam &&
+                            _got_status && !alarmed() && !both_limits_di)) {
                     _home_leave_overshoot = false;
                     _home_crawl_resume_pending = true;
                     _home_stop_pending = true;
@@ -1106,20 +1130,23 @@ void AP_ModbusSteering::update(float steering_out)
                                   "CL57R: left overshoot, resume seek");
                 }
             }
-            // Primary: stop on the limit DI we are seeking (X1 P-OT / X2 N-OT).
+            // Primary: stop on exclusive target DI (not both ends reading pressed).
             const bool di_hit = !_home_leave_overshoot &&
                                 _got_di && _saw_target_di_clear &&
-                                target_limit_di_active() && _saw_home_motion &&
-                                _leg_peak_travel >= MIN_HOME_LEG_MOTION;
+                                target_limit_di_active() &&
+                                !opposite_limit_di_active() &&
+                                !both_limits_di &&
+                                _saw_home_motion &&
+                                _leg_peak_travel >= short_jam;
             const bool past_expected =
                 !_home_leave_overshoot &&
                 (expected >= 20000) &&
                 _saw_home_motion &&
                 (now - _home_start_ms) > 800 &&
                 (_leg_peak_travel >= expected + expected / 4);
-            // Ignore alarm while opposite (overshot) DI is active — leave toward target.
             const bool seek_armed = (now - _home_start_ms) > 800;
-            const bool on_wrong_limit = _got_di && opposite_limit_di_active();
+            const bool on_wrong_limit = _got_di &&
+                (opposite_limit_di_active() || both_limits_di);
             const bool alarm_hit = !_home_leave_overshoot &&
                                    seek_armed && _saw_home_motion &&
                                    _got_status && alarmed() &&
@@ -1137,8 +1164,7 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_early_retries++;
                     _home_leg_settling = false;
                     _home_stop_pending = true;
-                    if (_home_leg == 0) {
-                        // Leg1 start jammed past a switch: reverse toward the other stop.
+                    if (_home_leg == 0 && !_home_dir_flip) {
                         _home_leave_overshoot = true;
                         _home_leave_spd_pending = true;
                         _home_crawl_resume_pending = false;
@@ -1147,7 +1173,7 @@ void AP_ModbusSteering::update(float steering_out)
                                       (int)_leg_peak_travel,
                                       (unsigned)_home_early_retries);
                     } else {
-                        // Leg2: still on/past L1 — crawl same way toward L2.
+                        // Already flipped or leg2: keep same direction (don't undo flip).
                         _home_crawl_resume_pending = true;
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                       "CL57R: early hit %d, continue %u",
@@ -1155,8 +1181,7 @@ void AP_ModbusSteering::update(float steering_out)
                                       (unsigned)_home_early_retries);
                     }
                 } else if (!past_expected && !di_hit && _leg_peak_travel < short_jam &&
-                           _home_leg == 0) {
-                    // Never accept a few-k false L1 after exhausted reverse leaves.
+                           _home_leg == 0 && !_home_dir_flip) {
                     _home_leg_settling = false;
                     _home_leave_overshoot = true;
                     _home_stop_pending = true;
@@ -1165,6 +1190,15 @@ void AP_ModbusSteering::update(float steering_out)
                     _home_early_retries = 0;
                     GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
                                   "CL57R: refuse short L1 %d, keep leave",
+                                  (int)_leg_peak_travel);
+                } else if (!past_expected && !di_hit && _leg_peak_travel < short_jam) {
+                    // Flipped already but still short: clear and keep crawling same way.
+                    _home_leg_settling = false;
+                    _home_stop_pending = true;
+                    _home_crawl_resume_pending = true;
+                    _home_early_retries = 0;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: short hit %d after flip, continue",
                                   (int)_leg_peak_travel);
                 } else if (!_home_leg_settling) {
                     _home_leg_settling = true;
@@ -1938,8 +1972,7 @@ void AP_ModbusSteering::update(float steering_out)
         if (_home_retry_pending) {
             // Dedicated slot: never piggy-back home restart on a status read.
             _home_retry_pending = false;
-            if (_home_speed_leg && !_saw_home_motion && _home_leg == 0 &&
-                !_home_dir_flip) {
+            if (_home_speed_leg && !_saw_home_motion && !_home_dir_flip) {
                 // Same-dir retry into a hard stop never moves — flip instead.
                 _home_dir_flip = true;
                 send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
