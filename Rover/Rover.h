@@ -144,6 +144,11 @@ private:
     AP_FarDriverThrottle fardriver_throttle;
     AP_ModbusSteering modbus_steering;
 
+    // Latest MANUAL_CONTROL steering from GCS (QGC virtual sticks). Used by
+    // Modbus steering so Radio Failsafe cannot wipe RC overrides when no TX.
+    float gcs_steering_norm = 0.0f;
+    uint32_t gcs_steering_ms = 0;
+
     // external control implementation
 #if AP_EXTERNAL_CONTROL_ENABLED
     AP_ExternalControl_Rover external_control;

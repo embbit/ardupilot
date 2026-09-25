@@ -103,7 +103,8 @@ bool AP_Arming_Rover::pre_arm_checks(bool report)
             & oa_check(report)
 #endif
             & parameter_checks(report)
-            & mode_checks(report));
+            & mode_checks(report)
+            & modbus_steering_checks(report));
 #pragma clang diagnostic pop
 }
 
@@ -252,4 +253,29 @@ bool AP_Arming_Rover::motor_checks(bool report)
 #endif
 
     return ret;
+}
+
+bool AP_Arming_Rover::modbus_steering_checks(bool report)
+{
+    if (!rover.modbus_steering.enabled()) {
+        return true;
+    }
+    if (rover.modbus_steering.homing()) {
+        check_failed(report, "CL57R homing");
+        return false;
+    }
+    if (!rover.modbus_steering.homed()) {
+        check_failed(report, "CL57R not calibrated");
+        return false;
+    }
+    if (rover.modbus_steering.alarmed()) {
+        check_failed(report, "CL57R alarm");
+        return false;
+    }
+    return true;
+}
+
+bool AP_Arming_Rover::mandatory_checks(bool report)
+{
+    return modbus_steering_checks(report) & AP_Arming::mandatory_checks(report);
 }

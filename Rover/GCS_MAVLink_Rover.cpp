@@ -566,7 +566,21 @@ void GCS_MAVLINK_Rover::handle_message(const mavlink_message_t &msg)
 
 void GCS_MAVLINK_Rover::handle_manual_control_axes(const mavlink_manual_control_t &packet, const uint32_t tnow)
 {
-    manual_override(rover.channel_steer, packet.y, 1000, 2000, tnow);
+    // ArduPilot Rover steering is MANUAL_CONTROL.y (roll). QGC virtual/on-screen
+    // joysticks often put ground-vehicle steering on .r (yaw) instead — use the
+    // larger deflection so both layouts work.
+    int16_t steer_in = packet.y;
+    const int16_t roll_mag = (packet.y == INT16_MAX) ? 0 : (packet.y < 0 ? -packet.y : packet.y);
+    const int16_t yaw_mag = (packet.r == INT16_MAX) ? 0 : (packet.r < 0 ? -packet.r : packet.r);
+    if (packet.r != INT16_MAX && yaw_mag > roll_mag) {
+        steer_in = packet.r;
+    }
+    // Direct path for Modbus steering (survives RC failsafe clearing overrides).
+    if (steer_in != INT16_MAX) {
+        rover.gcs_steering_norm = constrain_float(steer_in / 1000.0f, -1.0f, 1.0f);
+        rover.gcs_steering_ms = tnow;
+    }
+    manual_override(rover.channel_steer, steer_in, 1000, 2000, tnow);
     manual_override(rover.channel_throttle, packet.z, 1000, 2000, tnow);
 }
 

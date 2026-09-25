@@ -8,29 +8,201 @@ class AP_ModbusSteering {
 public:
     AP_ModbusSteering();
 
-    // Инициализация порта
     void init(AP_SerialManager &serial_manager);
-
-    // Основной цикл управления
     void update(float steering_out);
 
-    // Описание параметров для Mission Planner
-    static const AP_Param::GroupInfo var_info[];
+    bool enabled() const { return _uart != nullptr; }
+    bool homed() const { return _homed; }
+    bool homing() const { return in_home(); }
+    bool alarmed() const { return (_status_word & (1U << 3)) != 0; }
+
+    static const struct AP_Param::GroupInfo var_info[];
 
 private:
+    enum class DriveState : uint8_t {
+        INIT_ENABLE = 0,
+        INIT_CLEAR_ALARM,
+        INIT_SUBDIVISION,
+        INIT_START_SPD,
+        INIT_MAX_SPD,
+        INIT_ACCEL,
+        INIT_DECEL,
+        INIT_ABS_MODE,
+        INIT_TRACK_ERR,
+        RUN_WRITE,
+        RUN_READ,
+        HOME_CLEAR_ALARM,
+        HOME_SET_METHOD,
+        HOME_SET_SPD,
+        HOME_SET_RUN_SPD,
+        HOME_SET_CRAWL,
+        HOME_SET_ACCEL,
+        HOME_ENABLE,
+        HOME_SEEK_SPD,
+        HOME_START,
+        HOME_WAIT,
+        HOME_ZERO_AT_L1,
+        HOME_MOVE_CENTER,
+        HOME_WAIT_CENTER,
+        HOME_ZERO,
+    };
+
+    enum class RxExpect : uint8_t {
+        NONE = 0,
+        ENCODER,
+        STATUS,
+        DI_INPUT,
+    };
+
+    // Dual-limit speed-mode calibration phases.
+    // Extreme positions are always latched on DI (limit switch), never on alarm.
+    enum class CalPhase : uint8_t {
+        LEG1_CRAWL = 0, // crawl toward first DI
+        LEG1_RECOVER,   // after alarm: reverse crawl, latch P1 on DI1
+        LEG2_SEEK,      // SEEK_SPD toward second limit
+        LEG2_CRAWL,     // last ~20% at crawl
+        LEG2_RECOVER,   // after alarm: reverse crawl, latch P2 on DI2
+    };
+
+    int32_t travel_limit_pulses() const;
+    int32_t expected_full_travel_pulses() const;
+    uint8_t rtu_frame_len(const uint8_t *buf, uint8_t avail) const;
+    void consume_rx();
+    void advance_init();
+    void advance_home();
+    void poll_rc_buttons();
+    void poll_param_trigger();
+    bool rc_rising_edge(int8_t ch, bool &was_high) const;
+    void request_alarm_clear();
+    void start_home();
+    bool in_run() const;
+    bool in_home() const;
+    bool home_prep_wait_echo() const;
+    uint16_t home_first_method() const;
+    uint16_t home_method_reg() const;
+    bool dual_limit_home() const;
+    bool target_limit_di_active() const;
+    bool opposite_limit_di_active() const;
+    int16_t seek_speed_signed(uint16_t rpm) const;
+    bool cal_phase_reverse() const;
+    int16_t cal_phase_spd_signed() const;
+    void begin_di_recover(uint32_t now, const char *why);
+    void latch_di_extreme_and_finish(uint32_t now);
+    void home_leg_done(uint32_t now);
+    uint16_t run_speed_rpm() const;
+    uint16_t calib_speed_rpm() const;
+    uint16_t calib_crawl_rpm() const;
+    uint16_t mid_seek_speed_rpm() const;
+    int32_t center_target_pulses() const;
+    void send_u16(uint16_t reg, uint16_t value);
+    void send_target_pos(int32_t target);
+    void queue_motion(uint16_t motion);
+    bool flush_queued_motion();
+    void finish_home();
+    void abort_home(const char *reason);
+
     AP_HAL::UARTDriver *_uart = nullptr;
     uint32_t _last_send_ms = 0;
+    uint32_t _last_vect_ms = 0;
+    uint32_t _last_rx_ms = 0;
+    uint32_t _home_start_ms = 0;
+    uint32_t _last_home_retry_ms = 0;
+    uint32_t _last_home_norx_ms = 0;
+    uint32_t _home_rx_lost_ms = 0;
+    uint32_t _last_home_progress_ms = 0;
+    uint32_t _last_button_ms = 0;
+    DriveState _state = DriveState::INIT_ENABLE;
+    RxExpect _rx_expect = RxExpect::NONE;
+    uint8_t _init_attempts = 0;
+    bool _got_echo = false;
+    bool _ever_got_rx = false;
+    uint32_t _last_echo_wait_ms = 0;
+    bool _have_target = false;
+    bool _alarm_clear_pending = false;
+    bool _enable_after_alarm_clear = false;
+    bool _pending_run_spd = false;
+    uint32_t _last_alarm_warn_ms = 0;
+    bool _home_pending = false;
+    bool _homed = false;
+    bool _was_armed = false;
+    bool _rst_was_high = false;
+    bool _home_was_high = false;
+    bool _got_status = false;
+    bool _saw_home_run = false;
+    bool _saw_home_motion = false;
+    bool _saw_home_clear = false;
+    bool _home_read_encoder = false;
+    uint8_t _home_poll_phase = 0; // 0=enc, 1=status, 2=DI(0x0005)
+    bool _got_di = false;
+    uint16_t _di_word = 0;
+    bool _saw_target_di_clear = false;
+    bool _home_center_run_spd = false;
+    uint8_t _home_center_prep = 0;
+    bool _center_resend = false;
+    int32_t _steer_cmd_offset = 0;
+    bool _speed_follow = false;
+    uint8_t _follow_prep = 0;
+    bool _follow_moving = false;
+    int8_t _follow_sign = 0;
+    uint8_t _follow_slot = 0;
+    uint8_t _follow_alarm_step = 0;
+    uint8_t _follow_restore = 0;
+    int32_t _follow_last_enc = 0;
+    int16_t _follow_last_spd = 0;
+    uint32_t _follow_progress_ms = 0;
+    uint16_t _queued_motion = 0;
+    bool _home_retry_pending = false;
+    bool _home_leg_settling = false;
+    uint32_t _home_leg_settle_ms = 0;
+    bool _center_step_settling = false;
+    uint32_t _center_step_settle_ms = 0;
+    int32_t _home_start_pulses = 0;
+    int32_t _leg_peak_travel = 0;
+    int8_t _leg_dir_sign = 0;
+    int32_t _center_move_target = 0;
+    int32_t _center_step_target = 0;
+    int32_t _center_encoder_origin = 0;
+    int32_t _measured_half_travel = 0;
+    uint8_t _home_leg = 0;
+    bool _home_stop_pending = false;
+    bool _home_clear_pending = false;
+    bool _home_speed_leg = false;
+    bool _home_soft_spd_pending = false;
+    bool _home_crawl_resume_pending = false;
+    CalPhase _cal_phase = CalPhase::LEG1_CRAWL;
+    bool _leg1_recovered = false; // L1 found DI after an alarm overshoot
+    bool _recover_saw_motion = false;
+    uint32_t _recover_start_ms = 0;
+    bool _di_extreme_latched = false; // this leg finished via DI latch
+    int32_t _leg1_travel = 0;
+    bool _follow_mid_retried = false;
+    bool _follow_halted = false;
+    uint8_t _follow_alarm_count = 0;
+    int32_t _follow_peak_toward = 0;
+    int32_t _last_stick_log = 0;
+    bool _read_status_next = false;
+    int32_t _last_target = 0;
+    int32_t _actual_pulses = 0;
+    uint16_t _status_word = 0;
+    uint8_t _rx_buf[64] {};
+    uint8_t _rx_len = 0;
 
-    // Параметры Ardupilot
-    AP_Int8  slave_id;     
-    AP_Int16 reg_address;   
-    AP_Int32 max_steps;     
-    AP_Int16 start_speed;   
+    AP_Int8  slave_id;
+    AP_Int16 reg_address;
+    AP_Int32 max_steps;
+    AP_Int16 start_speed;
     AP_Int16 max_speed;
     AP_Int32 pos_db;
     AP_Int32 ret_slew;
     AP_Int8  out_rev;
     AP_Int16 ratio;
-
-    int32_t travel_limit_pulses() const;
+    AP_Int8  rst_ch;
+    AP_Int8  cal_ch;
+    AP_Int8  cal_mth;
+    AP_Int16 seek_speed;
+    AP_Int8  cal_trig;
+    AP_Int8  cal_mode;
+    AP_Int16 crawl_speed;
+    int8_t   _cal_trig_last = 0;
+    bool     _cal_trig_inited = false;
 };
