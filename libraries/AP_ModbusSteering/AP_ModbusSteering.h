@@ -72,6 +72,8 @@ private:
     uint16_t home_method_reg() const;
     bool dual_limit_home() const;
     bool target_limit_di_active() const;
+    bool opposite_limit_di_active() const;
+    int16_t seek_speed_signed(uint16_t rpm) const;
     void home_leg_done(uint32_t now);
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
@@ -157,6 +159,9 @@ private:
     bool _home_soft_approaching = false;
     bool _home_soft_spd_pending = false;
     bool _home_crawl_resume_pending = false;
+    // Past a limit into the hard stop: crawl opposite to leave, then resume seek.
+    bool _home_leave_overshoot = false;
+    bool _home_leave_spd_pending = false;
     uint8_t _home_early_retries = 0;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
