@@ -587,7 +587,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10",
+                  "CL57R: cal@limit ofs %d v10a",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -799,6 +799,8 @@ void AP_ModbusSteering::advance_home()
         _home_leg_settling = false;
         _home_stop_pending = false;
         _home_clear_pending = false;
+        _home_soft_approaching = false;
+        _home_soft_spd_pending = false;
         if (_home_speed_leg) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
                           (unsigned)(_home_leg + 1),
@@ -917,18 +919,43 @@ void AP_ModbusSteering::update(float steering_out)
         } else if (_home_speed_leg) {
             // Speed-mode limit seek: stop when we hit an alarm (hard stop /
             // tracking) or stall after having moved.
+            const int32_t expected = expected_full_travel_pulses();
+            // Soft approach: drop to crawl before the far end so we do not
+            // overshoot the switch into the mechanical stop.
+            const int32_t soft_at = (expected >= 20000)
+                ? ((_home_leg == 0) ? (expected / 3) : ((expected * 2) / 3))
+                : 50000;
+            if (!_home_soft_approaching && expected >= 20000 &&
+                _saw_home_motion && _leg_peak_travel >= soft_at &&
+                !_home_stop_pending && !_home_clear_pending) {
+                _home_soft_approaching = true;
+                _home_soft_spd_pending = true;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "CL57R: soft approach @%d",
+                              (int)_leg_peak_travel);
+            }
+            const bool past_expected =
+                (expected >= 20000) &&
+                _saw_home_motion &&
+                (_leg_peak_travel >= expected + expected / 10);
             const bool hit = _saw_home_motion && _got_status && alarmed();
             const bool stalled = _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
-            if ((hit || stalled) && !_home_stop_pending && !_home_clear_pending) {
+            if ((hit || stalled || past_expected) && !_home_stop_pending && !_home_clear_pending) {
                 if (!_home_leg_settling) {
                     _home_leg_settling = true;
-                    _home_leg_settle_ms = now + 250;
+                    _home_leg_settle_ms = now + 400;
                     _home_stop_pending = true;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: limit hit travel %d",
-                                  (int)_leg_peak_travel);
+                    if (past_expected && !hit) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: seek past expected %d, stop",
+                                      (int)_leg_peak_travel);
+                    } else {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: limit hit travel %d",
+                                      (int)_leg_peak_travel);
+                    }
                 } else if (now >= _home_leg_settle_ms) {
                     _home_leg_settling = false;
                     home_leg_done(now);
@@ -1384,21 +1411,19 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
-            // After mid: stick-center means HOLD pose. Never chase encoder zero —
-            // a drive re-zero after ready made v6 drive back into the limit at
-            // run RPM (enc≈+193k, target 0) and crunch the gearbox.
+            // After mid is locked (_steer_cmd_offset==0): stick-center means
+            // return to / hold physical mid (enc==0 vs origin). Do NOT rebase
+            // the origin on stick-center — that left the rudder wherever the
+            // stick was released (no spring-back to zero).
             if (_steer_cmd_offset == 0 &&
-                stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
+                abs_err <= arrive_db) {
                 if (_follow_moving) {
                     send_u16(REG_MOTION, MOTION_STOP);
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
                     _follow_last_spd = 0;
-                } else if (abs_err > arrive_db) {
-                    _center_encoder_origin = _actual_pulses;
-                    _last_target = 0;
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
                 } else {
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                 }
@@ -1406,7 +1431,8 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
-            // Stick deflected (or still seeking mid): speed-mode follow.
+            // Stick deflected, or stick centered but off mid → speed-mode follow
+            // toward target (stick pulses, or 0 = physical center).
             {
                 // One-shot notice so the GCS can confirm stick input reached the driver.
                 if (_steer_cmd_offset == 0 && !_follow_moving) {
@@ -1416,6 +1442,12 @@ void AP_ModbusSteering::update(float steering_out)
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                                       "CL57R: stick cmd %d",
                                       (int)stick_pulses);
+                    } else if (stick_pulses != _last_stick_log &&
+                               stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
+                               abs_err > arrive_db) {
+                        _last_stick_log = stick_pulses;
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                      "CL57R: stick center, return mid");
                     }
                 }
                 const int8_t want_sign = (err > 0) ? 1 : -1;
@@ -1576,6 +1608,16 @@ void AP_ModbusSteering::update(float steering_out)
         if (_home_clear_pending) {
             _home_clear_pending = false;
             send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+            break;
+        }
+        if (_home_soft_spd_pending) {
+            _home_soft_spd_pending = false;
+            int16_t spd = (int16_t)calib_crawl_rpm();
+            if (home_method_reg() == 18) {
+                spd = (int16_t)(-spd);
+            }
+            send_u16(REG_MAX_SPD, (uint16_t)spd);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: seek crawl spd=%d", (int)spd);
             break;
         }
         if (_home_retry_pending) {
