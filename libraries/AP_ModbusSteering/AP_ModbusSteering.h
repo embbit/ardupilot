@@ -164,6 +164,9 @@ private:
     bool _home_leave_spd_pending = false;
     // Start jammed into a stop with no encoder motion: invert seek/DI for this leg.
     bool _home_dir_flip = false;
+    uint8_t _home_flip_count = 0;
+    int32_t _home_stuck_peak = -1;
+    uint8_t _home_stuck_hits = 0;
     uint8_t _home_early_retries = 0;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;

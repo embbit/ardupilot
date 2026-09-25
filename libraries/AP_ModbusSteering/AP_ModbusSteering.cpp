@@ -479,6 +479,9 @@ void AP_ModbusSteering::start_home()
     _home_leave_overshoot = false;
     _home_leave_spd_pending = false;
     _home_dir_flip = false;
+    _home_flip_count = 0;
+    _home_stuck_peak = -1;
+    _home_stuck_hits = 0;
     _home_early_retries = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
@@ -577,6 +580,9 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _home_leave_overshoot = false;
         _home_leave_spd_pending = false;
         _home_dir_flip = false;
+        _home_flip_count = 0;
+        _home_stuck_peak = -1;
+        _home_stuck_hits = 0;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit 1 reached, zero and seek limit 2");
         return;
     }
@@ -674,7 +680,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v10j",
+                  "CL57R: cal@limit ofs %d v10k",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -899,6 +905,9 @@ void AP_ModbusSteering::advance_home()
         _home_leave_overshoot = false;
         _home_leave_spd_pending = false;
         _home_dir_flip = false;
+        _home_flip_count = 0;
+        _home_stuck_peak = -1;
+        _home_stuck_hits = 0;
         _home_early_retries = 0;
         if (_home_speed_leg) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
