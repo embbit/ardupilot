@@ -38,6 +38,7 @@ private:
         HOME_SET_CRAWL,
         HOME_SET_ACCEL,
         HOME_ENABLE,
+        HOME_SET_TRACK_ERR,
         HOME_SEEK_SPD,
         HOME_START,
         HOME_WAIT,
@@ -79,6 +80,7 @@ private:
     uint16_t calib_crawl_rpm() const;
     uint16_t mid_seek_speed_rpm() const;
     uint16_t track_err_limit() const;
+    uint16_t seek_track_err_limit() const;
     bool lim_pos_active() const;
     bool lim_neg_active() const;
     bool dir_blocked(int8_t sign) const;
@@ -100,6 +102,7 @@ private:
     uint32_t _last_home_norx_ms = 0;
     uint32_t _home_rx_lost_ms = 0;
     uint32_t _last_home_progress_ms = 0;
+    uint32_t _home_ignore_alarm_ms = 0;
     uint32_t _last_button_ms = 0;
     DriveState _state = DriveState::INIT_ENABLE;
     RxExpect _rx_expect = RxExpect::NONE;
@@ -111,6 +114,7 @@ private:
     bool _alarm_clear_pending = false;
     bool _enable_after_alarm_clear = false;
     bool _pending_run_spd = false;
+    bool _pending_track_restore = false;
     uint32_t _last_alarm_warn_ms = 0;
     bool _home_pending = false;
     bool _homed = false;

@@ -319,6 +319,15 @@ uint16_t AP_ModbusSteering::track_err_limit() const
     return (uint16_t)v;
 }
 
+uint16_t AP_ModbusSteering::seek_track_err_limit() const
+{
+    // Dual-limit seek must tolerate lag at HOME_SPD. A tight user TRACK_ERR
+    // (e.g. 4000) trips mid-span and falsely ends a leg. Boost for seek only.
+    const uint16_t user = track_err_limit();
+    const uint16_t seek_min = 25000;
+    return (user > seek_min) ? user : seek_min;
+}
+
 bool AP_ModbusSteering::lim_pos_active() const
 {
     if (!_got_di) {
@@ -811,7 +820,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v15",
+                  "CL57R: cal@limit ofs %d v16",
                   (int)_steer_cmd_offset);
     finish_home();
 }
@@ -826,6 +835,7 @@ void AP_ModbusSteering::finish_home()
     if (!_speed_follow) {
         _pending_run_spd = true;
     }
+    _pending_track_restore = true;
     _alarm_clear_pending = true;
     _enable_after_alarm_clear = true;
     _rx_expect = RxExpect::NONE;
@@ -841,6 +851,10 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _state = DriveState::RUN_WRITE;
     _have_target = false;
     _rx_expect = RxExpect::NONE;
+    _pending_track_restore = true;
+    _home_stop_pending = false;
+    _home_clear_pending = false;
+    _home_crawl_pending = false;
     if (home_trig.get() == 1) {
         home_trig.set_and_save(0);
     }
@@ -1001,11 +1015,14 @@ void AP_ModbusSteering::advance_home()
         // HOME_CRAWL (<=300) when the limit input is already seen.
         if (dual_limit_home()) {
             _home_speed_leg = true;
-            _state = DriveState::HOME_SEEK_SPD;
+            _state = DriveState::HOME_SET_TRACK_ERR;
         } else {
             _home_speed_leg = false;
             _state = DriveState::HOME_START;
         }
+        break;
+    case DriveState::HOME_SET_TRACK_ERR:
+        _state = DriveState::HOME_SEEK_SPD;
         break;
     case DriveState::HOME_SEEK_SPD:
         _state = DriveState::HOME_START;
@@ -1029,6 +1046,7 @@ void AP_ModbusSteering::advance_home()
         _home_crawl_pending = false;
         _home_crawl_away = false;
         _home_early_retries = 0;
+        _home_ignore_alarm_ms = 0;
         if (_home_speed_leg) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u @%urpm",
                           (unsigned)(_home_leg + 1),
@@ -1151,11 +1169,14 @@ void AP_ModbusSteering::update(float steering_out)
             // Do NOT finish a leg on DI alone — floating X1/X2 bits caused
             // false "DI limit hit" with ~7k travel and aborted calibration.
             const int32_t expected = expected_full_travel_pulses();
-            // Require a substantial fraction of OUT_REV travel before treating
-            // an alarm as a real endstop. Low TRACK_ERR (e.g. 4000) trips mid
-            // span (~expected/4) and used to "finish" cal while still on a stop.
-            const int32_t min_real = (expected >= 20000) ? ((expected * 5) / 8) : 20000;
-            const bool hit = _saw_home_motion && _got_status && alarmed();
+            // Leg1 often starts near mid (~expected/2 to a stop). Leg2 is
+            // lock-to-lock (~expected). Low TRACK_ERR false hits are shorter.
+            const int32_t min_real = (expected >= 20000)
+                ? ((_home_leg == 0) ? ((expected * 2) / 5) : ((expected * 5) / 8))
+                : 20000;
+            const bool alarm_now = _got_status && alarmed() &&
+                                   (now >= _home_ignore_alarm_ms);
+            const bool hit = _saw_home_motion && alarm_now;
             const bool stalled = _saw_home_motion &&
                                  (now - _last_home_progress_ms) > 1500 &&
                                  !running;
@@ -1165,7 +1186,8 @@ void AP_ModbusSteering::update(float steering_out)
                 (expected >= 20000) &&
                 _saw_home_motion &&
                 (_leg_peak_travel >= expected + expected / 8);
-            if ((hit || stalled || past_expected) && !_home_stop_pending && !_home_clear_pending) {
+            if ((hit || stalled || past_expected) &&
+                !_home_stop_pending && !_home_clear_pending && !_home_crawl_pending) {
                 if (past_expected && !hit && !stalled) {
                     if (!_home_leg_settling) {
                         _home_leg_settling = true;
@@ -1190,6 +1212,10 @@ void AP_ModbusSteering::update(float steering_out)
                                   "CL57R: early alarm %d, crawl retry %u",
                                   (int)_leg_peak_travel,
                                   (unsigned)_home_early_retries);
+                } else if (_leg_peak_travel < min_real) {
+                    // Do not accept a short hit as an endstop — that placed mid
+                    // on a hard stop (TRACK_ERR too tight / no real limit).
+                    abort_home("early limits only; raise TRACK_ERR / check mech");
                 } else if (!_home_leg_settling) {
                     _home_leg_settling = true;
                     _home_leg_settle_ms = now + 250;
@@ -1414,6 +1440,12 @@ void AP_ModbusSteering::update(float steering_out)
             _state = DriveState::RUN_READ;
             break;
         }
+        if (_pending_track_restore) {
+            send_u16(REG_TRACK_ERR, track_err_limit());
+            _pending_track_restore = false;
+            _state = DriveState::RUN_READ;
+            break;
+        }
         if (_jog_active) {
             const uint32_t jnow = AP_HAL::millis();
             const int32_t moved = _actual_pulses - _jog_start_enc;
@@ -1534,8 +1566,9 @@ void AP_ModbusSteering::update(float steering_out)
                         _follow_sign = 0;
                         _follow_slot = 0;
                         _follow_restore = 1;
-                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                                      "CL57R: mid overshoot guard %d", (int)enc);
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "CL57R: mid overshoot stop %d", (int)enc);
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
                         _state = DriveState::RUN_READ;
                         break;
                     }
@@ -1923,8 +1956,6 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     case DriveState::HOME_CLEAR_ALARM:
         send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: TRACK_ERR=%u",
-                      (unsigned)track_err_limit());
         break;
     case DriveState::HOME_SET_METHOD:
         send_u16(REG_HOME_METHOD, home_method_reg());
@@ -1958,9 +1989,15 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_ENABLE:
         send_u16(REG_MOTOR_ENABLE, 0x0001);
         break;
+    case DriveState::HOME_SET_TRACK_ERR: {
+        const uint16_t te = seek_track_err_limit();
+        send_u16(REG_TRACK_ERR, te);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: seek TRACK_ERR=%u (param %u)",
+                      (unsigned)te, (unsigned)track_err_limit());
+        break;
+    }
     case DriveState::HOME_SEEK_SPD: {
-        // Also refresh TRACK_ERR (param) and soft decel before signed cruise.
-        // One frame per slot: write MAX_SPD here; TRACK_ERR rewritten on early retry.
+        // Soft decel already set; signed cruise RPM for this leg.
         int16_t spd = (int16_t)calib_speed_rpm();
         if (home_method_reg() == 18) {
             spd = (int16_t)(-spd);
@@ -1986,6 +2023,7 @@ void AP_ModbusSteering::update(float steering_out)
         if (_home_clear_pending) {
             _home_clear_pending = false;
             send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+            _home_ignore_alarm_ms = AP_HAL::millis() + 400;
             break;
         }
         if (_home_crawl_pending) {
@@ -2001,13 +2039,12 @@ void AP_ModbusSteering::update(float steering_out)
             if (neg) {
                 spd = (int16_t)(-spd);
             }
-            // Crawl resume is for tracking recovery — never refuse on DI here
-            // (false dual-active bits used to deadlock both directions).
+            // Keep leg origin / peak — crawl continues the same seek span.
+            // Ignore alarms briefly so STOP/CLEAR/SPEED can take effect before
+            // the same latched status burns another early-retry slot.
             send_u16(REG_MAX_SPD, (uint16_t)spd);
             _queued_motion = MOTION_SPEED;
-            _leg_peak_travel = 0;
-            _home_start_pulses = _actual_pulses;
-            _saw_home_motion = false;
+            _home_ignore_alarm_ms = AP_HAL::millis() + 1200;
             _last_home_progress_ms = AP_HAL::millis();
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: seek crawl spd=%d", (int)spd);
             break;
