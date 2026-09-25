@@ -53,14 +53,14 @@ class Nema23Motor:
         self.alarmed = False
 
     def di_word(self):
-        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT. Assert slightly before hard stop
-        # so firmware can stop on DI ahead of TRACK_ERR/alarm.
+        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT.
+        # Match firmware: M17 seeks + toward X2 (N-OT); M18 seeks - toward X1 (P-OT).
         word = 0
         margin = max(int(SPEED_HARD_STOP * 0.05), 200)
         if self.position >= SPEED_HARD_STOP - margin:
-            word |= (1 << 1)
+            word |= (1 << 2)  # X2 at positive hard stop (M17 target)
         if self.position <= -SPEED_HARD_STOP + margin:
-            word |= (1 << 2)
+            word |= (1 << 1)  # X1 at negative hard stop (M18 target)
         return word
 
     def refresh_status(self):

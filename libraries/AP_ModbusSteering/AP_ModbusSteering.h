@@ -54,12 +54,14 @@ private:
         DI_INPUT,
     };
 
-    // Dual-limit speed-mode calibration phases (v11).
+    // Dual-limit speed-mode calibration phases.
+    // Extreme positions are always latched on DI (limit switch), never on alarm.
     enum class CalPhase : uint8_t {
-        LEG1_CRAWL = 0, // crawl to first DI or alarm
-        LEG2_PASS,      // after alarm L1: crawl until opposite DI active→passive
+        LEG1_CRAWL = 0, // crawl toward first DI
+        LEG1_RECOVER,   // after alarm: reverse crawl, latch P1 on DI1
         LEG2_SEEK,      // SEEK_SPD toward second limit
         LEG2_CRAWL,     // last ~20% at crawl
+        LEG2_RECOVER,   // after alarm: reverse crawl, latch P2 on DI2
     };
 
     int32_t travel_limit_pulses() const;
@@ -82,6 +84,10 @@ private:
     bool target_limit_di_active() const;
     bool opposite_limit_di_active() const;
     int16_t seek_speed_signed(uint16_t rpm) const;
+    bool cal_phase_reverse() const;
+    int16_t cal_phase_spd_signed() const;
+    void begin_di_recover(uint32_t now, const char *why);
+    void latch_di_extreme_and_finish(uint32_t now);
     void home_leg_done(uint32_t now);
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
@@ -164,8 +170,9 @@ private:
     bool _home_soft_spd_pending = false;
     bool _home_crawl_resume_pending = false;
     CalPhase _cal_phase = CalPhase::LEG1_CRAWL;
-    bool _leg1_hit_alarm = false;
-    bool _pass_di_saw_active = false;
+    bool _leg1_recovered = false; // L1 found DI after an alarm overshoot
+    bool _recover_saw_motion = false;
+    uint32_t _recover_start_ms = 0;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
