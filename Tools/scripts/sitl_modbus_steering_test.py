@@ -553,12 +553,12 @@ def run_rc_buttons():
         if not any("cal@limit" in t or "cal done at limit" in t for t in events):
             print("FAIL: missing cal done at limit message")
             return 1
-        if not any("spd-follow" in t or " v10k" in t or " v10j" in t or " v10i" in t or " v10h" in t or " v10g" in t or " v10f" in t or " v10e" in t or " v10d" in t or " v10c" in t or " v10b" in t or " v10a" in t or " v10" in t or " v9" in t or "v8" in t
-                   or "cal@limit" in t or "limit seek" in t or "DI limit" in t or "flip seek" in t for t in events):
+        if not any("spd-follow" in t or " v11" in t or " v10k" in t or " v10j" in t or " v10i" in t or " v10h" in t or " v10g" in t or " v10f" in t or " v10e" in t or " v10d" in t or " v10c" in t or " v10b" in t or " v10a" in t or " v10" in t or " v9" in t or "v8" in t
+                   or "cal@limit" in t or "limit seek" in t or "DI limit" in t or "soft crawl" in t for t in events):
             print("FAIL: missing speed-follow mid return message")
             return 1
 
-        # Wait for physical mid return (speed mode at crawl RPM).
+        # Wait for physical mid return (speed mode at SEEK RPM).
         mid_done = False
         deadline = time.time() + 60
         while time.time() < deadline:

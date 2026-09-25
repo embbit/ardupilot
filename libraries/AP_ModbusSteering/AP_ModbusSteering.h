@@ -54,6 +54,14 @@ private:
         DI_INPUT,
     };
 
+    // Dual-limit speed-mode calibration phases (v11).
+    enum class CalPhase : uint8_t {
+        LEG1_CRAWL = 0, // crawl to first DI or alarm
+        LEG2_PASS,      // after alarm L1: crawl until opposite DI active→passive
+        LEG2_SEEK,      // SEEK_SPD toward second limit
+        LEG2_CRAWL,     // last ~20% at crawl
+    };
+
     int32_t travel_limit_pulses() const;
     int32_t expected_full_travel_pulses() const;
     uint8_t rtu_frame_len(const uint8_t *buf, uint8_t avail) const;
@@ -82,7 +90,6 @@ private:
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_target_pos(int32_t target);
-    // Queue a 0x0036 write for the next 50 ms slot (never TX with another frame).
     void queue_motion(uint16_t motion);
     bool flush_queued_motion();
     void finish_home();
@@ -127,8 +134,6 @@ private:
     uint8_t _home_center_prep = 0;
     bool _center_resend = false;
     int32_t _steer_cmd_offset = 0;
-    // After dual-limit cal: continuous speed-mode follow toward
-    // stick_pulses + _steer_cmd_offset (stick=0 drives to physical mid).
     bool _speed_follow = false;
     uint8_t _follow_prep = 0;
     bool _follow_moving = false;
@@ -156,18 +161,11 @@ private:
     bool _home_stop_pending = false;
     bool _home_clear_pending = false;
     bool _home_speed_leg = false;
-    bool _home_soft_approaching = false;
     bool _home_soft_spd_pending = false;
     bool _home_crawl_resume_pending = false;
-    // Past a limit into the hard stop: crawl opposite to leave, then resume seek.
-    bool _home_leave_overshoot = false;
-    bool _home_leave_spd_pending = false;
-    // Start jammed into a stop with no encoder motion: invert seek/DI for this leg.
-    bool _home_dir_flip = false;
-    uint8_t _home_flip_count = 0;
-    int32_t _home_stuck_peak = -1;
-    uint8_t _home_stuck_hits = 0;
-    uint8_t _home_early_retries = 0;
+    CalPhase _cal_phase = CalPhase::LEG1_CRAWL;
+    bool _leg1_hit_alarm = false;
+    bool _pass_di_saw_active = false;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
@@ -196,6 +194,7 @@ private:
     AP_Int16 home_speed;
     AP_Int8  home_trig;
     AP_Int8  home_mode;
+    AP_Int16 crawl_speed;
     int8_t   _home_trig_last = 0;
     bool     _home_trig_inited = false;
 };
