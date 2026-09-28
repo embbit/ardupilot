@@ -91,6 +91,7 @@ private:
     void latch_di_extreme_and_finish(uint32_t now);
     void home_leg_done(uint32_t now);
     uint32_t link_timeout_ms() const;
+    uint32_t home_timeout_ms() const;
     void handle_run_link_failsafe(uint32_t now);
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
@@ -207,6 +208,7 @@ private:
     AP_Int8  cal_mode;
     AP_Int16 crawl_speed;
     AP_Int16 link_timeout;
+    AP_Int16 cal_timeout_s;
     int8_t   _cal_trig_last = 0;
     bool     _cal_trig_inited = false;
     bool     _run_link_failsafe = false;

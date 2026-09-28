@@ -55,7 +55,7 @@ constexpr uint16_t MID_SEEK_ACCEL_MS = 800;
 constexpr uint16_t MID_SEEK_DECEL_MS = 800;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
-constexpr uint32_t HOME_TIMEOUT_MS = 90000;
+constexpr uint32_t HOME_TIMEOUT_DEFAULT_MS = 90000;
 constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
 constexpr uint32_t HOME_RX_LOST_WARN_MS = 15000;
 constexpr uint32_t HOME_RX_ABORT_MS = 30000;
@@ -198,6 +198,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("LINK_TO", 17, AP_ModbusSteering, link_timeout, 1500),
 
+    // @Param: CAL_TO
+    // @DisplayName: Calibration leg timeout
+    // @Description: Abort calibration if a seek/crawl/recover leg or mid move does not finish within this many seconds. Use a short value in SITL to test the abort path. 0 keeps the 90s default.
+    // @Units: s
+    // @Range: 0 600
+    // @User: Advanced
+    AP_GROUPINFO("CAL_TO", 18, AP_ModbusSteering, cal_timeout_s, 0),
+
     AP_GROUPEND
 };
 
@@ -237,6 +245,15 @@ uint32_t AP_ModbusSteering::link_timeout_ms() const
         return 0;
     }
     return (uint32_t)to;
+}
+
+uint32_t AP_ModbusSteering::home_timeout_ms() const
+{
+    const int16_t sec = cal_timeout_s.get();
+    if (sec <= 0) {
+        return HOME_TIMEOUT_DEFAULT_MS;
+    }
+    return (uint32_t)sec * 1000U;
 }
 
 bool AP_ModbusSteering::link_ok() const
@@ -1196,7 +1213,7 @@ void AP_ModbusSteering::update(float steering_out)
         if (!enc_rebase && running && moved >= 50) {
             _saw_home_run = true;
         }
-        if (now - _home_start_ms > HOME_TIMEOUT_MS) {
+        if (now - _home_start_ms > home_timeout_ms()) {
             abort_home("home timeout");
         } else if (_home_speed_leg) {
             // Extremes always on DI. Alarm → recover (reverse crawl) → latch DI.
@@ -1359,7 +1376,7 @@ void AP_ModbusSteering::update(float steering_out)
             arrive = cap;
         }
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
-        if (now - _home_start_ms > HOME_TIMEOUT_MS) {
+        if (now - _home_start_ms > home_timeout_ms()) {
             abort_home("center timeout");
         } else if (_got_status && alarmed()) {
             abort_home("alarm during center");

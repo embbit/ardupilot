@@ -1053,6 +1053,36 @@ def run_cal_rx_abort():
             pass
 
 
+def run_cal_timeout():
+    """CAL_TO short value must abort a stuck seek without waiting 90s."""
+    procs, _sitl, _sim = start_rover_and_sim()
+    try:
+        mavlink, events = connect_ready()
+        if mavlink is None:
+            return 1
+        # Slow crawl so the leg cannot finish before CAL_TO fires.
+        set_cal_defaults(mavlink, crawl_spd=5, seek_spd=5)
+        set_param(mavlink, "OB_STR_CAL_TO", 3, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
+        set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
+        deadline = time.time() + 20
+        timed_out = False
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.3, events)
+            if any("home timeout" in t for t in events):
+                timed_out = True
+                break
+            if any("CL57R: calibrated" in t for t in events):
+                print("FAIL: calibrated before CAL_TO abort")
+                return 1
+        if not timed_out:
+            print("FAIL: CAL_TO did not abort with home timeout")
+            return 1
+        print("PASS: CAL_TO aborted cal with home timeout")
+        return 0
+    finally:
+        stop_procs(procs)
+
+
 def run_follow_alarm():
     """Speed-follow must react to a tracking alarm after cal."""
     ctl = default_control_file()
@@ -1109,6 +1139,7 @@ def main():
             "cal-mode0",
             "cal-mth18",
             "cal-rx-abort",
+            "cal-timeout",
             "follow-alarm",
             "coverage",
             "all",
@@ -1154,6 +1185,7 @@ def main():
         ("cal-mode0", "=== CAL_MODE=0 SINGLE-LIMIT ===", run_cal_mode0),
         ("cal-mth18", "=== CAL_MTH=18 DUAL-LIMIT ===", run_cal_mth18),
         ("cal-rx-abort", "=== CAL RX ABORT ===", run_cal_rx_abort),
+        ("cal-timeout", "=== CAL_TO HOME TIMEOUT ===", run_cal_timeout),
         ("follow-alarm", "=== FOLLOW ALARM ===", run_follow_alarm),
     )
     for name, title, fn in coverage_tests:
