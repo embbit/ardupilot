@@ -8,6 +8,8 @@
 extern const AP_HAL::HAL &hal;
 
 namespace {
+// Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
+constexpr const char *CL57R_FW_TAG = "v12.1";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -814,8 +816,8 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d v12",
-                  (int)_steer_cmd_offset);
+                  "CL57R: cal@limit ofs %d %s",
+                  (int)_steer_cmd_offset, CL57R_FW_TAG);
     finish_home();
 }
 

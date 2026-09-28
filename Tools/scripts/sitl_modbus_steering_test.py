@@ -477,6 +477,7 @@ def run_param_trigger():
 
 
 def run_rc_buttons():
+    wipe_sitl_eeprom()
     sitl_lines = []
     sim_lines = []
     sim_cmd = [
@@ -579,8 +580,9 @@ def run_rc_buttons():
         if not any("cal@limit" in t or "cal done at limit" in t for t in events):
             print("FAIL: missing cal done at limit message")
             return 1
-        if not any("spd-follow" in t or " v12" in t or " v11" in t or " v10k" in t or " v10j" in t or " v10i" in t or " v10h" in t or " v10g" in t or " v10f" in t or " v10e" in t or " v10d" in t or " v10c" in t or " v10b" in t or " v10a" in t or " v10" in t or " v9" in t or "v8" in t
-                   or "cal@limit" in t or "limit seek" in t or "DI extreme" in t or "soft crawl" in t or "recover DI" in t for t in events):
+        if not any("spd-follow" in t or "cal@limit" in t or "v12.1" in t or " v12" in t
+                   or "limit seek" in t or "DI extreme" in t or "soft crawl" in t or "recover DI" in t
+                   for t in events):
             print("FAIL: missing speed-follow mid return message")
             return 1
 
@@ -697,18 +699,6 @@ def stop_procs(procs):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-
-
-def wipe_sitl_eeprom():
-    """Drop persisted SITL EEPROM so prior param_set values cannot bleed across tests."""
-    for name in ("eeprom.bin", "eeprom.dat"):
-        path = os.path.join(ROOT, name)
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            print(f"WARN: could not remove {path}: {exc}")
 
 
 def start_rover_and_sim(sim_extra=None, control_file=None):
