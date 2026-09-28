@@ -15,7 +15,7 @@ public:
     bool homed() const { return _homed; }
     bool homing() const { return in_home(); }
     bool alarmed() const { return (_status_word & (1U << 3)) != 0; }
-    // True when a CRC-valid Modbus frame was seen within LINK_TO.
+    // CRC-valid Modbus RX seen within LINK_TO (or LINK_OK_DEFAULT_MS if 0).
     bool link_ok() const;
 
     static const struct AP_Param::GroupInfo var_info[];
@@ -56,14 +56,13 @@ private:
         DI_INPUT,
     };
 
-    // Dual-limit speed-mode calibration phases.
-    // Extreme positions are always latched on DI (limit switch), never on alarm.
+    // Dual-limit cal phases. Extremes latch on DI only, never on alarm.
     enum class CalPhase : uint8_t {
-        LEG1_CRAWL = 0, // crawl toward first DI
-        LEG1_RECOVER,   // after alarm: reverse crawl, latch P1 on DI1
-        LEG2_SEEK,      // SEEK_SPD toward second limit
-        LEG2_CRAWL,     // last ~20% at crawl
-        LEG2_RECOVER,   // after alarm: reverse crawl, latch P2 on DI2
+        LEG1_CRAWL = 0,
+        LEG1_RECOVER,
+        LEG2_SEEK,
+        LEG2_CRAWL,
+        LEG2_RECOVER,
     };
 
     int32_t travel_limit_pulses() const;
@@ -136,7 +135,7 @@ private:
     bool _saw_home_motion = false;
     bool _saw_home_clear = false;
     bool _home_read_encoder = false;
-    uint8_t _home_poll_phase = 0; // 0=enc, 1=status, 2=DI(0x0005)
+    uint8_t _home_poll_phase = 0; // 0=encoder, 1=status, 2=DI
     bool _got_di = false;
     uint16_t _di_word = 0;
     bool _saw_target_di_clear = false;
@@ -174,10 +173,10 @@ private:
     bool _home_soft_spd_pending = false;
     bool _home_crawl_resume_pending = false;
     CalPhase _cal_phase = CalPhase::LEG1_CRAWL;
-    bool _leg1_recovered = false; // L1 found DI after an alarm overshoot
+    bool _leg1_recovered = false;
     bool _recover_saw_motion = false;
     uint32_t _recover_start_ms = 0;
-    bool _di_extreme_latched = false; // this leg finished via DI latch
+    bool _di_extreme_latched = false;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;

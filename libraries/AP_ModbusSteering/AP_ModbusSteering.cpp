@@ -1,15 +1,9 @@
 #include "AP_ModbusSteering.h"
+#include "modbus_protocol.h"
 
 #include <AP_Math/AP_Math.h>
 #include <GCS_MAVLink/GCS.h>
 #include <RC_Channel/RC_Channel.h>
-
-extern "C" {
-    void modbus_create_write_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t value, uint8_t *out_buffer);
-    void modbus_create_write_multiple_packet(uint8_t slave_id, uint16_t start_reg, uint16_t reg_count, const uint16_t *reg_values, uint8_t *out_buffer);
-    void modbus_create_read_packet(uint8_t slave_id, uint16_t reg_addr, uint16_t reg_count, uint8_t *out_buffer);
-    uint16_t modbus_crc16(const uint8_t *buf, uint16_t len);
-}
 
 extern const AP_HAL::HAL &hal;
 
@@ -18,16 +12,20 @@ constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
-constexpr uint16_t REG_HOME_METHOD = 0x0040;
-constexpr uint16_t REG_HOME_SPD = 0x0041;
-constexpr uint16_t REG_HOME_CRAWL = 0x0042;
-constexpr uint16_t REG_HOME_ACCEL = 0x0043;
+constexpr uint16_t REG_SUBDIVISION = 0x0023;
+constexpr uint16_t REG_START_SPD = 0x0030;
+constexpr uint16_t REG_ACCEL = 0x0031;
+constexpr uint16_t REG_DECEL = 0x0032;
 constexpr uint16_t REG_MAX_SPD = 0x0033;
 constexpr uint16_t REG_TARGET_POS = 0x0034;
 constexpr uint16_t REG_MOTION = 0x0036;
 constexpr uint16_t REG_AUX_CONTROL = 0x0037;
 constexpr uint16_t REG_MOTOR_ENABLE = 0x0038;
 constexpr uint16_t REG_POS_MODE = 0x003A;
+constexpr uint16_t REG_HOME_METHOD = 0x0040;
+constexpr uint16_t REG_HOME_SPD = 0x0041;
+constexpr uint16_t REG_HOME_CRAWL = 0x0042;
+constexpr uint16_t REG_HOME_ACCEL = 0x0043;
 constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t AUX_POS_ZERO = 0x0008;
@@ -60,6 +58,9 @@ constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
 constexpr uint32_t HOME_RX_LOST_WARN_MS = 15000;
 constexpr uint32_t HOME_RX_ABORT_MS = 30000;
 constexpr uint32_t HOME_RX_SILENCE_MS = 12000;
+// Used by link_ok() when LINK_TO is 0 (run failsafe stop disabled).
+constexpr uint32_t LINK_OK_DEFAULT_MS = 2000;
+constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
@@ -242,16 +243,18 @@ bool AP_ModbusSteering::link_ok() const
         return false;
     }
     const uint32_t to = link_timeout_ms();
-    const uint32_t limit = (to > 0) ? to : 2000U;
+    const uint32_t limit = (to > 0U) ? to : LINK_OK_DEFAULT_MS;
+    // Unsigned millis wrap is intentional (uint32_t modular difference).
     return (AP_HAL::millis() - _last_rx_ms) <= limit;
 }
 
 void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
 {
     const uint32_t to = link_timeout_ms();
-    if (to == 0 || _last_rx_ms == 0) {
+    if (to == 0U || _last_rx_ms == 0U) {
         return;
     }
+    // Unsigned millis wrap is intentional (uint32_t modular difference).
     if ((now - _last_rx_ms) <= to) {
         if (_run_link_failsafe) {
             _run_link_failsafe = false;
@@ -266,8 +269,7 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
         _follow_sign = 0;
         _follow_slot = 0;
         _follow_last_spd = 0;
-        _queued_motion = 0;
-        // One-shot STOP on the next TX slot (half-duplex safe).
+        // Replace any pending motion with a half-duplex-safe STOP.
         queue_motion(MOTION_STOP);
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
                       "CL57R: Modbus link lost, STOP (> %ums)",
@@ -276,8 +278,8 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
         return;
     }
 
-    if (_last_run_link_warn_ms == 0 ||
-        (now - _last_run_link_warn_ms) >= 2000) {
+    if (_last_run_link_warn_ms == 0U ||
+        (now - _last_run_link_warn_ms) >= LINK_WARN_INTERVAL_MS) {
         _last_run_link_warn_ms = now;
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "CL57R: Modbus link still down");
     }
@@ -1062,7 +1064,7 @@ void AP_ModbusSteering::advance_home()
         }
         break;
     case DriveState::HOME_ZERO_AT_L1:
-        // Clear residual L1 alarm before leg2 seek (v10e finish-on-stale-alarm).
+        // Clear residual L1 alarm before leg2 seek.
         _state = DriveState::HOME_CLEAR_ALARM;
         _got_echo = false;
         _init_attempts = 0;
@@ -1240,10 +1242,8 @@ void AP_ModbusSteering::update(float steering_out)
                 if (di_on && recover_ready) {
                     const int32_t rec_delta = _actual_pulses - _home_start_pulses;
                     const int32_t at = (rec_delta >= 0) ? rec_delta : -rec_delta;
-                    // Ignore premature DI during leg2 recover (need real stroke).
-                    if (_home_leg == 1 && at < min_di) {
-                        // keep recovering
-                    } else {
+                    // Leg2: ignore premature DI until enough stroke is seen.
+                    if (!(_home_leg == 1 && at < min_di)) {
                         latch_di_extreme_and_finish(now);
                     }
                 } else if (recover_ready && (now - _recover_start_ms) > 2500 &&
@@ -1473,19 +1473,19 @@ void AP_ModbusSteering::update(float steering_out)
         send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
         break;
     case DriveState::INIT_SUBDIVISION:
-        send_u16(0x0023, SUBDIVISION_PPR);
+        send_u16(REG_SUBDIVISION, SUBDIVISION_PPR);
         break;
     case DriveState::INIT_START_SPD:
-        send_u16(0x0030, (uint16_t)start_speed.get());
+        send_u16(REG_START_SPD, (uint16_t)start_speed.get());
         break;
     case DriveState::INIT_MAX_SPD:
         send_u16(REG_MAX_SPD, run_speed_rpm());
         break;
     case DriveState::INIT_ACCEL:
-        send_u16(0x0031, ACCEL_DEFAULT);
+        send_u16(REG_ACCEL, ACCEL_DEFAULT);
         break;
     case DriveState::INIT_DECEL:
-        send_u16(0x0032, DECEL_DEFAULT);
+        send_u16(REG_DECEL, DECEL_DEFAULT);
         break;
     case DriveState::INIT_ABS_MODE:
         send_u16(REG_POS_MODE, 0x0001);
@@ -1513,16 +1513,13 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         }
         if (_run_link_failsafe) {
-            // MOTION_STOP was queued on entry; do not resume stick or mid follow
-            // until CRC-valid RX clears the failsafe. Keep the half-duplex slot
-            // alive with a cheap enable write.
+            // STOP already queued; hold follow until CRC-valid RX clears failsafe.
             send_u16(REG_MOTOR_ENABLE, 0x0001);
             _state = DriveState::RUN_READ;
             break;
         }
         if (_speed_follow) {
-            // Continuous speed-mode position follow. Absolute Bit0 starts are
-            // ignored after native home on this CL57R; Bit3 speed mode moves.
+            // Speed-mode follow: after native home Bit0 abs starts are ignored.
             const int32_t target = stick_pulses + _steer_cmd_offset;
             const int32_t enc = _actual_pulses - _center_encoder_origin;
             const int32_t err = target - enc;
@@ -1559,17 +1556,16 @@ void AP_ModbusSteering::update(float steering_out)
                 } else if (_follow_prep == 3) {
                     send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
                 } else if (_follow_prep == 4) {
-                    send_u16(0x0030, (uint16_t)start_speed.get());
+                    send_u16(REG_START_SPD, (uint16_t)start_speed.get());
                 } else if (_follow_prep == 5) {
-                    send_u16(0x0031, MID_SEEK_ACCEL_MS);
+                    send_u16(REG_ACCEL, MID_SEEK_ACCEL_MS);
                 } else if (_follow_prep == 6) {
-                    send_u16(0x0032, MID_SEEK_DECEL_MS);
+                    send_u16(REG_DECEL, MID_SEEK_DECEL_MS);
                 } else if (_follow_prep == 7) {
-                    // Do not rewrite TRACK_ERR here — 0xFFFF can raise Modbus
-                    // exception code 3 (illegal data) on this CL57R.
+                    // Skip TRACK_ERR rewrite; 0xFFFF can raise exception code 3.
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                 } else {
-                    // Do not AUX_POS_ZERO on the pressed limit — it aggravates faults.
+                    // Avoid AUX_POS_ZERO on a pressed limit (aggravates faults).
                     _center_encoder_origin = _actual_pulses;
                     _follow_last_enc = 0;
                     _follow_last_spd = 0;
@@ -1585,9 +1581,9 @@ void AP_ModbusSteering::update(float steering_out)
 
             if (_follow_restore > 0) {
                 if (_follow_restore == 1) {
-                    send_u16(0x0031, ACCEL_DEFAULT);
+                    send_u16(REG_ACCEL, ACCEL_DEFAULT);
                 } else if (_follow_restore == 2) {
-                    send_u16(0x0032, DECEL_DEFAULT);
+                    send_u16(REG_DECEL, DECEL_DEFAULT);
                 } else {
                     send_u16(REG_MAX_SPD, run_speed_rpm());
                     _pending_run_spd = false;
@@ -1631,9 +1627,8 @@ void AP_ModbusSteering::update(float steering_out)
                     send_u16(REG_MOTOR_ENABLE, 0x0001);
                     _follow_alarm_step = 4;
                 } else if (_follow_alarm_step == 4) {
-                    // If we already reached / passed mid, finish here. Never
-                    // re-command a full mid distance after overshoot (v5 bug:
-                    // encoder reset → remain≈-194k drove into the far stop).
+                    // Already at/past mid: finish here. Do not re-command a
+                    // full mid distance after encoder reset / overshoot.
                     const bool mid_return = (_steer_cmd_offset != 0);
                     const int32_t abs_goal = (_steer_cmd_offset >= 0) ?
                                             _steer_cmd_offset : -_steer_cmd_offset;
@@ -1774,10 +1769,8 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
-            // After mid is locked (_steer_cmd_offset==0): stick-center returns
-            // to physical mid — but NEVER chase a near-full-travel error while
-            // stick is centered. CL57R often re-zeros after mid-ready; chasing
-            // phantom enc≈±half→0 slams the far stop (v6 / v10a).
+            // With mid locked, stick-center holds physical mid. Do not chase a
+            // near-full-travel encoder jump (drive may spontaneously re-zero).
             if (_steer_cmd_offset == 0 &&
                 stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
                 const int32_t half = travel_limit_pulses();
@@ -1815,7 +1808,7 @@ void AP_ModbusSteering::update(float steering_out)
             // Stick deflected, or stick centered but off mid → speed-mode follow
             // toward target (stick pulses, or 0 = physical center).
             {
-                // One-shot notice so the GCS can confirm stick input reached the driver.
+                // GCS one-shot: confirm stick reached the driver.
                 if (_steer_cmd_offset == 0 && !_follow_moving) {
                     if (stick_pulses != _last_stick_log &&
                         (stick_pulses > arrive_db || stick_pulses < -arrive_db)) {
@@ -1846,9 +1839,7 @@ void AP_ModbusSteering::update(float steering_out)
                         max_rpm = gentle;
                     }
                 }
-                // Brake before target: ~0.75s of cruise travel for stick-center
-                // return (was ~0.25s and overshot mid to -7k). Mid-cal seek uses
-                // ~0.5s so SEEK_SPD still covers most of the half-travel.
+                // Longer brake window for stick-center return; shorter for mid seek.
                 const int32_t brake_div =
                     (_steer_cmd_offset == 0 &&
                      stick_pulses <= arrive_db && stick_pulses >= -arrive_db) ? 1 : 2;
@@ -1918,9 +1909,8 @@ void AP_ModbusSteering::update(float steering_out)
                         send_u16(REG_MOTOR_ENABLE, 0x0001);
                     }
                 } else {
-                    // Refresh approach MAX_SPD only when rpm changes a lot.
-                    // Spamming MAX_SPD every 50ms starves encoder RX and the
-                    // firmware thinks enc stuck at 0 while the motor runs away.
+                    // Refresh MAX_SPD only on large rpm change; every-slot
+                    // writes starve encoder RX and look like a stuck encoder.
                     const int16_t spd_delta = (signed_spd > _follow_last_spd) ?
                                              (signed_spd - _follow_last_spd) :
                                              (_follow_last_spd - signed_spd);
@@ -1986,9 +1976,9 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     }
     case DriveState::HOME_SET_ACCEL:
-        // Speed-mode dual-limit seek uses run accel/decel regs (not native home).
+        // Dual-limit speed-mode uses run accel/decel regs, not native home accel.
         if (dual_limit_home()) {
-            send_u16(0x0032, MID_SEEK_DECEL_MS);
+            send_u16(REG_DECEL, MID_SEEK_DECEL_MS);
         } else {
             send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
         }
@@ -2168,6 +2158,10 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     case DriveState::HOME_ZERO:
         send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+        break;
+    default:
+        // Unexpected state: recover to RUN_READ poll cycle.
+        _state = DriveState::RUN_READ;
         break;
     }
 }
