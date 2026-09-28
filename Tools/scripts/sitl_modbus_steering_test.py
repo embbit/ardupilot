@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(ROOT, "modules/mavlink"))
 
 from pymavlink import mavutil  # noqa: E402
 
-MODBUS_LINK_TIMEOUT_S = 3.5
+# Matches OB_STR_LINK_TO default (1500 ms) plus margin for SITL scheduling.
+MODBUS_LINK_TIMEOUT_S = 2.0
 
 
 def wait_for_tcp_port(host, port, timeout_s=30):
@@ -181,10 +182,10 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
             left_in = send_stick(1100, "LEFT", hold_s=4, expect_abs=0.2)
             send_stick(1500, "CENTER", hold_s=3)
 
-            if any("Re-initializing" in t for t in events):
-                print("FAIL: unexpected Modbus Timeout while the link was up")
+            if any("Re-initializing" in t or "Modbus link lost" in t for t in events):
+                print("FAIL: unexpected Modbus link failsafe while the link was up")
                 return 1
-            print("PASS: no telemetry timeout while stick was centered")
+            print("PASS: no link failsafe while stick was centered")
 
             moved = any("target=" in line and "target=      0" not in line for line in sim_lines)
             inertia = any("vel=" in line and "vel=     +0" not in line and "vel=     -0" not in line
@@ -212,6 +213,7 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
         deadline = time.time() + link_drop_delay + link_down_duration + 45
         link_lost = False
         link_restored = False
+        fw_stop = False
 
         while time.time() < deadline:
             if not link_lost and any("LINK DOWN" in line for line in sim_lines):
@@ -227,6 +229,10 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
                     text = msg.text
                     print(f"[MAV] {text}")
                     events.append(text)
+                    if "Modbus link lost" in text or "Modbus link still down" in text:
+                        fw_stop = True
+                    if "Modbus link restored" in text:
+                        link_restored = True
                 msg = mavlink.recv_match(blocking=False)
             time.sleep(0.05)
 
@@ -252,6 +258,11 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
             return 1
         print("PASS: Modbus link restored after drop")
 
+        if not fw_stop and not any("Modbus link lost" in t for t in events):
+            print("FAIL: firmware did not report Modbus link lost / STOP")
+            return 1
+        print("PASS: firmware Modbus link failsafe STOP")
+
         if init_after_loss < 2:
             print(f"WARN: enable-count={init_after_loss} (re-init not required if RUN keepalive)")
         else:
@@ -263,9 +274,10 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
             print("WARN: overshoot correction during link recovery test")
 
         if coast_seen:
+            # Firmware now queues MOTION_STOP on link loss; coast is best-effort.
             print("PASS: motor coasted with inertia during link down")
         else:
-            print("WARN: inertia coast not logged (motor may have been stopped)")
+            print("WARN: inertia coast not logged (expected if firmware STOP won the race)")
 
         # Verify steering works again after re-init
         events.clear()

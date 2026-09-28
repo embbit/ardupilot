@@ -272,6 +272,10 @@ bool AP_Arming_Rover::modbus_steering_checks(bool report)
         check_failed(report, "CL57R alarm");
         return false;
     }
+    if (!rover.modbus_steering.link_ok()) {
+        check_failed(report, "CL57R Modbus link");
+        return false;
+    }
     return true;
 }
 

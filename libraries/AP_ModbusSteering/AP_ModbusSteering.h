@@ -15,6 +15,8 @@ public:
     bool homed() const { return _homed; }
     bool homing() const { return in_home(); }
     bool alarmed() const { return (_status_word & (1U << 3)) != 0; }
+    // True when a CRC-valid Modbus frame was seen within LINK_TO.
+    bool link_ok() const;
 
     static const struct AP_Param::GroupInfo var_info[];
 
@@ -89,6 +91,8 @@ private:
     void begin_di_recover(uint32_t now, const char *why);
     void latch_di_extreme_and_finish(uint32_t now);
     void home_leg_done(uint32_t now);
+    uint32_t link_timeout_ms() const;
+    void handle_run_link_failsafe(uint32_t now);
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
     uint16_t calib_crawl_rpm() const;
@@ -203,6 +207,9 @@ private:
     AP_Int8  cal_trig;
     AP_Int8  cal_mode;
     AP_Int16 crawl_speed;
+    AP_Int16 link_timeout;
     int8_t   _cal_trig_last = 0;
     bool     _cal_trig_inited = false;
+    bool     _run_link_failsafe = false;
+    uint32_t _last_run_link_warn_ms = 0;
 };

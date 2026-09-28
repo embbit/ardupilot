@@ -187,6 +187,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("CAL_TRIG", 14, AP_ModbusSteering, cal_trig, 0),
 
+    // @Param: LINK_TO
+    // @DisplayName: Modbus link timeout
+    // @Description: After calibration, if no CRC-valid Modbus RX for this many ms, send MOTION STOP and halt stick follow until the link returns. Also used by arming link_ok(). 0 disables run failsafe stop (not recommended).
+    // @Units: ms
+    // @Range: 0 30000
+    // @User: Standard
+    AP_GROUPINFO("LINK_TO", 17, AP_ModbusSteering, link_timeout, 1500),
+
     AP_GROUPEND
 };
 
@@ -217,6 +225,62 @@ int32_t AP_ModbusSteering::expected_full_travel_pulses() const
 bool AP_ModbusSteering::in_run() const
 {
     return _state == DriveState::RUN_WRITE || _state == DriveState::RUN_READ;
+}
+
+uint32_t AP_ModbusSteering::link_timeout_ms() const
+{
+    const int16_t to = link_timeout.get();
+    if (to <= 0) {
+        return 0;
+    }
+    return (uint32_t)to;
+}
+
+bool AP_ModbusSteering::link_ok() const
+{
+    if (_uart == nullptr || _last_rx_ms == 0) {
+        return false;
+    }
+    const uint32_t to = link_timeout_ms();
+    const uint32_t limit = (to > 0) ? to : 2000U;
+    return (AP_HAL::millis() - _last_rx_ms) <= limit;
+}
+
+void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
+{
+    const uint32_t to = link_timeout_ms();
+    if (to == 0 || _last_rx_ms == 0) {
+        return;
+    }
+    if ((now - _last_rx_ms) <= to) {
+        if (_run_link_failsafe) {
+            _run_link_failsafe = false;
+            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: Modbus link restored");
+        }
+        return;
+    }
+
+    if (!_run_link_failsafe) {
+        _run_link_failsafe = true;
+        _follow_moving = false;
+        _follow_sign = 0;
+        _follow_slot = 0;
+        _follow_last_spd = 0;
+        _queued_motion = 0;
+        // One-shot STOP on the next TX slot (half-duplex safe).
+        queue_motion(MOTION_STOP);
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                      "CL57R: Modbus link lost, STOP (> %ums)",
+                      (unsigned)to);
+        _last_run_link_warn_ms = now;
+        return;
+    }
+
+    if (_last_run_link_warn_ms == 0 ||
+        (now - _last_run_link_warn_ms) >= 2000) {
+        _last_run_link_warn_ms = now;
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "CL57R: Modbus link still down");
+    }
 }
 
 bool AP_ModbusSteering::in_home() const
@@ -540,6 +604,8 @@ void AP_ModbusSteering::start_home()
     _follow_alarm_count = 0;
     _follow_peak_toward = 0;
     _queued_motion = 0;
+    _run_link_failsafe = false;
+    _last_run_link_warn_ms = 0;
     _home_retry_pending = false;
     _home_stop_pending = false;
     _home_clear_pending = false;
@@ -1078,6 +1144,10 @@ void AP_ModbusSteering::update(float steering_out)
         _home_rx_lost_ms = 0;
     }
 
+    if (in_run()) {
+        handle_run_link_failsafe(now);
+    }
+
     if (_state == DriveState::HOME_WAIT) {
         const bool home_bit = (_got_status && (_status_word & STATUS_HOME_DONE) != 0);
         const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
@@ -1372,10 +1442,6 @@ void AP_ModbusSteering::update(float steering_out)
             _init_attempts++;
         }
     } else if (in_run()) {
-        if (!_speed_follow && _last_rx_ms != 0 && (now - _last_rx_ms) > 2000) {
-            _last_rx_ms = now;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus Timeout, continuing");
-        }
         if (!_speed_follow && _got_status && alarmed() &&
             (now - _last_alarm_warn_ms) > 5000) {
             _last_alarm_warn_ms = now;
@@ -1443,6 +1509,14 @@ void AP_ModbusSteering::update(float steering_out)
         if (_pending_run_spd) {
             send_u16(REG_MAX_SPD, run_speed_rpm());
             _pending_run_spd = false;
+            _state = DriveState::RUN_READ;
+            break;
+        }
+        if (_run_link_failsafe) {
+            // MOTION_STOP was queued on entry; do not resume stick or mid follow
+            // until CRC-valid RX clears the failsafe. Keep the half-duplex slot
+            // alive with a cheap enable write.
+            send_u16(REG_MOTOR_ENABLE, 0x0001);
             _state = DriveState::RUN_READ;
             break;
         }
