@@ -1053,6 +1053,39 @@ def run_cal_rx_abort():
             pass
 
 
+def run_link_to_zero():
+    """LINK_TO=0 disables post-cal STOP failsafe (arming still uses default)."""
+    ctl = default_control_file()
+    procs, _sitl, _sim = start_rover_and_sim(control_file=ctl)
+    try:
+        mavlink, events = connect_ready()
+        if mavlink is None:
+            return 1
+        set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+        if not calibrate_via_param(mavlink, events):
+            return 1
+        if not wait_mid_travel(mavlink, events):
+            print("FAIL: mid-travel required before LINK_TO=0 test")
+            return 1
+        set_param(mavlink, "OB_STR_LINK_TO", 0, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
+        time.sleep(0.3)
+        n_before = len(events)
+        write_sim_control(ctl, "DROP 4")
+        time.sleep(5.0)
+        collect_mavlink_events(mavlink, 1.0, events)
+        if any("Modbus link lost" in t for t in events[n_before:]):
+            print("FAIL: LINK_TO=0 still issued Modbus link lost STOP")
+            return 1
+        print("PASS: LINK_TO=0 disables run-link STOP")
+        return 0
+    finally:
+        stop_procs(procs)
+        try:
+            os.remove(ctl)
+        except OSError:
+            pass
+
+
 def run_cal_timeout():
     """CAL_TO short value must abort a stuck seek without waiting 90s."""
     procs, _sitl, _sim = start_rover_and_sim()
@@ -1140,6 +1173,7 @@ def main():
             "cal-mth18",
             "cal-rx-abort",
             "cal-timeout",
+            "link-to-zero",
             "follow-alarm",
             "coverage",
             "all",
@@ -1186,6 +1220,7 @@ def main():
         ("cal-mth18", "=== CAL_MTH=18 DUAL-LIMIT ===", run_cal_mth18),
         ("cal-rx-abort", "=== CAL RX ABORT ===", run_cal_rx_abort),
         ("cal-timeout", "=== CAL_TO HOME TIMEOUT ===", run_cal_timeout),
+        ("link-to-zero", "=== LINK_TO=0 NO STOP ===", run_link_to_zero),
         ("follow-alarm", "=== FOLLOW ALARM ===", run_follow_alarm),
     )
     for name, title, fn in coverage_tests:
