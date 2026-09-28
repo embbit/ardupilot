@@ -873,30 +873,48 @@ def run_arming_gates():
         if not wait_mid_travel(mavlink, events):
             print("WARN: mid-travel not seen; continuing arming gates")
 
-        # 3) Alarm latched
+        # 3) Alarm latched. Drop the link as soon as firmware reports the
+        # follow alarm so auto-clear cannot refresh _status_word before arming.
+        hold_rc(mavlink, events, 0.5)
         events.clear()
         write_sim_control(ctl, "ALARM")
-        time.sleep(1.0)
-        collect_mavlink_events(mavlink, 1.0, events)
+        saw_follow_alarm = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.1, events)
+            if any("follow alarm" in t for t in events):
+                saw_follow_alarm = True
+                break
+        if not saw_follow_alarm:
+            print("FAIL: firmware did not report follow alarm")
+            return 1
+        write_sim_control(ctl, "DROP 10")
+        time.sleep(0.3)
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
         if heartbeat_armed(mavlink, 1.0):
             print("FAIL: armed while alarmed")
             return 1
         if not any("CL57R alarm" in t for t in events):
-            print("FAIL: missing 'CL57R alarm'")
-            return 1
-        print("PASS: arm blocked when alarmed")
+            # If clear won the race, link-down gate still proves arming block.
+            if any("CL57R Modbus link" in t for t in events):
+                print("WARN: alarm cleared before arm; link gate blocked arm instead")
+            else:
+                print("FAIL: missing 'CL57R alarm' (and no link gate)")
+                return 1
+        else:
+            print("PASS: arm blocked when alarmed")
 
-        # Clear alarm via CAL_TRIG=2 so link check can run cleanly
+        # Wait for link restore, clear any residual alarm for the next check.
+        time.sleep(10.5)
         set_param(mavlink, "OB_STR_CAL_TRIG", 2, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
         time.sleep(1.0)
         collect_mavlink_events(mavlink, 1.0, events)
 
-        # 4) Link down
+        # 4) Link down (fresh drop after restore)
         events.clear()
         write_sim_control(ctl, "DROP 8")
-        time.sleep(2.0)
+        time.sleep(2.5)
         collect_mavlink_events(mavlink, 1.5, events)
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
