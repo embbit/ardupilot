@@ -48,8 +48,7 @@ class Nema23Motor:
         self.home_rpm = 0
         self.home_finish_at = 0.0
         self.home_runs = 0
-        # Alarm/stall: когда True, мотор НЕ исполняет команды позиции,
-        # пока не придёт alarm-clear (0x0037=0x0004). Моделирует tracking error.
+        # When True, ignore position commands until alarm-clear (0x0037=0x0004).
         self.alarmed = False
 
     def di_word(self):
@@ -136,7 +135,7 @@ class Nema23Motor:
             return
 
         if self.alarmed:
-            # Мотор в alarm: не двигается, ждёт alarm-clear. Позиция заморожена.
+            # Frozen until alarm-clear.
             self.velocity = 0.0
             self.speed_mode = False
         elif self.home_finish_at > 0.0:
@@ -274,6 +273,8 @@ sim_state = {
     "packets_rx": 0,
     "packets_dropped": 0,
     "telemetry_file": None,
+    "control_file": None,
+    "mute_reads": False,
     "last_cmd_target": 0,
 }
 
@@ -336,7 +337,7 @@ def _inject_position(pos):
 
 
 def _raise_alarm_at(pos):
-    """Заморозить мотор в позиции pos и выставить tracking-error alarm."""
+    """Freeze motor at pos and raise tracking-error alarm."""
     motor.position = float(pos)
     motor.reported_position = float(pos)
     motor.raise_alarm()
@@ -380,6 +381,51 @@ def check_link_schedule(now):
             sim_state["link_active"] = True
             print(f"[CL57R Modbus Sim] LINK UP (pos={motor.actual_pos} v={motor.velocity:+.0f} pps)")
         sim_state["link_restore_at"] = None
+
+
+def poll_control_file(now):
+    """Apply one-shot commands from --control-file (DROP/ALARM/MUTE/UNMUTE)."""
+    path = sim_state.get("control_file")
+    if not path:
+        return
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            lines = [ln.strip() for ln in fh.readlines() if ln.strip()]
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if not lines:
+        return
+    # Consume file so each command runs once.
+    try:
+        open(path, "w", encoding="ascii").close()
+    except OSError:
+        return
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        cmd = parts[0].upper()
+        if cmd == "DROP" and len(parts) >= 2:
+            duration = float(parts[1])
+            sim_state["link_drop_at"] = now
+            sim_state["link_restore_at"] = now + duration
+            print(f"[CL57R Modbus Sim] Control DROP {duration}s")
+        elif cmd == "ALARM" and len(parts) >= 2:
+            _raise_alarm_at(int(float(parts[1])))
+            print("[CL57R Modbus Sim] Control ALARM")
+        elif cmd == "ALARM":
+            _raise_alarm_at(motor.actual_pos)
+            print("[CL57R Modbus Sim] Control ALARM (current pos)")
+        elif cmd == "MUTE":
+            sim_state["mute_reads"] = True
+            print("[CL57R Modbus Sim] Control MUTE reads")
+        elif cmd == "UNMUTE":
+            sim_state["mute_reads"] = False
+            print("[CL57R Modbus Sim] Control UNMUTE reads")
+        else:
+            print(f"[CL57R Modbus Sim] Unknown control cmd: {line}")
 
 
 def handle_write_single(reg_addr, val):
@@ -454,10 +500,12 @@ def handle_write_single(reg_addr, val):
 
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
                          telemetry_file=None, link_drops=None, inject_positions=None,
-                         alarm_events=None, mute_reads=False):
+                         alarm_events=None, mute_reads=False, control_file=None):
     motor.encoder_lag_s = encoder_lag_ms / 1000.0
     motor.reported_position = motor.position
     sim_state["telemetry_file"] = telemetry_file
+    sim_state["control_file"] = control_file
+    sim_state["mute_reads"] = bool(mute_reads)
     sim_state["start_time"] = time.time()
     sim_state["link_schedule"] = []
     sim_state["inject_schedule"] = []
@@ -465,6 +513,12 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
     if telemetry_file:
         with open(telemetry_file, "w", encoding="ascii") as fh:
             fh.write("t,cmd_target,actual,encoder,vel,follow,err\n")
+    if control_file:
+        try:
+            open(control_file, "w", encoding="ascii").close()
+        except OSError:
+            pass
+        print(f"[CL57R Modbus Sim] Control file: {control_file}")
     if link_drops:
         schedule_link_drops(link_drops)
         print(f"[CL57R Modbus Sim] Link drop schedule: {link_drops}")
@@ -492,6 +546,7 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
         try:
             now = time.time()
             check_link_schedule(now)
+            poll_control_file(now)
 
             dt_s = now - last_physics_time
             motor.update(dt_s, sim_state["link_active"])
@@ -562,7 +617,7 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                         response.extend(req[2:6])
 
                     elif func_code == 0x03:
-                        if mute_reads:
+                        if sim_state.get("mute_reads"):
                             pass
                         elif reg_addr == 0x0007:
                             high_word, low_word = encode_position(motor.encoder_pos)
@@ -635,6 +690,8 @@ def parse_args():
                         help="Comma-separated delay:position pairs to raise tracking-error alarm")
     parser.add_argument("--mute-reads", action="store_true",
                         help="Ack writes but never reply to 0x03 (encoder/status)")
+    parser.add_argument("--control-file", type=str, default=None,
+                        help="Path polled for runtime cmds: DROP <s>, ALARM [pos], MUTE, UNMUTE")
     return parser.parse_args()
 
 
@@ -664,4 +721,5 @@ if __name__ == "__main__":
     if drop_delay is not None:
         link_drops = [(drop_delay, down_duration)]
     run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file,
-                         link_drops, inject_positions, alarm_events, args.mute_reads)
+                         link_drops, inject_positions, alarm_events, args.mute_reads,
+                         args.control_file)
