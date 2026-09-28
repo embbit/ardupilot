@@ -252,6 +252,10 @@ bool AP_ModbusSteering::link_ok() const
 
 void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
 {
+    // Param contract: run-link STOP applies after calibration only.
+    if (!_homed) {
+        return;
+    }
     const uint32_t to = link_timeout_ms();
     if (to == 0U || _last_rx_ms == 0U) {
         return;
