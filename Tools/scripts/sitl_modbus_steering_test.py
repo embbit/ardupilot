@@ -20,6 +20,18 @@ from pymavlink import mavutil  # noqa: E402
 MODBUS_LINK_TIMEOUT_S = 2.0
 
 
+def wipe_sitl_eeprom():
+    """Drop persisted SITL EEPROM so prior param_set values cannot bleed across tests."""
+    for name in ("eeprom.bin", "eeprom.dat"):
+        path = os.path.join(ROOT, name)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"WARN: could not remove {path}: {exc}")
+
+
 def wait_for_tcp_port(host, port, timeout_s=30):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -78,6 +90,7 @@ def wait_for_status(events, needle, timeout_s=60):
 
 
 def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
+    wipe_sitl_eeprom()
     sitl_lines = []
     sim_lines = []
 
@@ -355,6 +368,7 @@ def heartbeat_armed(mavlink, timeout_s):
 
 
 def run_param_trigger():
+    wipe_sitl_eeprom()
     sitl_lines = []
     sim_lines = []
     sim_cmd = [
@@ -685,7 +699,20 @@ def stop_procs(procs):
                 proc.kill()
 
 
+def wipe_sitl_eeprom():
+    """Drop persisted SITL EEPROM so prior param_set values cannot bleed across tests."""
+    for name in ("eeprom.bin", "eeprom.dat"):
+        path = os.path.join(ROOT, name)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"WARN: could not remove {path}: {exc}")
+
+
 def start_rover_and_sim(sim_extra=None, control_file=None):
+    wipe_sitl_eeprom()
     sitl_lines = []
     sim_lines = []
     sim_cmd = [sys.executable, "-u", os.path.join(ROOT, "outb_steer_sim.py")]
@@ -728,13 +755,14 @@ def connect_ready():
     return mavlink, events
 
 
-def set_cal_defaults(mavlink, cal_mode=1, cal_mth=17):
+def set_cal_defaults(mavlink, cal_mode=1, cal_mth=17, crawl_spd=200, seek_spd=1800):
     int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
     int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
     set_param(mavlink, "OB_STR_CAL_TRIG", 0, int8)
     set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
     set_param(mavlink, "OB_STR_RATIO", 10, int16)
-    set_param(mavlink, "OB_STR_SEEK_SPD", 1800, int16)
+    set_param(mavlink, "OB_STR_SEEK_SPD", seek_spd, int16)
+    set_param(mavlink, "OB_STR_CRAWL_SPD", crawl_spd, int16)
     set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
     set_param(mavlink, "OB_STR_CAL_MODE", cal_mode, int8)
     set_param(mavlink, "OB_STR_CAL_MTH", cal_mth, int8)
@@ -991,10 +1019,8 @@ def run_cal_rx_abort():
         mavlink, events = connect_ready()
         if mavlink is None:
             return 1
-        set_cal_defaults(mavlink)
         # Slow crawl so DROP can win the race before _saw_home_motion latches.
-        set_param(mavlink, "OB_STR_CRAWL_SPD", 5, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
-        set_param(mavlink, "OB_STR_SEEK_SPD", 5, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
+        set_cal_defaults(mavlink, crawl_spd=5, seek_spd=5)
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
         # Reach HOME_WAIT (prep needs link), then drop before encoder motion.
         seek_started = False
