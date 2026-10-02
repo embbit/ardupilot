@@ -109,6 +109,9 @@ private:
     uint32_t _last_send_ms = 0;
     uint32_t _last_vect_ms = 0;
     uint32_t _last_rx_ms = 0;
+    uint32_t _last_bus_ms = 0;
+    uint32_t _link_lost_candidate_ms = 0;
+    uint32_t _rx_crc_err = 0;
     uint32_t _home_start_ms = 0;
     uint32_t _last_home_retry_ms = 0;
     uint32_t _last_home_norx_ms = 0;

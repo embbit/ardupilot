@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.6";
+constexpr const char *CL57R_FW_TAG = "v12.7";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -63,6 +63,9 @@ constexpr uint32_t HOME_RX_SILENCE_MS = 12000;
 // Used by link_ok() when LINK_TO is 0 (run failsafe stop disabled).
 constexpr uint32_t LINK_OK_DEFAULT_MS = 2000;
 constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
+// Half-duplex RS485 often corrupts replies during TX; require sustained
+// silence (no good CRC and no slave-addressed junk) before STOP.
+constexpr uint32_t LINK_LOST_CONFIRM_MS = 500;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
@@ -199,7 +202,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: LINK_TO
     // @DisplayName: Modbus link timeout
-    // @Description: After calibration, if no CRC-valid Modbus RX for this many ms, send MOTION STOP and halt stick follow until the link returns. Also used by arming link_ok(). 0 disables run failsafe stop (not recommended).
+    // @Description: After calibration, if no Modbus bus activity (good CRC or slave-addressed frames) for this many ms, send MOTION STOP and halt stick follow until the link returns. Also used by arming link_ok(). Half-duplex CRC noise alone does not trip. 0 disables run failsafe stop (not recommended).
     // @Units: ms
     // @Range: 0 30000
     // @User: Standard
@@ -277,8 +280,15 @@ bool AP_ModbusSteering::link_ok() const
     }
     const uint32_t to = link_timeout_ms();
     const uint32_t limit = (to > 0U) ? to : LINK_OK_DEFAULT_MS;
-    // Unsigned millis wrap is intentional (uint32_t modular difference).
-    return (AP_HAL::millis() - _last_rx_ms) <= limit;
+    const uint32_t now = AP_HAL::millis();
+    // Good CRC frames, or recent slave-addressed traffic (incl. CRC junk).
+    if ((now - _last_rx_ms) <= limit) {
+        return true;
+    }
+    if (_last_bus_ms != 0U && (now - _last_bus_ms) <= limit) {
+        return true;
+    }
+    return false;
 }
 
 void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
@@ -289,14 +299,31 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
     }
     const uint32_t to = link_timeout_ms();
     if (to == 0U || _last_rx_ms == 0U) {
+        _link_lost_candidate_ms = 0;
         return;
     }
-    // Unsigned millis wrap is intentional (uint32_t modular difference).
-    if ((now - _last_rx_ms) <= to) {
+    // Bus is up if we still see CRC-valid frames OR slave-addressed noise
+    // (half-duplex collisions during speed-follow look like "silence" on
+    // _last_rx_ms alone and were flapping lost/restored every few seconds).
+    const uint32_t good_age = now - _last_rx_ms;
+    const uint32_t bus_ms = (_last_bus_ms != 0U) ? _last_bus_ms : _last_rx_ms;
+    const uint32_t bus_age = now - bus_ms;
+    if (good_age <= to || bus_age <= to) {
+        _link_lost_candidate_ms = 0;
         if (_run_link_failsafe) {
             _run_link_failsafe = false;
-            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: Modbus link restored");
+            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE,
+                          "CL57R: Modbus link restored (crc_err=%u)",
+                          (unsigned)_rx_crc_err);
         }
+        return;
+    }
+
+    if (_link_lost_candidate_ms == 0U) {
+        _link_lost_candidate_ms = now;
+        return;
+    }
+    if ((now - _link_lost_candidate_ms) < LINK_LOST_CONFIRM_MS) {
         return;
     }
 
@@ -309,8 +336,8 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
         // Replace any pending motion with a half-duplex-safe STOP.
         queue_motion(MOTION_STOP);
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                      "CL57R: Modbus link lost, STOP (> %ums)",
-                      (unsigned)to);
+                      "CL57R: Modbus link lost, STOP (silent %ums crc_err=%u)",
+                      (unsigned)good_age, (unsigned)_rx_crc_err);
         _last_run_link_warn_ms = now;
         return;
     }
@@ -318,7 +345,9 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
     if (_last_run_link_warn_ms == 0U ||
         (now - _last_run_link_warn_ms) >= LINK_WARN_INTERVAL_MS) {
         _last_run_link_warn_ms = now;
-        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "CL57R: Modbus link still down");
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                      "CL57R: Modbus link still down (crc_err=%u)",
+                      (unsigned)_rx_crc_err);
     }
 }
 
@@ -944,12 +973,17 @@ void AP_ModbusSteering::consume_rx()
         }
         const uint16_t received_crc = (_rx_buf[offset + frame_len - 1] << 8) | _rx_buf[offset + frame_len - 2];
         if (modbus_crc16(&_rx_buf[offset], frame_len - 2) != received_crc) {
+            // Slave-addressed frame with bad CRC: bus is alive (typical
+            // half-duplex collide). Do not treat as link-down silence.
+            _rx_crc_err++;
+            _last_bus_ms = AP_HAL::millis();
             offset++;
             continue;
         }
 
         _ever_got_rx = true;
         _last_rx_ms = AP_HAL::millis();
+        _last_bus_ms = _last_rx_ms;
 
         const uint8_t fn = _rx_buf[offset + 1];
         if (fn == 0x06) {
