@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.12";
+constexpr const char *CL57R_FW_TAG = "v12.13";
 // After leaving a limit, stale OT may linger — clear+same-dir, don't reverse.
 constexpr uint32_t LEAVE_ALARM_GRACE_MS = 5000;
 constexpr uint8_t REAPPROACH_MAX = 10;
@@ -469,11 +469,9 @@ void AP_ModbusSteering::begin_di_recover(uint32_t now, const char *why)
 
 void AP_ModbusSteering::begin_forward_reapproach(uint32_t now, const char *why)
 {
-    // Clear alarm and keep crawling the SAME way. Do not enter soft-crawl
-    // until we have actually left the opposite switch.
-    if (_home_leg == 1 && _cal_phase == CalPhase::LEG2_SEEK && _leg2_left_l1) {
-        _cal_phase = CalPhase::LEG2_CRAWL;
-    }
+    // Clear alarm and keep the SAME direction. Never demote SEEK→CRAWL here
+    // (HW: that dropped cruise to 300rpm and failed to leave L1). Soft-crawl
+    // is only entered at soft_at in HOME_WAIT.
     _home_leg_settling = false;
     _home_stop_pending = true;
     _home_soft_spd_pending = false;
@@ -1575,19 +1573,24 @@ void AP_ModbusSteering::update(float steering_out)
                 !both_limits_di &&
                 !on_target_di;
 
-            // Still on opposite DI, or just left it: never reverse into it.
-            // HW v12.11: leg2 recover fired while still on L1 (left_opp unset).
+            // Still on opposite DI, or not yet far enough toward the far DI:
+            // never reverse back into the switch we are leaving.
+            // HW v12.12: after off L1, X1 bounced on, 9x reapproach demoted to
+            // crawl, grace expired → recover reverse into L1.
             const bool still_on_opp =
                 _saw_opp_di && _got_di && opposite_limit_di_active();
             const bool leave_guard =
                 still_on_opp ||
+                (_leg2_left_l1 && _leg_peak_travel < min_di) ||
                 (_left_opp_ms != 0 &&
                  (_leg_peak_travel < min_hit ||
                   (now - _left_opp_ms) < LEAVE_ALARM_GRACE_MS));
+            // Debounce only while leave_guard (unlimited attempts). Cap only
+            // applies outside leave (should not reverse-spam either).
             const bool reapproach_ok =
-                _reapproach_count < REAPPROACH_MAX &&
                 (_reapproach_last_ms == 0 ||
-                 (now - _reapproach_last_ms) > 800);
+                 (now - _reapproach_last_ms) > 800) &&
+                (leave_guard || _reapproach_count < REAPPROACH_MAX);
 
             // Recompute: leave may have armed stop/clear/soft this cycle.
             const bool busy_now = _home_stop_pending || _home_clear_pending ||
@@ -1596,24 +1599,14 @@ void AP_ModbusSteering::update(float steering_out)
             if (!in_recover && !busy_now && !_home_leg_settling) {
                 if (di_hit || start_on_limit) {
                     latch_di_extreme_and_finish(now);
-                } else if (still_on_opp && _got_status && alarmed() &&
-                           reapproach_ok) {
-                    // Leaving the pressed switch: clear OT and keep leave
-                    // direction immediately (do not wait seek_armed / reverse).
-                    begin_forward_reapproach(now, "on opp DI");
+                } else if (leave_guard && _got_status && alarmed() &&
+                           reapproach_ok && !past_expected) {
+                    // Leaving / not yet at far DI: clear OT, keep leave dir.
+                    const char *why = still_on_opp ? "on opp DI" : "leave OT";
+                    begin_forward_reapproach(now, why);
                 } else if (alarm_past || past_expected || stalled || far_end_no_di) {
-                    // Never finish without DI.
-                    // On/just-left opposite → same-dir only.
-                    // Else → reverse recover.
-                    if (leave_guard && !past_expected &&
-                        (alarm_past || far_end_no_di || stalled)) {
-                        if (reapproach_ok) {
-                            begin_forward_reapproach(
-                                now,
-                                far_end_no_di && !alarm_past
-                                ? "far end no DI" : "leave OT");
-                        }
-                    } else if (!leave_guard) {
+                    // Past leave window: reverse recover to find DI.
+                    if (!leave_guard) {
                         const char *why = "alarm";
                         if (far_end_no_di && !alarm_past) {
                             why = "far end no DI";
