@@ -9,10 +9,10 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.11";
+constexpr const char *CL57R_FW_TAG = "v12.12";
 // After leaving a limit, stale OT may linger — clear+same-dir, don't reverse.
-constexpr uint32_t LEAVE_ALARM_GRACE_MS = 4000;
-constexpr uint8_t REAPPROACH_MAX = 8;
+constexpr uint32_t LEAVE_ALARM_GRACE_MS = 5000;
+constexpr uint8_t REAPPROACH_MAX = 10;
 // While reversing out of a hard stop, re-clear OT a few times before abort.
 constexpr uint8_t RECOVER_NUDGE_MAX = 4;
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
@@ -469,9 +469,9 @@ void AP_ModbusSteering::begin_di_recover(uint32_t now, const char *why)
 
 void AP_ModbusSteering::begin_forward_reapproach(uint32_t now, const char *why)
 {
-    // Clear alarm and keep crawling the SAME way. Used when leg2 still has
-    // stale L1 OT / early SEEK alarm — reverse would return to the first limit.
-    if (_home_leg == 1 && _cal_phase == CalPhase::LEG2_SEEK) {
+    // Clear alarm and keep crawling the SAME way. Do not enter soft-crawl
+    // until we have actually left the opposite switch.
+    if (_home_leg == 1 && _cal_phase == CalPhase::LEG2_SEEK && _leg2_left_l1) {
         _cal_phase = CalPhase::LEG2_CRAWL;
     }
     _home_leg_settling = false;
@@ -1575,12 +1575,15 @@ void AP_ModbusSteering::update(float steering_out)
                 !both_limits_di &&
                 !on_target_di;
 
-            // After leaving a limit: never reverse until we have real stroke
-            // away from it (grace OR peak < min_hit). Same both legs.
+            // Still on opposite DI, or just left it: never reverse into it.
+            // HW v12.11: leg2 recover fired while still on L1 (left_opp unset).
+            const bool still_on_opp =
+                _saw_opp_di && _got_di && opposite_limit_di_active();
             const bool leave_guard =
-                _left_opp_ms != 0 &&
-                (_leg_peak_travel < min_hit ||
-                 (now - _left_opp_ms) < LEAVE_ALARM_GRACE_MS);
+                still_on_opp ||
+                (_left_opp_ms != 0 &&
+                 (_leg_peak_travel < min_hit ||
+                  (now - _left_opp_ms) < LEAVE_ALARM_GRACE_MS));
             const bool reapproach_ok =
                 _reapproach_count < REAPPROACH_MAX &&
                 (_reapproach_last_ms == 0 ||
@@ -1593,11 +1596,15 @@ void AP_ModbusSteering::update(float steering_out)
             if (!in_recover && !busy_now && !_home_leg_settling) {
                 if (di_hit || start_on_limit) {
                     latch_di_extreme_and_finish(now);
+                } else if (still_on_opp && _got_status && alarmed() &&
+                           reapproach_ok) {
+                    // Leaving the pressed switch: clear OT and keep leave
+                    // direction immediately (do not wait seek_armed / reverse).
+                    begin_forward_reapproach(now, "on opp DI");
                 } else if (alarm_past || past_expected || stalled || far_end_no_di) {
                     // Never finish without DI.
-                    // leave_guard (just left a switch / short stroke since):
-                    //   same-direction reapproach only — never reverse into it.
-                    // Otherwise: reverse recover (jam / stall / overshoot).
+                    // On/just-left opposite → same-dir only.
+                    // Else → reverse recover.
                     if (leave_guard && !past_expected &&
                         (alarm_past || far_end_no_di || stalled)) {
                         if (reapproach_ok) {
@@ -1606,7 +1613,7 @@ void AP_ModbusSteering::update(float steering_out)
                                 far_end_no_di && !alarm_past
                                 ? "far end no DI" : "leave OT");
                         }
-                    } else {
+                    } else if (!leave_guard) {
                         const char *why = "alarm";
                         if (far_end_no_di && !alarm_past) {
                             why = "far end no DI";
