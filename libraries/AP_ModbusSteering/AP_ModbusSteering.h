@@ -186,10 +186,14 @@ private:
     uint32_t _recover_start_ms = 0;
     uint8_t _reapproach_count = 0;
     uint32_t _reapproach_last_ms = 0;
+    uint8_t _recover_nudge_count = 0;
     bool _di_extreme_latched = false;
     bool _leg2_left_l1 = false;
     bool _leg2_saw_l1_di = false;
     uint32_t _leg2_seek_ms = 0;
+    // Any leg: opposite DI seen then cleared (stale OT after leave).
+    bool _saw_opp_di = false;
+    uint32_t _left_opp_ms = 0;
     bool _home_retry_clear_next = true;
     bool _di_both_ignore = false;
     uint32_t _di_both_since_ms = 0;
