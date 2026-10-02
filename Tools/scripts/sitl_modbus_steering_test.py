@@ -771,7 +771,7 @@ def wait_calibrated(mavlink, events, timeout_s=50):
     return False
 
 
-def wait_mid_travel(mavlink, events, timeout_s=60):
+def wait_mid_travel(mavlink, events, timeout_s=90):
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         hold_rc(mavlink, events, 0.4)

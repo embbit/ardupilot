@@ -1634,8 +1634,9 @@ void AP_ModbusSteering::update(float steering_out)
                                                             : "leave OT");
                     begin_forward_reapproach(now, why);
                 } else if (alarm_past || past_expected || stalled || far_end_no_di) {
-                    // Past leave window: reverse recover to find DI.
-                    if (!leave_guard) {
+                    // Encoder freeze always reverse-recovers (even mid short-stroke).
+                    // Otherwise reverse only outside leave_guard.
+                    if ((stalled && !alarm_past) || !leave_guard) {
                         const char *why = "alarm";
                         if (far_end_no_di && !alarm_past) {
                             why = "far end no DI";
@@ -2120,10 +2121,10 @@ void AP_ModbusSteering::update(float steering_out)
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
-                } else if (stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
-                           _follow_peak_toward > abs_goal_run / 3) {
-                    // Physical mid: re-base. Do NOT AUX_POS_ZERO (drive may also
-                    // spontaneously re-zero — stick-center must HOLD, not chase 0).
+                } else if (_follow_peak_toward > abs_goal_run / 4 &&
+                           abs_err <= stop_db) {
+                    // Stopped inside brake window after real progress — done.
+                    // (Tighter arrive_db caused endless 60rpm hunt in SITL.)
                     _center_encoder_origin = _actual_pulses;
                     _steer_cmd_offset = 0;
                     _have_target = true;
