@@ -88,6 +88,7 @@ private:
     bool cal_phase_reverse() const;
     int16_t cal_phase_spd_signed() const;
     void begin_di_recover(uint32_t now, const char *why);
+    void begin_forward_reapproach(uint32_t now, const char *why);
     void latch_di_extreme_and_finish(uint32_t now);
     void home_leg_done(uint32_t now);
     uint32_t link_timeout_ms() const;
@@ -183,6 +184,8 @@ private:
     bool _leg1_recovered = false;
     bool _recover_saw_motion = false;
     uint32_t _recover_start_ms = 0;
+    uint8_t _reapproach_count = 0;
+    uint32_t _reapproach_last_ms = 0;
     bool _di_extreme_latched = false;
     bool _leg2_left_l1 = false;
     bool _leg2_saw_l1_di = false;

@@ -9,7 +9,10 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.8";
+constexpr const char *CL57R_FW_TAG = "v12.9";
+// Stale L1 OT alarm right after leave must not reverse-recover back to L1.
+constexpr uint32_t LEG2_ALARM_GRACE_MS = 2500;
+constexpr uint8_t REAPPROACH_MAX = 6;
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -461,6 +464,27 @@ void AP_ModbusSteering::begin_di_recover(uint32_t now, const char *why)
                   "CL57R: recover DI (%s)", why != nullptr ? why : "alarm");
 }
 
+void AP_ModbusSteering::begin_forward_reapproach(uint32_t now, const char *why)
+{
+    // Clear alarm and keep crawling the SAME way. Used when leg2 still has
+    // stale L1 OT / early SEEK alarm — reverse would return to the first limit.
+    if (_home_leg == 1 && _cal_phase == CalPhase::LEG2_SEEK) {
+        _cal_phase = CalPhase::LEG2_CRAWL;
+    }
+    _home_leg_settling = false;
+    _home_stop_pending = true;
+    _home_soft_spd_pending = false;
+    _home_crawl_resume_pending = true;
+    _reapproach_count++;
+    _reapproach_last_ms = now;
+    _saw_target_di_clear = !target_limit_di_active();
+    _last_home_progress_ms = now;
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                  "CL57R: reapproach (%s) n=%u",
+                  why != nullptr ? why : "alarm",
+                  (unsigned)_reapproach_count);
+}
+
 void AP_ModbusSteering::latch_di_extreme_and_finish(uint32_t now)
 {
     // Extreme = encoder on the limit switch. Overwrite any hard-stop peak.
@@ -696,6 +720,8 @@ void AP_ModbusSteering::start_home()
     _di_both_since_ms = 0;
     _recover_saw_motion = false;
     _recover_start_ms = 0;
+    _reapproach_count = 0;
+    _reapproach_last_ms = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
@@ -1161,6 +1187,8 @@ void AP_ModbusSteering::advance_home()
         _home_crawl_resume_pending = false;
         _home_soft_spd_pending = false;
         _recover_saw_motion = false;
+        _reapproach_count = 0;
+        _reapproach_last_ms = 0;
         _di_extreme_latched = false;
         _home_retry_clear_next = true;
         _di_both_ignore = false;
@@ -1389,6 +1417,11 @@ void AP_ModbusSteering::update(float steering_out)
                  (now - _home_start_ms) > 2000)) {
                 _leg2_left_l1 = true;
                 _leg2_seek_ms = now;
+                // Drop stale L1 OT before cruise — otherwise alarm_past fires
+                // within ~1s and reverse-recover returns to the first switch.
+                if (_got_status && alarmed()) {
+                    _home_stop_pending = true; // STOP → CLEAR → soft_spd
+                }
                 _home_soft_spd_pending = true;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                               "CL57R: off L1, SEEK cruise @%d",
@@ -1485,28 +1518,66 @@ void AP_ModbusSteering::update(float steering_out)
                 !both_limits_di &&
                 !on_target_di;
 
-            // Leg2 SEEK can overshoot the DI poll window at high RPM. If we
-            // already traveled ~soft_at and alarm at the far stop, latch.
-            const bool far_end_alarm =
+            // Leg2 at soft_at with alarm but no target DI: do not latch
+            // di=0000 (HW: false mid and wrong travel).
+            const bool far_end_no_di =
                 approach && seek_armed && _home_leg == 1 &&
                 _got_status && alarmed() && _saw_home_motion &&
-                expected >= 20000 &&
+                span >= 20000 &&
                 _leg_peak_travel >= soft_at &&
                 !both_limits_di &&
-                !opposite_limit_di_active();
+                !on_target_di;
 
-            if (!in_recover && !busy && !_home_leg_settling) {
-                if (di_hit || start_on_limit || far_end_alarm) {
+            // Right after leaving L1 the drive often keeps OT alarm; reverse
+            // recover sends the shaft back to the first switch (HW log).
+            const bool leg2_early =
+                _home_leg == 1 &&
+                (_leg_peak_travel < min_di ||
+                 (_leg2_left_l1 && _leg2_seek_ms != 0 &&
+                  (now - _leg2_seek_ms) < LEG2_ALARM_GRACE_MS));
+            const bool reapproach_ok =
+                _reapproach_count < REAPPROACH_MAX &&
+                (_reapproach_last_ms == 0 ||
+                 (now - _reapproach_last_ms) > 800);
+
+            // Recompute: leave→SEEK may have armed stop/clear/soft this cycle.
+            const bool busy_now = _home_stop_pending || _home_clear_pending ||
+                                  _home_soft_spd_pending ||
+                                  _home_crawl_resume_pending;
+            if (!in_recover && !busy_now && !_home_leg_settling) {
+                if (di_hit || start_on_limit) {
                     latch_di_extreme_and_finish(now);
-                } else if (alarm_past || past_expected || stalled) {
-                    // Never finish on alarm / past-estimate / stall — find the DI.
-                    const char *why = "alarm";
-                    if (stalled && !alarm_past && !past_expected) {
-                        why = "stall";
-                    } else if (past_expected && !alarm_past) {
-                        why = "past estimate";
+                } else if (alarm_past || past_expected || stalled || far_end_no_di) {
+                    // Never finish without DI. Prefer forward reapproach while
+                    // still short of the far end; reverse only after overshoot
+                    // or exhausted reapproach attempts.
+                    const bool want_reverse =
+                        past_expected ||
+                        (_reapproach_count >= REAPPROACH_MAX) ||
+                        (far_end_no_di && !leg2_early &&
+                         _reapproach_count >= 2);
+                    if (!want_reverse && reapproach_ok &&
+                        (alarm_past || stalled || far_end_no_di || leg2_early)) {
+                        const char *why = "alarm";
+                        if (leg2_early) {
+                            why = "early L2";
+                        } else if (stalled && !alarm_past) {
+                            why = "stall";
+                        } else if (far_end_no_di && !alarm_past) {
+                            why = "far end no DI";
+                        }
+                        begin_forward_reapproach(now, why);
+                    } else {
+                        const char *why = "alarm";
+                        if (far_end_no_di && !alarm_past) {
+                            why = "far end no DI";
+                        } else if (stalled && !alarm_past && !past_expected) {
+                            why = "stall";
+                        } else if (past_expected && !alarm_past) {
+                            why = "past estimate";
+                        }
+                        begin_di_recover(now, why);
                     }
-                    begin_di_recover(now, why);
                 }
             } else if (!in_recover && _home_leg_settling && !busy &&
                        now >= _home_leg_settle_ms) {
@@ -1834,8 +1905,12 @@ void AP_ModbusSteering::update(float steering_out)
                     const bool mid_return = (_steer_cmd_offset != 0);
                     const int32_t abs_goal = (_steer_cmd_offset >= 0) ?
                                             _steer_cmd_offset : -_steer_cmd_offset;
+                    // Require real progress toward mid. Encoder glitches after
+                    // alarm clear can look "past" mid with peak still ~0.
+                    const bool mid_progress =
+                        mid_return && _follow_peak_toward > (abs_goal / 3);
                     const bool near_or_past =
-                        mid_return &&
+                        mid_progress &&
                         (_follow_peak_toward > (abs_goal - mid_stop) ||
                          abs_err <= mid_stop ||
                          (_follow_sign < 0 && enc <= target) ||
@@ -1947,13 +2022,21 @@ void AP_ModbusSteering::update(float steering_out)
                 ((_follow_sign < 0 && enc <= target) ||
                  (_follow_sign > 0 && enc >= target));
             const int32_t stop_db = (_steer_cmd_offset != 0) ? mid_stop : arrive_db;
-            if (_steer_cmd_offset != 0 && (crossed_mid || abs_err <= stop_db)) {
+            const int32_t abs_goal_run = (_steer_cmd_offset >= 0) ?
+                                         _steer_cmd_offset : -_steer_cmd_offset;
+            const bool mid_moved =
+                (_steer_cmd_offset == 0) ||
+                (_follow_peak_toward > abs_goal_run / 3) ||
+                (_follow_moving && abs_err <= stop_db);
+            if (_steer_cmd_offset != 0 && mid_moved &&
+                (crossed_mid || abs_err <= stop_db)) {
                 if (_follow_moving) {
                     send_u16(REG_MOTION, MOTION_STOP);
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
-                } else if (stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                } else if (stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
+                           _follow_peak_toward > abs_goal_run / 3) {
                     // Physical mid: re-base. Do NOT AUX_POS_ZERO (drive may also
                     // spontaneously re-zero — stick-center must HOLD, not chase 0).
                     _center_encoder_origin = _actual_pulses;
