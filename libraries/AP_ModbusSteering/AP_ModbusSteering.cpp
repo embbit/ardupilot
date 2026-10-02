@@ -9,10 +9,10 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.10";
+constexpr const char *CL57R_FW_TAG = "v12.11";
 // After leaving a limit, stale OT may linger — clear+same-dir, don't reverse.
-constexpr uint32_t LEAVE_ALARM_GRACE_MS = 2500;
-constexpr uint8_t REAPPROACH_MAX = 6;
+constexpr uint32_t LEAVE_ALARM_GRACE_MS = 4000;
+constexpr uint8_t REAPPROACH_MAX = 8;
 // While reversing out of a hard stop, re-clear OT a few times before abort.
 constexpr uint8_t RECOVER_NUDGE_MAX = 4;
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
@@ -1207,6 +1207,8 @@ void AP_ModbusSteering::advance_home()
             _leg2_left_l1 = false;
             _leg2_saw_l1_di = false;
             _leg2_seek_ms = 0;
+            // Sitting on L1 at leg2 start — opposite for this leg.
+            _saw_opp_di = true;
         }
         if (_home_speed_leg) {
             const char *phase = "crawl";
@@ -1322,16 +1324,21 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t moved = (delta >= 0) ? delta : -delta;
         bool enc_rebase = false;
         if (moved > _leg_peak_travel) {
-            // AUX_POS_ZERO after L1 can race: start_pulses captured pre-zero then
-            // encoder snaps → false peak ≈ full travel and instant "limit hit".
+            // Drive may snap encoder on alarm-clear at L1. Rebase peak, but
+            // never clear motion flags after leaving a limit — that armed
+            // start_jam and reverse-recovered back into the stop (HW v12.10).
             const int32_t expected_chk = expected_full_travel_pulses();
             const int32_t jump = moved - _leg_peak_travel;
+            const bool left_already =
+                (_left_opp_ms != 0) || _leg2_left_l1;
             if (expected_chk >= 20000 && jump > expected_chk / 2 &&
                 (now - _home_start_ms) < 2500) {
                 _home_start_pulses = _actual_pulses;
                 _leg_peak_travel = 0;
-                _saw_home_motion = false;
-                _saw_home_run = false;
+                if (!left_already) {
+                    _saw_home_motion = false;
+                    _saw_home_run = false;
+                }
                 enc_rebase = true;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                               "CL57R: seek enc jump, rebase");
@@ -1513,13 +1520,17 @@ void AP_ModbusSteering::update(float steering_out)
             const bool start_on_limit =
                 on_approach &&
                 !_saw_home_motion &&
+                _left_opp_ms == 0 &&
                 (now - _home_start_ms) > 1500 &&
                 _got_di && target_limit_di_active() &&
                 !opposite_limit_di_active() && !both_limits_di;
-            // Start jammed (alarm, no motion) → reverse recover (either leg).
+            // True start jam only before leaving any switch. After leave,
+            // enc-rebase clearing motion must not look like start_jam.
             const bool start_jam =
                 on_approach &&
                 !_saw_home_motion &&
+                _left_opp_ms == 0 &&
+                !_leg2_left_l1 &&
                 (now - _home_start_ms) > 1500 &&
                 _got_status && alarmed();
 
@@ -1564,11 +1575,12 @@ void AP_ModbusSteering::update(float steering_out)
                 !both_limits_di &&
                 !on_target_di;
 
-            // Same for both legs: reapproach only right after leaving a limit
-            // (stale OT). Jam into a hard stop with no leave → reverse.
-            const bool just_left_opp =
+            // After leaving a limit: never reverse until we have real stroke
+            // away from it (grace OR peak < min_hit). Same both legs.
+            const bool leave_guard =
                 _left_opp_ms != 0 &&
-                (now - _left_opp_ms) < LEAVE_ALARM_GRACE_MS;
+                (_leg_peak_travel < min_hit ||
+                 (now - _left_opp_ms) < LEAVE_ALARM_GRACE_MS);
             const bool reapproach_ok =
                 _reapproach_count < REAPPROACH_MAX &&
                 (_reapproach_last_ms == 0 ||
@@ -1582,19 +1594,18 @@ void AP_ModbusSteering::update(float steering_out)
                 if (di_hit || start_on_limit) {
                     latch_di_extreme_and_finish(now);
                 } else if (alarm_past || past_expected || stalled || far_end_no_di) {
-                    // Never finish without DI. Identical policy both legs:
-                    // just-left-opposite + alarm → same-dir reapproach;
-                    // jam / stall / overshoot → reverse recover.
-                    const bool do_reapproach =
-                        just_left_opp && reapproach_ok &&
-                        (alarm_past || far_end_no_di) &&
-                        !past_expected &&
-                        !start_jam &&
-                        !(stalled && !alarm_past);
-                    if (do_reapproach) {
-                        begin_forward_reapproach(now,
-                                                 far_end_no_di && !alarm_past
-                                                 ? "far end no DI" : "leave OT");
+                    // Never finish without DI.
+                    // leave_guard (just left a switch / short stroke since):
+                    //   same-direction reapproach only — never reverse into it.
+                    // Otherwise: reverse recover (jam / stall / overshoot).
+                    if (leave_guard && !past_expected &&
+                        (alarm_past || far_end_no_di || stalled)) {
+                        if (reapproach_ok) {
+                            begin_forward_reapproach(
+                                now,
+                                far_end_no_di && !alarm_past
+                                ? "far end no DI" : "leave OT");
+                        }
                     } else {
                         const char *why = "alarm";
                         if (far_end_no_di && !alarm_past) {
