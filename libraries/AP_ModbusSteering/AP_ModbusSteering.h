@@ -178,6 +178,9 @@ private:
     bool _recover_saw_motion = false;
     uint32_t _recover_start_ms = 0;
     bool _di_extreme_latched = false;
+    bool _leg2_left_l1 = false;
+    bool _leg2_saw_l1_di = false;
+    bool _home_retry_clear_next = true;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;

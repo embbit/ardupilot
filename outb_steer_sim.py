@@ -175,6 +175,13 @@ class Nema23Motor:
             # Continuous speed mode (0x0036 Bit3): run at signed MAX_SPD.
             direction = 1.0 if self.max_rpm_signed >= 0 else -1.0
             target_vel = self.max_vel * direction
+            # Limit switches block further travel into the stop, not leave.
+            # X1 at negative end → block more -vel; X2 at positive end → block +vel.
+            di = self.di_word()
+            if (di & (1 << 1)) and target_vel < 0:
+                target_vel = 0.0
+            if (di & (1 << 2)) and target_vel > 0:
+                target_vel = 0.0
             if abs(self.velocity - target_vel) < 1.0:
                 self.velocity = target_vel
             elif self.velocity < target_vel:
