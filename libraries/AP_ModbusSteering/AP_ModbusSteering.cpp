@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.1";
+constexpr const char *CL57R_FW_TAG = "v12.2";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -66,6 +66,9 @@ constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
+// Encoder peak frozen this long during approach → treat as hard-stop stall
+// (DI missing or alarm bit late). Reverse-crawl to find the switch.
+constexpr uint32_t HOME_STALL_MS = 4000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
@@ -864,9 +867,22 @@ void AP_ModbusSteering::finish_home()
 void AP_ModbusSteering::abort_home(const char *reason)
 {
     GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: %s", reason);
+    // Snapshot helps HW bring-up when DI/alarm/geometry are wrong.
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                  "CL57R: abort di=%04x st=%04x pk=%d",
+                  (unsigned)_di_word,
+                  (unsigned)_status_word,
+                  (int)_leg_peak_travel);
     _state = DriveState::RUN_WRITE;
     _have_target = false;
     _rx_expect = RxExpect::NONE;
+    _home_speed_leg = false;
+    _home_stop_pending = false;
+    _home_clear_pending = false;
+    _home_soft_spd_pending = false;
+    _home_crawl_resume_pending = false;
+    // Never leave speed-mode running into a hard stop after cal abort.
+    queue_motion(MOTION_STOP);
     if (cal_trig.get() == 1) {
         cal_trig.set_and_save(0);
     }
@@ -1321,13 +1337,24 @@ void AP_ModbusSteering::update(float steering_out)
                 _saw_home_motion &&
                 (now - _home_start_ms) > 800 &&
                 (_leg_peak_travel >= expected + expected / 4);
+            // Hard stop with no DI bit / late alarm: encoder peak freezes.
+            const bool stalled =
+                approach && seek_armed && _saw_home_motion &&
+                !both_limits_di &&
+                (now - _last_home_progress_ms) >= HOME_STALL_MS;
 
             if (!in_recover && !busy && !_home_leg_settling) {
                 if (di_hit || start_on_limit) {
                     latch_di_extreme_and_finish(now);
-                } else if (alarm_past || past_expected) {
-                    // Never finish on alarm / past-estimate — find the DI.
-                    begin_di_recover(now, past_expected ? "past estimate" : "alarm");
+                } else if (alarm_past || past_expected || stalled) {
+                    // Never finish on alarm / past-estimate / stall — find the DI.
+                    const char *why = "alarm";
+                    if (stalled && !alarm_past && !past_expected) {
+                        why = "stall";
+                    } else if (past_expected && !alarm_past) {
+                        why = "past estimate";
+                    }
+                    begin_di_recover(now, why);
                 }
             } else if (!in_recover && _home_leg_settling && !busy &&
                        now >= _home_leg_settle_ms) {

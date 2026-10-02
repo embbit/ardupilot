@@ -1088,7 +1088,7 @@ def run_link_to_zero():
 
 def run_cal_timeout():
     """CAL_TO short value must abort a stuck seek without waiting 90s."""
-    procs, _sitl, _sim = start_rover_and_sim()
+    procs, _sitl, sim_lines = start_rover_and_sim()
     try:
         mavlink, events = connect_ready()
         if mavlink is None:
@@ -1110,10 +1110,63 @@ def run_cal_timeout():
         if not timed_out:
             print("FAIL: CAL_TO did not abort with home timeout")
             return 1
+        if not any("abort di=" in t for t in events):
+            print("FAIL: home timeout missing abort di/st/pk snapshot")
+            return 1
+        # Abort must STOP speed-mode — do not keep driving into the stop.
+        collect_mavlink_events(mavlink, 1.0, events)
+        if not any("MOTION STOP" in line for line in sim_lines):
+            print("FAIL: home timeout did not send MOTION STOP")
+            return 1
         print("PASS: CAL_TO aborted cal with home timeout")
         return 0
     finally:
         stop_procs(procs)
+
+
+def run_cal_stall():
+    """Encoder freeze (no alarm, no DI) must start DI recover instead of waiting 90s."""
+    ctl = default_control_file()
+    procs, _sitl, _sim = start_rover_and_sim(control_file=ctl)
+    try:
+        mavlink, events = connect_ready()
+        if mavlink is None:
+            return 1
+        set_cal_defaults(mavlink, crawl_spd=200, seek_spd=400)
+        write_sim_control(ctl, "NODI")
+        set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
+        deadline = time.time() + 15
+        saw_crawl = False
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.2, events)
+            if any("limit seek leg 1 crawl" in t for t in events):
+                saw_crawl = True
+                break
+        if not saw_crawl:
+            print("FAIL: cal stall test never reached leg1 crawl")
+            return 1
+        write_sim_control(ctl, "STALL")
+        deadline = time.time() + 12
+        saw_stall = False
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.3, events)
+            if any("recover DI (stall)" in t for t in events):
+                saw_stall = True
+                break
+            if any("CL57R: calibrated" in t for t in events):
+                print("FAIL: calibrated during NODI/STALL test")
+                return 1
+        if not saw_stall:
+            print("FAIL: no recover DI (stall) after encoder freeze")
+            return 1
+        print("PASS: approach stall starts DI recover")
+        return 0
+    finally:
+        stop_procs(procs)
+        try:
+            os.remove(ctl)
+        except OSError:
+            pass
 
 
 def run_follow_alarm():
@@ -1173,6 +1226,7 @@ def main():
             "cal-mth18",
             "cal-rx-abort",
             "cal-timeout",
+            "cal-stall",
             "link-to-zero",
             "follow-alarm",
             "coverage",
@@ -1220,6 +1274,7 @@ def main():
         ("cal-mth18", "=== CAL_MTH=18 DUAL-LIMIT ===", run_cal_mth18),
         ("cal-rx-abort", "=== CAL RX ABORT ===", run_cal_rx_abort),
         ("cal-timeout", "=== CAL_TO HOME TIMEOUT ===", run_cal_timeout),
+        ("cal-stall", "=== CAL STALL RECOVER ===", run_cal_stall),
         ("link-to-zero", "=== LINK_TO=0 NO STOP ===", run_link_to_zero),
         ("follow-alarm", "=== FOLLOW ALARM ===", run_follow_alarm),
     )

@@ -50,10 +50,16 @@ class Nema23Motor:
         self.home_runs = 0
         # When True, ignore position commands until alarm-clear (0x0037=0x0004).
         self.alarmed = False
+        # When True, freeze shaft (no alarm) until cleared — HW stall / missing DI.
+        self.force_stall = False
+        # When True, report DI word 0 (limit switches disconnected).
+        self.di_disabled = False
 
     def di_word(self):
         # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT.
         # Match firmware: M17 seeks + toward X2 (N-OT); M18 seeks - toward X1 (P-OT).
+        if self.di_disabled:
+            return 0
         word = 0
         margin = max(int(SPEED_HARD_STOP * 0.05), 200)
         if self.position >= SPEED_HARD_STOP - margin:
@@ -162,6 +168,9 @@ class Nema23Motor:
             self.speed_mode = False
             self._decay_velocity(dt_s, self.max_decel * 2)
             self.position += self.velocity * dt_s
+        elif self.force_stall and link_active:
+            self.velocity = 0.0
+            self.driver_target = int(round(self.position))
         elif self.speed_mode and link_active:
             # Continuous speed mode (0x0036 Bit3): run at signed MAX_SPD.
             direction = 1.0 if self.max_rpm_signed >= 0 else -1.0
@@ -384,7 +393,7 @@ def check_link_schedule(now):
 
 
 def poll_control_file(now):
-    """Apply one-shot commands from --control-file (DROP/ALARM/MUTE/UNMUTE)."""
+    """Apply one-shot commands from --control-file (DROP/ALARM/MUTE/UNMUTE/STALL/NODI)."""
     path = sim_state.get("control_file")
     if not path:
         return
@@ -424,6 +433,20 @@ def poll_control_file(now):
         elif cmd == "UNMUTE":
             sim_state["mute_reads"] = False
             print("[CL57R Modbus Sim] Control UNMUTE reads")
+        elif cmd == "STALL":
+            motor.force_stall = True
+            motor.velocity = 0.0
+            motor.driver_target = int(round(motor.position))
+            print(f"[CL57R Modbus Sim] Control STALL at pos={int(motor.position)}")
+        elif cmd == "UNSTALL":
+            motor.force_stall = False
+            print("[CL57R Modbus Sim] Control UNSTALL")
+        elif cmd == "NODI":
+            motor.di_disabled = True
+            print("[CL57R Modbus Sim] Control NODI (DI forced off)")
+        elif cmd == "DI":
+            motor.di_disabled = False
+            print("[CL57R Modbus Sim] Control DI enabled")
         else:
             print(f"[CL57R Modbus Sim] Unknown control cmd: {line}")
 
@@ -486,6 +509,7 @@ def handle_write_single(reg_addr, val):
         print(f"[CL57R Modbus Sim] SPEED START rpm={motor.max_rpm_signed}")
     elif reg_addr == 0x0036 and (val & 0x0020):
         motor.speed_mode = False
+        motor.force_stall = False
         motor.velocity = 0.0
         motor.driver_target = int(round(motor.position))
         print("[CL57R Modbus Sim] MOTION STOP")
