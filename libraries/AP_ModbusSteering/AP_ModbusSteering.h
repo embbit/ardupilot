@@ -181,6 +181,8 @@ private:
     bool _leg2_left_l1 = false;
     bool _leg2_saw_l1_di = false;
     bool _home_retry_clear_next = true;
+    bool _di_both_ignore = false;
+    uint32_t _di_both_since_ms = 0;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;

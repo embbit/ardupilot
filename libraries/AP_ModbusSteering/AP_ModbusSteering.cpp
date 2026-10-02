@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.3";
+constexpr const char *CL57R_FW_TAG = "v12.4";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -69,6 +69,10 @@ constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
 // Encoder peak frozen this long during approach → treat as hard-stop stall
 // (DI missing or alarm bit late). Reverse-crawl to find the switch.
 constexpr uint32_t HOME_STALL_MS = 4000;
+// Both X1+X2 stuck high blocks DI latch/recover; after this, ignore the mask
+// for alarm/stall and abort if still both-on with no single-DI path.
+constexpr uint32_t BOTH_DI_IGNORE_MS = 1500;
+constexpr uint32_t BOTH_DI_ABORT_MS = 8000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
@@ -651,6 +655,8 @@ void AP_ModbusSteering::start_home()
     _leg2_left_l1 = false;
     _leg2_saw_l1_di = false;
     _home_retry_clear_next = true;
+    _di_both_ignore = false;
+    _di_both_since_ms = 0;
     _recover_saw_motion = false;
     _recover_start_ms = 0;
     _leg1_travel = 0;
@@ -1096,6 +1102,8 @@ void AP_ModbusSteering::advance_home()
         _recover_saw_motion = false;
         _di_extreme_latched = false;
         _home_retry_clear_next = true;
+        _di_both_ignore = false;
+        _di_both_since_ms = 0;
         if (_home_leg == 1) {
             // Leg2 always leaves L1 at crawl until opposite DI clears.
             _leg2_left_l1 = false;
@@ -1267,8 +1275,30 @@ void AP_ModbusSteering::update(float steering_out)
             if (_got_di && !target_limit_di_active()) {
                 _saw_target_di_clear = true;
             }
-            const bool both_limits_di = _got_di &&
+            const bool both_raw = _got_di &&
                 ((_di_word & DI_LIMIT_MASK) == DI_LIMIT_MASK);
+            if (both_raw) {
+                if (_di_both_since_ms == 0) {
+                    _di_both_since_ms = now;
+                }
+                if (!_di_both_ignore &&
+                    (now - _di_both_since_ms) >= BOTH_DI_IGNORE_MS) {
+                    _di_both_ignore = true;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: both DI stuck di=%04x, ignore mask",
+                                  (unsigned)_di_word);
+                }
+                if (_di_both_ignore &&
+                    (now - _di_both_since_ms) >= BOTH_DI_ABORT_MS) {
+                    // Do not wait for the 90s home timeout — DI is unusable.
+                    abort_home("both DI stuck (check X1/X2 wiring)");
+                    return;
+                }
+            } else {
+                _di_both_since_ms = 0;
+            }
+            // Glitch both-on must not freeze cal for 90s (HW: di=0006).
+            const bool both_limits_di = both_raw && !_di_both_ignore;
             const bool seek_armed = (now - _home_start_ms) > 800;
             const bool in_recover =
                 (_cal_phase == CalPhase::LEG1_RECOVER ||

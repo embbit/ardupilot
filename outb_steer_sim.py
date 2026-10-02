@@ -54,12 +54,16 @@ class Nema23Motor:
         self.force_stall = False
         # When True, report DI word 0 (limit switches disconnected).
         self.di_disabled = False
+        # When True, force X1+X2 active (HW both-DI stuck).
+        self.force_both_di = False
 
     def di_word(self):
         # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT.
         # Match firmware: M17 seeks + toward X2 (N-OT); M18 seeks - toward X1 (P-OT).
         if self.di_disabled:
             return 0
+        if self.force_both_di:
+            return (1 << 1) | (1 << 2)
         word = 0
         margin = max(int(SPEED_HARD_STOP * 0.05), 200)
         if self.position >= SPEED_HARD_STOP - margin:
@@ -454,6 +458,12 @@ def poll_control_file(now):
         elif cmd == "DI":
             motor.di_disabled = False
             print("[CL57R Modbus Sim] Control DI enabled")
+        elif cmd == "BOTHDI":
+            motor.force_both_di = True
+            print("[CL57R Modbus Sim] Control BOTHDI (X1+X2 forced on)")
+        elif cmd == "NOBOTHDI":
+            motor.force_both_di = False
+            print("[CL57R Modbus Sim] Control NOBOTHDI")
         else:
             print(f"[CL57R Modbus Sim] Unknown control cmd: {line}")
 

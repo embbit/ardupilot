@@ -1169,6 +1169,52 @@ def run_cal_stall():
             pass
 
 
+def run_cal_both_di():
+    """Both X1+X2 stuck must not freeze cal for the full home timeout."""
+    ctl = default_control_file()
+    procs, _sitl, _sim = start_rover_and_sim(control_file=ctl)
+    try:
+        mavlink, events = connect_ready()
+        if mavlink is None:
+            return 1
+        set_cal_defaults(mavlink, crawl_spd=200, seek_spd=400)
+        write_sim_control(ctl, "BOTHDI")
+        set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
+        deadline = time.time() + 25
+        saw_ignore = False
+        saw_abort = False
+        saw_recover = False
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.3, events)
+            if any("both DI stuck" in t and "ignore mask" in t for t in events):
+                saw_ignore = True
+            if any("both DI stuck (check X1/X2 wiring)" in t for t in events):
+                saw_abort = True
+                break
+            if any("recover DI" in t for t in events):
+                saw_recover = True
+            if any("home timeout" in t for t in events):
+                print("FAIL: fell through to home timeout with both DI")
+                return 1
+            if any("CL57R: calibrated" in t for t in events):
+                print("FAIL: calibrated with BOTHDI forced")
+                return 1
+        if not saw_ignore:
+            print("FAIL: no both-DI ignore warning")
+            return 1
+        if not (saw_abort or saw_recover):
+            print("FAIL: neither both-DI abort nor recover after ignore")
+            return 1
+        print("PASS: both-DI does not freeze cal for 90s")
+        return 0
+    finally:
+        stop_procs(procs)
+        try:
+            os.remove(ctl)
+        except OSError:
+            pass
+
+
 def run_follow_alarm():
     """Speed-follow must react to a tracking alarm after cal."""
     ctl = default_control_file()
@@ -1227,6 +1273,7 @@ def main():
             "cal-rx-abort",
             "cal-timeout",
             "cal-stall",
+            "cal-both-di",
             "link-to-zero",
             "follow-alarm",
             "coverage",
@@ -1275,6 +1322,7 @@ def main():
         ("cal-rx-abort", "=== CAL RX ABORT ===", run_cal_rx_abort),
         ("cal-timeout", "=== CAL_TO HOME TIMEOUT ===", run_cal_timeout),
         ("cal-stall", "=== CAL STALL RECOVER ===", run_cal_stall),
+        ("cal-both-di", "=== CAL BOTH DI STUCK ===", run_cal_both_di),
         ("link-to-zero", "=== LINK_TO=0 NO STOP ===", run_link_to_zero),
         ("follow-alarm", "=== FOLLOW ALARM ===", run_follow_alarm),
     )
