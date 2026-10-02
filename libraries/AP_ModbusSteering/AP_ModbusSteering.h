@@ -141,6 +141,7 @@ private:
     uint16_t _di_word = 0;
     bool _di_log_inited = false;
     uint16_t _di_log_word = 0;
+    uint16_t _di_raw_log = 0;
     bool _saw_target_di_clear = false;
     bool _home_center_run_spd = false;
     uint8_t _home_center_prep = 0;
@@ -216,6 +217,7 @@ private:
     AP_Int16 crawl_speed;
     AP_Int16 link_timeout;
     AP_Int16 cal_timeout_s;
+    AP_Int8  di_inv;
     int8_t   _cal_trig_last = 0;
     bool     _cal_trig_inited = false;
     bool     _run_link_failsafe = false;

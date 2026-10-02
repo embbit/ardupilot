@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.5";
+constexpr const char *CL57R_FW_TAG = "v12.6";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -212,6 +212,13 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @Range: 0 600
     // @User: Advanced
     AP_GROUPINFO("CAL_TO", 18, AP_ModbusSteering, cal_timeout_s, 0),
+
+    // @Param: DI_INV
+    // @DisplayName: Invert limit DI X1/X2
+    // @Description: Invert CL57R DI bits for X1 (P-OT) and X2 (N-OT) after read. Use 1 for NC / active-low switches that read both ON when neither end is pressed (raw di=0006 at mid).
+    // @Values: 0:Normal,1:InvertX1X2
+    // @User: Standard
+    AP_GROUPINFO("DI_INV", 19, AP_ModbusSteering, di_inv, 0),
 
     AP_GROUPEND
 };
@@ -970,16 +977,24 @@ void AP_ModbusSteering::consume_rx()
                 _status_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 _got_status = true;
             } else if (_rx_expect == RxExpect::DI_INPUT && byte_count >= 2) {
-                const uint16_t di = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
-                // Log only on change (bring-up: verify X1/X2 wiring).
-                if (!_di_log_inited || di != _di_log_word) {
+                const uint16_t raw = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
+                uint16_t di = raw;
+                // NC / active-low ends: mid stroke often reads both X1+X2 ON.
+                if (di_inv.get() != 0) {
+                    di = (uint16_t)(di ^ DI_LIMIT_MASK);
+                }
+                // Log only on change (bring-up: verify X1/X2 wiring / DI_INV).
+                if (!_di_log_inited || di != _di_log_word || raw != _di_raw_log) {
                     _di_log_inited = true;
                     _di_log_word = di;
+                    _di_raw_log = raw;
                     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: DI %04x X1=%u X2=%u",
+                                  "CL57R: DI raw=%04x eff=%04x X1=%u X2=%u%s",
+                                  (unsigned)raw,
                                   (unsigned)di,
                                   (unsigned)((di & DI_X1) != 0 ? 1 : 0),
-                                  (unsigned)((di & DI_X2) != 0 ? 1 : 0));
+                                  (unsigned)((di & DI_X2) != 0 ? 1 : 0),
+                                  di_inv.get() != 0 ? " inv" : "");
                 }
                 _di_word = di;
                 _got_di = true;
