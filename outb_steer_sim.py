@@ -219,18 +219,27 @@ class Nema23Motor:
                 self.velocity = max(target_vel, self.velocity - self.max_accel * dt_s)
             self.position += self.velocity * dt_s
             self.driver_target = int(round(self.position))
-            # Hard stop models hitting a mechanical limit (world / mech frame).
+            # Hard stop in mechanical frame. Sitting on a limit after native
+            # home must not alarm — only driving further into the stop.
             mech = self.mech_pos()
-            if mech >= SPEED_HARD_STOP:
+            if mech > SPEED_HARD_STOP and self.velocity > 0:
                 self.position = float(SPEED_HARD_STOP - self.mech_offset)
                 self.driver_target = int(round(self.position))
+                self.velocity = 0.0
                 self.raise_alarm()
                 print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
-            elif mech <= -SPEED_HARD_STOP:
+            elif mech < -SPEED_HARD_STOP and self.velocity < 0:
                 self.position = float(-SPEED_HARD_STOP - self.mech_offset)
                 self.driver_target = int(round(self.position))
+                self.velocity = 0.0
                 self.raise_alarm()
                 print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
+            elif mech > SPEED_HARD_STOP:
+                self.position = float(SPEED_HARD_STOP - self.mech_offset)
+                self.driver_target = int(round(self.position))
+            elif mech < -SPEED_HARD_STOP:
+                self.position = float(-SPEED_HARD_STOP - self.mech_offset)
+                self.driver_target = int(round(self.position))
         elif link_active:
             self._track_target(dt_s)
             new_pos = self.position + self.velocity * dt_s
