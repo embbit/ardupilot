@@ -8,16 +8,8 @@
 extern const AP_HAL::HAL &hal;
 
 namespace {
-// Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v13.0";
-// After leaving a limit, stale OT may linger — clear+same-dir, don't reverse.
-constexpr uint32_t LEAVE_ALARM_GRACE_MS = 5000;
-constexpr uint8_t REAPPROACH_MAX = 10;
-// While reversing out of a hard stop, re-clear OT a few times before abort.
-constexpr uint8_t RECOVER_NUDGE_MAX = 6;
-// Recover with almost no encoder motion → jammed; abort instead of 45s wait.
-constexpr uint32_t RECOVER_NOMOTION_ABORT_MS = 12000;
-constexpr int32_t RECOVER_NOMOTION_PEAK = 12000;
+// Frozen release tag for this CL57R steering stack.
+constexpr const char *CL57R_FW_TAG = "v13.1";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -77,13 +69,6 @@ constexpr uint32_t LINK_LOST_CONFIRM_MS = 500;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
-// Encoder peak frozen this long during approach → treat as hard-stop stall
-// (DI missing or alarm bit late). Reverse-crawl to find the switch.
-constexpr uint32_t HOME_STALL_MS = 4000;
-// Both X1+X2 stuck high blocks DI latch/recover; after this, ignore the mask
-// for alarm/stall and abort if still both-on with no single-DI path.
-constexpr uint32_t BOTH_DI_IGNORE_MS = 1500;
-constexpr uint32_t BOTH_DI_ABORT_MS = 8000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
@@ -185,17 +170,17 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("CAL_MTH", 12, AP_ModbusSteering, cal_mth, 17),
 
-    // @Param: SEEK_SPD
-    // @DisplayName: Calibration SEEK speed
-    // @Description: Written to CL57R 0x0041 (native home SEEK RPM). Also used for post-cal mid return cruise (half, capped). Keep moderate.
+    // @Param: HOME_SPD
+    // @DisplayName: Native home SEEK speed
+    // @Description: Written to CL57R 0x0041 (MOTION_HOME SEEK RPM). Also used as post-cal mid-return cruise RPM (leave-limit still uses CRAWL_SPD first).
     // @Units: RPM
     // @Range: 5 3000
     // @User: Standard
-    AP_GROUPINFO("SEEK_SPD", 13, AP_ModbusSteering, seek_speed, 500),
+    AP_GROUPINFO("HOME_SPD", 13, AP_ModbusSteering, home_speed, 500),
 
     // @Param: CRAWL_SPD
-    // @DisplayName: Calibration crawl speed
-    // @Description: Written to CL57R 0x0042 (native home near-limit crawl, capped at 300). Also used when leaving the post-cal limit toward mid.
+    // @DisplayName: Native home crawl speed
+    // @Description: Written to CL57R 0x0042 (MOTION_HOME near-limit crawl; driver max 300). Also used when leaving the post-cal limit toward mid.
     // @Units: RPM
     // @Range: 5 300
     // @User: Standard
@@ -389,127 +374,6 @@ uint16_t AP_ModbusSteering::home_method_reg() const
     return first;
 }
 
-bool AP_ModbusSteering::target_limit_di_active() const
-{
-    if (!_got_di) {
-        return false;
-    }
-    // M17 → X2 N-OT; M18 → X1 P-OT. First direction is always CAL_MTH.
-    const bool want_x1 = (home_method_reg() == 18);
-    if (want_x1) {
-        return (_di_word & DI_X1) != 0;
-    }
-    return (_di_word & DI_X2) != 0;
-}
-
-bool AP_ModbusSteering::opposite_limit_di_active() const
-{
-    if (!_got_di) {
-        return false;
-    }
-    const bool want_x1 = (home_method_reg() == 18);
-    if (want_x1) {
-        return (_di_word & DI_X2) != 0;
-    }
-    return (_di_word & DI_X1) != 0;
-}
-
-int16_t AP_ModbusSteering::seek_speed_signed(uint16_t rpm) const
-{
-    int16_t spd = (int16_t)rpm;
-    // M18 seeks negative; M17 seeks positive (CL57R convention).
-    if (home_method_reg() == 18) {
-        spd = (int16_t)(-spd);
-    }
-    return spd;
-}
-
-bool AP_ModbusSteering::cal_phase_reverse() const
-{
-    return _cal_phase == CalPhase::LEG1_RECOVER ||
-           _cal_phase == CalPhase::LEG2_RECOVER;
-}
-
-int16_t AP_ModbusSteering::cal_phase_spd_signed() const
-{
-    uint16_t rpm = calib_crawl_rpm();
-    if (_cal_phase == CalPhase::LEG2_SEEK) {
-        // Until we leave the L1 switch, stay at crawl. Full SEEK while still
-        // on L1 DI/OT often produces zero motion (HW: home retry storm).
-        if (_leg2_left_l1) {
-            rpm = calib_speed_rpm();
-        }
-    }
-    int16_t spd = seek_speed_signed(rpm);
-    if (cal_phase_reverse()) {
-        spd = (int16_t)(-spd);
-    }
-    return spd;
-}
-
-void AP_ModbusSteering::begin_di_recover(uint32_t now, const char *why)
-{
-    if (_home_leg == 0) {
-        _cal_phase = CalPhase::LEG1_RECOVER;
-        _leg1_recovered = true;
-    } else {
-        _cal_phase = CalPhase::LEG2_RECOVER;
-    }
-    _home_leg_settling = false;
-    _home_stop_pending = true;
-    _home_soft_spd_pending = false;
-    _home_crawl_resume_pending = true;
-    _recover_saw_motion = false;
-    _recover_start_ms = now;
-    _recover_nudge_count = 0;
-    // Keep _home_start_pulses from leg start so DI latch can compute
-    // travel to the switch (not the hard-stop overshoot peak).
-    _saw_target_di_clear = !target_limit_di_active();
-    _last_home_progress_ms = now;
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                  "CL57R: recover DI (%s)", why != nullptr ? why : "alarm");
-}
-
-void AP_ModbusSteering::begin_forward_reapproach(uint32_t now, const char *why)
-{
-    // Clear alarm and keep the SAME direction. Never demote SEEK→CRAWL here
-    // (HW: that dropped cruise to 300rpm and failed to leave L1). Soft-crawl
-    // is only entered at soft_at in HOME_WAIT.
-    _home_leg_settling = false;
-    _home_stop_pending = true;
-    _home_soft_spd_pending = false;
-    _home_crawl_resume_pending = true;
-    _reapproach_count++;
-    _reapproach_last_ms = now;
-    _saw_target_di_clear = !target_limit_di_active();
-    _last_home_progress_ms = now;
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                  "CL57R: reapproach (%s) n=%u",
-                  why != nullptr ? why : "alarm",
-                  (unsigned)_reapproach_count);
-}
-
-void AP_ModbusSteering::latch_di_extreme_and_finish(uint32_t now)
-{
-    // Extreme = encoder on the limit switch. Overwrite any hard-stop peak.
-    const int32_t delta = _actual_pulses - _home_start_pulses;
-    const int32_t at_di = (delta >= 0) ? delta : -delta;
-    _leg_peak_travel = at_di;
-    if (delta > 0) {
-        _leg_dir_sign = 1;
-    } else if (delta < 0) {
-        _leg_dir_sign = -1;
-    }
-    _home_leg_settling = true;
-    _home_leg_settle_ms = now + 120;
-    _home_stop_pending = true;
-    _home_crawl_resume_pending = false;
-    _di_extreme_latched = true;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: DI extreme travel %d di=0x%04x",
-                  (int)_leg_peak_travel, (unsigned)_di_word);
-}
-
 uint16_t AP_ModbusSteering::run_speed_rpm() const
 {
     const int16_t rpm = max_speed.get();
@@ -521,20 +385,19 @@ uint16_t AP_ModbusSteering::run_speed_rpm() const
 
 uint16_t AP_ModbusSteering::calib_speed_rpm() const
 {
-    const int16_t rpm = seek_speed.get();
+    const int16_t rpm = home_speed.get();
     if (rpm < 5) {
         return 500;
     }
-    // Cap SEEK — high RPM flies past the far DI into the hard stop (HW).
-    if (rpm > 800) {
-        return 800;
+    if (rpm > 3000) {
+        return 3000;
     }
     return (uint16_t)rpm;
 }
 
 uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 {
-    // 0x0042 / near-limit crawl is limited to 5..300.
+    // CL57R 0x0042 HOME_CRAWL is 5..300.
     const int16_t rpm = crawl_speed.get();
     if (rpm < 5) {
         return 30;
@@ -543,21 +406,6 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
         return 300;
     }
     return (uint16_t)rpm;
-}
-
-uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
-{
-    // Slower than leg2 SEEK — full SEEK from a pressed limit overshoots (HW).
-    const uint16_t seek = calib_speed_rpm();
-    const uint16_t crawl = calib_crawl_rpm();
-    uint16_t mid = seek / 2;
-    if (mid < crawl) {
-        mid = crawl;
-    }
-    if (mid > 400) {
-        mid = 400;
-    }
-    return mid;
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -720,27 +568,6 @@ void AP_ModbusSteering::start_home()
     _run_link_failsafe = false;
     _last_run_link_warn_ms = 0;
     _home_retry_pending = false;
-    _home_stop_pending = false;
-    _home_clear_pending = false;
-    _home_enable_pending = false;
-    _home_speed_leg = false;
-    _home_soft_spd_pending = false;
-    _home_crawl_resume_pending = false;
-    _cal_phase = CalPhase::LEG1_CRAWL;
-    _leg1_recovered = false;
-    _leg2_left_l1 = false;
-    _leg2_saw_l1_di = false;
-    _leg2_seek_ms = 0;
-    _home_retry_clear_next = true;
-    _di_both_ignore = false;
-    _di_both_since_ms = 0;
-    _recover_saw_motion = false;
-    _recover_start_ms = 0;
-    _reapproach_count = 0;
-    _reapproach_last_ms = 0;
-    _recover_nudge_count = 0;
-    _saw_opp_di = false;
-    _left_opp_ms = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
@@ -813,34 +640,13 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
 {
     (void)now;
     if (dual_limit_home() && _home_leg == 0) {
-        // Travel is always at the DI extreme. Short L1 only OK if we started
-        // already on the switch (no clear seen) or recovered onto nearby DI.
-        const int32_t expected = expected_full_travel_pulses();
-        const int32_t min_l1 = (expected >= 20000)
-            ? MIN(expected / 10, (int32_t)15000)
-            : 8000;
-        if (_saw_target_di_clear && !_leg1_recovered &&
-            _leg_peak_travel < min_l1) {
-            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                          "CL57R: refuse L1 travel %d (min %d)",
-                          (int)_leg_peak_travel, (int)min_l1);
-            abort_home("L1 travel too short");
-            return;
-        }
         _leg1_travel = _leg_peak_travel;
         _home_leg = 1;
-        _leg2_left_l1 = false;
-        _leg2_saw_l1_di = false;
-        _home_retry_clear_next = true;
-        // HOME_ZERO_AT_L1 clears alarm only (no AUX_POS_ZERO on pressed DI).
+        // Clear residual L1 alarm only (no AUX_POS_ZERO on pressed DI).
         _state = DriveState::HOME_ZERO_AT_L1;
         _got_echo = false;
         _init_attempts = 0;
-        _home_stop_pending = false;
-        _home_clear_pending = false;
         _home_leg_settling = false;
-        _home_crawl_resume_pending = false;
-        _home_soft_spd_pending = false;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                       "CL57R: native L1 travel %d, home limit 2",
                       (int)_leg1_travel);
@@ -856,20 +662,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             full_travel = abs_now;
         }
         const int32_t expected = expected_full_travel_pulses();
-        // Speed-mode only: POS_ZERO race. Native home sets di_extreme via done bit.
-        const uint32_t leg2_ms = AP_HAL::millis() - _home_start_ms;
-        if (_home_speed_leg && !_di_extreme_latched &&
-            leg2_ms < 1500 &&
-            expected >= 20000 &&
-            full_travel >= expected / 3) {
-            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                          "CL57R: leg2 fake hit %d in %ums",
-                          (int)full_travel, (unsigned)leg2_ms);
-            abort_home("leg2 enc race, abort");
-            return;
-        }
-        // After overshooting L1, leg2 often alarms on L1 again (~few k). Prefer
-        // a plausible leg1 measurement over aborting cal.
+        // Prefer a plausible leg1 stroke if leg2 came up short.
         if (expected >= 20000 && full_travel < expected / 4 &&
             _leg1_travel >= expected / 4 && _leg1_travel <= expected * 2) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
@@ -883,9 +676,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
             abort_home("measured travel too small (need both limits?)");
             return;
         }
-        // Only reject wildly wrong values; OUT_REV/RATIO are approximate until
-        // dual-limit measurement replaces them. Speed-mode seek can measure
-        // larger travel than a rough OUT_REV*RATIO estimate — allow 5x.
+        // OUT_REV/RATIO are approximate until dual-limit measurement replaces them.
         if (expected >= 20000 && full_travel > expected * 5) {
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
                           (int)full_travel, (int)expected);
@@ -975,12 +766,7 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _state = DriveState::RUN_WRITE;
     _have_target = false;
     _rx_expect = RxExpect::NONE;
-    _home_speed_leg = false;
-    _home_stop_pending = false;
-    _home_clear_pending = false;
-    _home_soft_spd_pending = false;
-    _home_crawl_resume_pending = false;
-    // Never leave speed-mode running into a hard stop after cal abort.
+    // Stop any in-progress home / speed motion after cal abort.
     queue_motion(MOTION_STOP);
     // Drop sticky OT so the user is not stuck in "alarm latched" spam.
     _alarm_clear_pending = true;
@@ -1164,15 +950,6 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_ENABLE;
         break;
     case DriveState::HOME_ENABLE:
-        // Dual-limit: two native MOTION_HOME legs (drive seeks DI via M17/M18).
-        // Speed-mode dual seek removed — CL57R home is more reliable on HW.
-        _home_speed_leg = false;
-        if (dual_limit_home() && _home_leg == 0) {
-            _leg1_recovered = false;
-        }
-        _state = DriveState::HOME_START;
-        break;
-    case DriveState::HOME_SEEK_SPD:
         _state = DriveState::HOME_START;
         break;
     case DriveState::HOME_START:
@@ -1184,53 +961,14 @@ void AP_ModbusSteering::advance_home()
         _leg_peak_travel = 0;
         _leg_dir_sign = 0;
         _home_read_encoder = false;
-        _home_poll_phase = 0;
         _got_status = false;
         _got_di = false;
         _di_word = 0;
-        _saw_target_di_clear = false;
         _saw_home_run = false;
         _saw_home_motion = false;
         _saw_home_clear = false;
         _home_leg_settling = false;
-        _home_stop_pending = false;
-        _home_clear_pending = false;
-        _home_enable_pending = false;
-        _home_soft_spd_pending = false;
-        _home_crawl_resume_pending = false;
-        _home_soft_spd_pending = false;
-        _recover_saw_motion = false;
-        _reapproach_count = 0;
-        _reapproach_last_ms = 0;
-        _recover_nudge_count = 0;
-        _saw_opp_di = false;
-        _left_opp_ms = 0;
-        _di_extreme_latched = false;
-        _home_retry_clear_next = true;
-        _di_both_ignore = false;
-        _di_both_since_ms = 0;
-        if (_home_leg == 1) {
-            // Leg2 always leaves L1 at crawl until opposite DI clears.
-            _leg2_left_l1 = false;
-            _leg2_saw_l1_di = false;
-            _leg2_seek_ms = 0;
-            // Sitting on L1 at leg2 start — opposite for this leg.
-            _saw_opp_di = true;
-        }
-        if (_home_speed_leg) {
-            const char *phase = "crawl";
-            if (_cal_phase == CalPhase::LEG2_SEEK) {
-                phase = _leg2_left_l1 ? "SEEK" : "leave";
-            } else if (_cal_phase == CalPhase::LEG2_CRAWL) {
-                phase = "crawl2";
-            } else if (_cal_phase == CalPhase::LEG1_RECOVER ||
-                       _cal_phase == CalPhase::LEG2_RECOVER) {
-                phase = "recover";
-            }
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek leg %u %s @%drpm",
-                          (unsigned)(_home_leg + 1), phase,
-                          (int)cal_phase_spd_signed());
-        } else if (dual_limit_home()) {
+        if (dual_limit_home()) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
                           (unsigned)(_home_leg + 1), (int)home_method_reg());
         } else {
@@ -1238,7 +976,7 @@ void AP_ModbusSteering::advance_home()
         }
         break;
     case DriveState::HOME_ZERO_AT_L1:
-        // Clear residual L1 alarm before leg2 seek.
+        // Clear residual L1 alarm before leg2 MOTION_HOME.
         _state = DriveState::HOME_CLEAR_ALARM;
         _got_echo = false;
         _init_attempts = 0;
@@ -1246,8 +984,6 @@ void AP_ModbusSteering::advance_home()
         _saw_home_run = false;
         _saw_home_clear = false;
         _got_di = false;
-        _saw_target_di_clear = false;
-        _home_poll_phase = 0;
         _home_start_ms = AP_HAL::millis();
         _last_home_progress_ms = _home_start_ms;
         break;
@@ -1331,24 +1067,19 @@ void AP_ModbusSteering::update(float steering_out)
         const int32_t moved = (delta >= 0) ? delta : -delta;
         bool enc_rebase = false;
         if (moved > _leg_peak_travel) {
-            // Drive may snap encoder on alarm-clear at L1. Rebase peak, but
-            // never clear motion flags after leaving a limit — that armed
-            // start_jam and reverse-recovered back into the stop (HW v12.10).
+            // Drive may snap encoder on alarm-clear between legs.
             const int32_t expected_chk = expected_full_travel_pulses();
             const int32_t jump = moved - _leg_peak_travel;
-            const bool left_already =
-                (_left_opp_ms != 0) || _leg2_left_l1;
             if (expected_chk >= 20000 && jump > expected_chk / 2 &&
                 (now - _home_start_ms) < 2500) {
                 _home_start_pulses = _actual_pulses;
                 _leg_peak_travel = 0;
-                if (!left_already) {
-                    _saw_home_motion = false;
+                if (!_saw_home_motion) {
                     _saw_home_run = false;
                 }
                 enc_rebase = true;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: seek enc jump, rebase");
+                              "CL57R: home enc jump, rebase");
             } else {
                 _leg_peak_travel = moved;
                 _last_home_progress_ms = now;
@@ -1362,7 +1093,6 @@ void AP_ModbusSteering::update(float steering_out)
         if (_got_status && !home_bit) {
             _saw_home_clear = true;
         }
-        // After enc rebase, ignore stale moved from this cycle (would re-arm saw).
         if (!enc_rebase && moved >= MIN_HOME_LEG_MOTION) {
             _saw_home_motion = true;
         }
@@ -1371,281 +1101,6 @@ void AP_ModbusSteering::update(float steering_out)
         }
         if (now - _home_start_ms > home_timeout_ms()) {
             abort_home("home timeout");
-        } else if (_home_speed_leg) {
-            // Extremes always on DI. Alarm → recover (reverse crawl) → latch DI.
-            const int32_t expected = expected_full_travel_pulses();
-            // Prefer the longer of OUT_REV estimate and measured L1 stroke so
-            // soft-crawl is not taken too early on a short estimate.
-            int32_t span = expected;
-            if (_home_leg == 1 && _leg1_travel > span) {
-                span = _leg1_travel;
-            }
-            // Soft-crawl earlier (~70%) so SEEK does not fly past the DI.
-            const int32_t soft_at = (span >= 20000)
-                ? ((span * 7) / 10)
-                : 50000;
-            const int32_t min_hit = (expected >= 20000)
-                ? MIN(expected / 10, (int32_t)15000)
-                : 8000;
-            // Leg2 must not latch a mid-stroke DI glitch; require ~40% estimate.
-            const int32_t min_di = (_home_leg == 0) ? min_hit :
-                ((expected >= 20000) ? MAX(min_hit, (expected * 2) / 5) : min_hit);
-            const bool busy = _home_stop_pending || _home_clear_pending ||
-                              _home_soft_spd_pending || _home_crawl_resume_pending;
-            if (_got_di && !target_limit_di_active()) {
-                _saw_target_di_clear = true;
-            }
-            const bool both_raw = _got_di &&
-                ((_di_word & DI_LIMIT_MASK) == DI_LIMIT_MASK);
-            if (both_raw) {
-                if (_di_both_since_ms == 0) {
-                    _di_both_since_ms = now;
-                }
-                if (!_di_both_ignore &&
-                    (now - _di_both_since_ms) >= BOTH_DI_IGNORE_MS) {
-                    _di_both_ignore = true;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: both DI stuck di=%04x, ignore mask",
-                                  (unsigned)_di_word);
-                }
-                if (_di_both_ignore &&
-                    (now - _di_both_since_ms) >= BOTH_DI_ABORT_MS) {
-                    // Do not wait for the 90s home timeout — DI is unusable.
-                    abort_home("both DI stuck (check X1/X2 wiring)");
-                    return;
-                }
-            } else {
-                _di_both_since_ms = 0;
-            }
-            // Glitch both-on must not freeze cal for 90s (HW: di=0006).
-            const bool both_limits_di = both_raw && !_di_both_ignore;
-            const bool seek_armed = (now - _home_start_ms) > 800;
-            const bool in_recover =
-                (_cal_phase == CalPhase::LEG1_RECOVER ||
-                 _cal_phase == CalPhase::LEG2_RECOVER);
-
-            // Track recover motion (peak may shrink while reversing toward DI).
-            if (in_recover && !enc_rebase && moved >= 200) {
-                _recover_saw_motion = true;
-                _last_home_progress_ms = now;
-            }
-
-            // Any approach: remember leaving the opposite limit (same rule
-            // for leg1 and leg2). Leg2 also promotes crawl → SEEK here.
-            const bool on_approach =
-                (_cal_phase == CalPhase::LEG1_CRAWL ||
-                 _cal_phase == CalPhase::LEG2_SEEK ||
-                 _cal_phase == CalPhase::LEG2_CRAWL);
-            if (on_approach && _got_di && opposite_limit_di_active()) {
-                _saw_opp_di = true;
-                if (_cal_phase == CalPhase::LEG2_SEEK) {
-                    _leg2_saw_l1_di = true;
-                }
-            }
-            if (on_approach && _got_di && _saw_opp_di &&
-                !opposite_limit_di_active() && _left_opp_ms == 0) {
-                _left_opp_ms = now;
-                if (_got_status && alarmed()) {
-                    _home_stop_pending = true; // STOP → CLEAR, drop stale OT
-                    _home_crawl_resume_pending = true;
-                }
-            }
-            if (_cal_phase == CalPhase::LEG2_SEEK && !busy && !_leg2_left_l1 &&
-                _got_di && !opposite_limit_di_active() &&
-                (_leg2_saw_l1_di || _saw_home_motion ||
-                 (now - _home_start_ms) > 2000)) {
-                _leg2_left_l1 = true;
-                _leg2_seek_ms = now;
-                if (_left_opp_ms == 0) {
-                    _left_opp_ms = now;
-                }
-                // Drop stale OT before cruise; keep same direction.
-                if (_got_status && alarmed()) {
-                    _home_stop_pending = true; // STOP → CLEAR → soft_spd
-                }
-                _home_soft_spd_pending = true;
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                              "CL57R: off L1, SEEK cruise @%d",
-                              (int)cal_phase_spd_signed());
-            }
-
-            // SEEK → crawl for the last ~20% of estimated lock-to-lock.
-            // Require a short SEEK window so we do not immediately drop back
-            // to crawl when peak already near soft_at after leave.
-            if (_cal_phase == CalPhase::LEG2_SEEK && _leg2_left_l1 && !busy &&
-                span >= 20000 && _saw_home_motion &&
-                _leg_peak_travel >= soft_at &&
-                _leg2_seek_ms != 0 &&
-                (now - _leg2_seek_ms) > 800) {
-                _cal_phase = CalPhase::LEG2_CRAWL;
-                _home_soft_spd_pending = true;
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                              "CL57R: soft crawl @%d (span %d)",
-                              (int)_leg_peak_travel, (int)span);
-            }
-
-            // --- Recover: latch extreme on target DI (no clear required) ---
-            if (in_recover && !busy && !_home_leg_settling) {
-                const bool di_on = _got_di && target_limit_di_active() &&
-                                   !opposite_limit_di_active() && !both_limits_di;
-                const bool recover_ready = (now - _recover_start_ms) > 600;
-                if (di_on && recover_ready) {
-                    const int32_t rec_delta = _actual_pulses - _home_start_pulses;
-                    const int32_t at = (rec_delta >= 0) ? rec_delta : -rec_delta;
-                    // Leg2: ignore premature DI until enough stroke is seen.
-                    if (!(_home_leg == 1 && at < min_di)) {
-                        latch_di_extreme_and_finish(now);
-                    }
-                } else if (recover_ready &&
-                           (now - _recover_start_ms) > RECOVER_NOMOTION_ABORT_MS &&
-                           _leg_peak_travel < RECOVER_NOMOTION_PEAK) {
-                    // Shaft not moving (HW: pk~6k over 45s, di=0000).
-                    abort_home("recover jammed, free shaft / check DI");
-                } else if (recover_ready &&
-                           (now - _last_home_progress_ms) > 1500 &&
-                           _recover_nudge_count < RECOVER_NUDGE_MAX) {
-                    // Re-clear + re-enable + reverse crawl (alarm or freeze).
-                    _recover_nudge_count++;
-                    _home_stop_pending = true;
-                    _home_crawl_resume_pending = true;
-                    _last_home_progress_ms = now;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: recover nudge %u (leave jam)",
-                                  (unsigned)_recover_nudge_count);
-                } else if (recover_ready && (now - _recover_start_ms) > 2500 &&
-                           _got_status && alarmed() &&
-                           (now - _last_home_progress_ms) > 1000 &&
-                           _recover_nudge_count >= RECOVER_NUDGE_MAX) {
-                    abort_home("recover alarm, DI not found");
-                } else if ((now - _recover_start_ms) > 45000) {
-                    abort_home("recover timeout, DI not found");
-                }
-            } else if (in_recover && _home_leg_settling && !busy &&
-                       now >= _home_leg_settle_ms) {
-                _home_leg_settling = false;
-                home_leg_done(now);
-            }
-
-            // Start already on target DI → latch as extreme (either leg).
-            const bool start_on_limit =
-                on_approach &&
-                !_saw_home_motion &&
-                _left_opp_ms == 0 &&
-                (now - _home_start_ms) > 1500 &&
-                _got_di && target_limit_di_active() &&
-                !opposite_limit_di_active() && !both_limits_di;
-            // True start jam only before leaving any switch. After leave,
-            // enc-rebase clearing motion must not look like start_jam.
-            const bool start_jam =
-                on_approach &&
-                !_saw_home_motion &&
-                _left_opp_ms == 0 &&
-                !_leg2_left_l1 &&
-                (now - _home_start_ms) > 1500 &&
-                _got_status && alarmed();
-
-            // Approach phases: finish only on DI; alarm → reapproach or recover.
-            const bool approach = on_approach;
-            const bool past_expected =
-                approach &&
-                (_cal_phase == CalPhase::LEG1_CRAWL ||
-                 _cal_phase == CalPhase::LEG2_CRAWL) &&
-                (expected >= 20000) &&
-                _saw_home_motion &&
-                (now - _home_start_ms) > 800 &&
-                (_leg_peak_travel >= expected + expected / 4);
-            // Hard stop with no DI bit / late alarm: encoder peak freezes.
-            const bool stalled =
-                approach && seek_armed && _saw_home_motion &&
-                !both_limits_di &&
-                (now - _last_home_progress_ms) >= HOME_STALL_MS;
-            // Require DI clear→assert for a clean hit. If we already slammed
-            // into the stop (alarm/stall) while the target DI is on, still
-            // latch — do not reverse-recover away from a valid extreme.
-            const bool on_target_di =
-                _got_di && target_limit_di_active() &&
-                !opposite_limit_di_active() && !both_limits_di &&
-                _saw_home_motion && _leg_peak_travel >= min_di;
-            const bool di_hit = approach && on_target_di &&
-                                (_saw_target_di_clear ||
-                                 (_got_status && alarmed()) ||
-                                 stalled);
-            const bool alarm_past =
-                approach && seek_armed &&
-                ((_saw_home_motion && _got_status && alarmed()) || start_jam) &&
-                !both_limits_di &&
-                !on_target_di;
-
-            // Soft-at with alarm but no target DI: do not latch di=0000.
-            const bool far_end_no_di =
-                approach && seek_armed &&
-                _got_status && alarmed() && _saw_home_motion &&
-                span >= 20000 &&
-                _leg_peak_travel >= soft_at &&
-                !both_limits_di &&
-                !on_target_di;
-
-            // Same-dir only (never reverse) when:
-            // - still on / just left opposite DI, or
-            // - short stroke with motion (early OT before target DI — HW v12.13
-            //   reverse went the wrong way, pk~6k, di=0000, 45s timeout).
-            const bool still_on_opp =
-                _saw_opp_di && _got_di && opposite_limit_di_active();
-            const bool short_stroke_moving =
-                _saw_home_motion && _leg_peak_travel < min_hit;
-            const bool leave_guard =
-                still_on_opp ||
-                short_stroke_moving ||
-                (_leg2_left_l1 && _leg_peak_travel < min_di) ||
-                (_left_opp_ms != 0 &&
-                 (_leg_peak_travel < min_hit ||
-                  (now - _left_opp_ms) < LEAVE_ALARM_GRACE_MS));
-            // Debounce only while leave_guard (unlimited attempts). Cap only
-            // applies outside leave (should not reverse-spam either).
-            const bool reapproach_ok =
-                (_reapproach_last_ms == 0 ||
-                 (now - _reapproach_last_ms) > 800) &&
-                (leave_guard || _reapproach_count < REAPPROACH_MAX);
-
-            // Recompute: leave may have armed stop/clear/soft this cycle.
-            const bool busy_now = _home_stop_pending || _home_clear_pending ||
-                                  _home_enable_pending ||
-                                  _home_soft_spd_pending ||
-                                  _home_crawl_resume_pending;
-            if (!in_recover && !busy_now && !_home_leg_settling) {
-                if (di_hit || start_on_limit) {
-                    latch_di_extreme_and_finish(now);
-                } else if (leave_guard && _got_status && alarmed() &&
-                           reapproach_ok && !past_expected) {
-                    // Short stroke / leave: clear OT, keep approach direction.
-                    const char *why = still_on_opp ? "on opp DI"
-                                     : (short_stroke_moving ? "short stroke"
-                                                            : "leave OT");
-                    begin_forward_reapproach(now, why);
-                } else if (alarm_past || past_expected || stalled || far_end_no_di) {
-                    // Encoder freeze always reverse-recovers (even mid short-stroke).
-                    // Otherwise reverse only outside leave_guard.
-                    if ((stalled && !alarm_past) || !leave_guard) {
-                        const char *why = "alarm";
-                        if (far_end_no_di && !alarm_past) {
-                            why = "far end no DI";
-                        } else if (stalled && !alarm_past && !past_expected) {
-                            why = "stall";
-                        } else if (past_expected && !alarm_past) {
-                            why = "past estimate";
-                        }
-                        begin_di_recover(now, why);
-                    }
-                }
-            } else if (!in_recover && _home_leg_settling && !busy &&
-                       now >= _home_leg_settle_ms) {
-                _home_leg_settling = false;
-                home_leg_done(now);
-            } else if (!in_recover && !_saw_home_motion &&
-                       (now - _last_home_progress_ms) > 10000) {
-                _last_home_progress_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: limit seek, no motion yet");
-            }
         } else if (home_bit && !running && !_saw_home_motion &&
                    (now - _home_start_ms) > 5000) {
             if (now - _last_home_retry_ms > 3000) {
@@ -1662,14 +1117,11 @@ void AP_ModbusSteering::update(float steering_out)
                 _home_leg_settle_ms = now + 200;
             } else if (now >= _home_leg_settle_ms) {
                 _home_leg_settling = false;
-                // Native home finished on the DI — treat as extreme latch.
-                _di_extreme_latched = true;
                 home_leg_done(now);
             }
         } else if (home_bit && !running && _saw_home_clear &&
                    !_saw_home_motion && (now - _home_start_ms) > 1500) {
             // Already on the limit: native home completes with little motion.
-            _di_extreme_latched = true;
             if (_leg_peak_travel < moved) {
                 _leg_peak_travel = moved;
             }
@@ -1867,27 +1319,30 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t err = target - enc;
             const int32_t abs_err = (err >= 0) ? err : -err;
             const int32_t arrive_db = MAX(pos_db.get(), 800);
-            // Brake window ~125ms of cruise travel, capped so high SEEK_SPD
+            // Brake window scales with mid cruise RPM
             // still reaches near mid (not stop 50k early).
-            const uint16_t mid_rpm = mid_seek_speed_rpm();
-            int32_t mid_stop = (int32_t)mid_rpm * CL57R_STEPS_PER_REV / 60 / 8;
+            const uint16_t mid_rpm = calib_speed_rpm();
+            // Brake distance ~250ms of cruise; larger HOME_SPD needs a wider window.
+            int32_t mid_stop = (int32_t)mid_rpm * CL57R_STEPS_PER_REV / 60 / 4;
             if (mid_stop < arrive_db) {
                 mid_stop = arrive_db;
             }
-            if (mid_stop > 12000) {
-                mid_stop = 12000;
+            if (mid_stop > 20000) {
+                mid_stop = 20000;
             }
             _last_target = target;
 
-            // Track peak progress toward mid. Ignore encoder snaps that jump
-            // near the full mid distance in one sample (HW: alarm then false ready).
+            // Track peak progress toward mid.
             if (_steer_cmd_offset != 0) {
                 const int32_t abs_goal_pk = (_steer_cmd_offset >= 0) ?
                                            _steer_cmd_offset : -_steer_cmd_offset;
                 const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
                 if (toward > _follow_peak_toward) {
                     const int32_t jump = toward - _follow_peak_toward;
-                    if (abs_goal_pk > 10000 &&
+                    // Ignore only a cold start snap to ~full mid (alarm false-ready).
+                    // Once speed-follow is moving, credit every advance.
+                    if (!_follow_moving &&
+                        abs_goal_pk > 10000 &&
                         jump > abs_goal_pk / 5 &&
                         _follow_peak_toward < abs_goal_pk / 4) {
                         // snap — do not credit as travel
@@ -2109,32 +1564,23 @@ void AP_ModbusSteering::update(float steering_out)
             const int32_t stop_db = (_steer_cmd_offset != 0) ? mid_stop : arrive_db;
             const int32_t abs_goal_run = (_steer_cmd_offset >= 0) ?
                                          _steer_cmd_offset : -_steer_cmd_offset;
-            const bool mid_moved =
-                (_steer_cmd_offset == 0) ||
-                (_follow_peak_toward > abs_goal_run / 3) ||
-                (_follow_moving && abs_err <= stop_db);
-            if (_steer_cmd_offset != 0 && mid_moved &&
+            const bool mid_progressed = _follow_peak_toward > abs_goal_run / 10;
+            if (_steer_cmd_offset != 0 && mid_progressed &&
                 (crossed_mid || abs_err <= stop_db)) {
                 if (_follow_moving) {
                     send_u16(REG_MOTION, MOTION_STOP);
                     _follow_moving = false;
                     _follow_sign = 0;
                     _follow_slot = 0;
-                } else if (_follow_peak_toward > abs_goal_run / 4 &&
-                           abs_err <= stop_db) {
-                    // Stopped inside brake window after real progress — done.
-                    // (Tighter arrive_db caused endless 60rpm hunt in SITL.)
-                    _center_encoder_origin = _actual_pulses;
-                    _steer_cmd_offset = 0;
-                    _have_target = true;
-                    _last_target = 0;
-                    _follow_alarm_count = 0;
-                    _follow_halted = false;
-                    _follow_restore = 1;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
-                } else {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
                 }
+                _center_encoder_origin = _actual_pulses;
+                _steer_cmd_offset = 0;
+                _have_target = true;
+                _last_target = 0;
+                _follow_alarm_count = 0;
+                _follow_halted = false;
+                _follow_restore = 1;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
                 _state = DriveState::RUN_READ;
                 break;
             }
@@ -2195,9 +1641,9 @@ void AP_ModbusSteering::update(float steering_out)
                     }
                 }
                 const int8_t want_sign = (err > 0) ? 1 : -1;
-                // Mid return: SEEK_SPD; stick-center return to mid: gentle.
+                // Mid return: HOME_SPD; stick-center return to mid: gentle.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
-                                   mid_seek_speed_rpm() : run_speed_rpm();
+                                   calib_speed_rpm() : run_speed_rpm();
                 if (_steer_cmd_offset != 0 && _follow_mid_retried) {
                     max_rpm = calib_crawl_rpm();
                 }
@@ -2335,7 +1781,7 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_SET_SPD: {
         const uint16_t spd = calib_speed_rpm();
         send_u16(REG_HOME_SPD, spd);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write SEEK_SPD=%u", (unsigned)spd);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write HOME_SPD=%u", (unsigned)spd);
         break;
     }
     case DriveState::HOME_SET_RUN_SPD: {
@@ -2356,99 +1802,17 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_ENABLE:
         send_u16(REG_MOTOR_ENABLE, 0x0001);
         break;
-    case DriveState::HOME_SEEK_SPD: {
-        const int16_t spd = cal_phase_spd_signed();
-        send_u16(REG_MAX_SPD, (uint16_t)spd);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write seek spd=%d", (int)spd);
-        break;
-    }
     case DriveState::HOME_START:
-        if (_home_speed_leg) {
-            send_u16(REG_MOTION, MOTION_SPEED);
-        } else {
-            send_u16(REG_MOTION, MOTION_HOME);
-        }
+        send_u16(REG_MOTION, MOTION_HOME);
         break;
     case DriveState::HOME_WAIT:
-        if (_home_stop_pending) {
-            _home_stop_pending = false;
-            send_u16(REG_MOTION, MOTION_STOP);
-            _home_clear_pending = true;
-            break;
-        }
-        if (_home_clear_pending) {
-            _home_clear_pending = false;
-            send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-            _home_enable_pending = true;
-            break;
-        }
-        if (_home_enable_pending) {
-            _home_enable_pending = false;
-            send_u16(REG_MOTOR_ENABLE, 0x0001);
-            break;
-        }
-        if (_home_soft_spd_pending) {
-            // CL57R often ignores MAX_SPD changes until SPEED start is
-            // reasserted — without this, log shows SEEK but shaft stays at crawl.
-            _home_soft_spd_pending = false;
-            const int16_t spd = cal_phase_spd_signed();
-            send_u16(REG_MAX_SPD, (uint16_t)spd);
-            _queued_motion = MOTION_SPEED;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: phase spd=%d", (int)spd);
-            break;
-        }
-        if (_home_crawl_resume_pending) {
-            // Resume (or reverse crawl for DI recover) after stop/clear.
-            _home_crawl_resume_pending = false;
-            const int16_t spd = cal_phase_spd_signed();
-            send_u16(REG_MAX_SPD, (uint16_t)spd);
-            _queued_motion = MOTION_SPEED;
-            _last_home_progress_ms = AP_HAL::millis();
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: resume crawl spd=%d", (int)spd);
-            break;
-        }
         if (_home_retry_pending) {
-            // Dedicated slot: never piggy-back home restart on a status read.
             _home_retry_pending = false;
-            if (_home_speed_leg) {
-                // Leg2 used to retry SPEED only — alarm from L1 POS_ZERO/OT
-                // stayed latched and the shaft never left the switch.
-                if (!_saw_home_motion && _home_retry_clear_next) {
-                    _home_retry_clear_next = false;
-                    send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: home retry clear di=%04x st=%04x",
-                                  (unsigned)_di_word,
-                                  (unsigned)_status_word);
-                    break;
-                }
-                _home_retry_clear_next = true;
-                const int16_t spd = cal_phase_spd_signed();
-                send_u16(REG_MAX_SPD, (uint16_t)spd);
-                _queued_motion = MOTION_SPEED;
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                              "CL57R: home retry spd=%d", (int)spd);
-            } else {
-                send_u16(REG_MOTION, MOTION_HOME);
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
-            }
+            send_u16(REG_MOTION, MOTION_HOME);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
             break;
         }
-        // Speed-mode dual-limit: poll encoder / status / DI(0x0005) round-robin
-        // so we can stop on X1/X2 before TRACK_ERR/alarm.
-        if (_home_speed_leg) {
-            if (_home_poll_phase == 0) {
-                _rx_expect = RxExpect::ENCODER;
-                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-            } else if (_home_poll_phase == 1) {
-                _rx_expect = RxExpect::STATUS;
-                modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
-            } else {
-                _rx_expect = RxExpect::DI_INPUT;
-                modbus_create_read_packet((uint8_t)slave_id.get(), REG_DI_STATUS, 1, tx_packet);
-            }
-            _home_poll_phase = (uint8_t)((_home_poll_phase + 1) % 3);
-        } else if (_home_read_encoder) {
+        if (_home_read_encoder) {
             _rx_expect = RxExpect::ENCODER;
             modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
             _home_read_encoder = false;

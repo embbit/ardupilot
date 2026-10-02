@@ -40,7 +40,6 @@ private:
         HOME_SET_CRAWL,
         HOME_SET_ACCEL,
         HOME_ENABLE,
-        HOME_SEEK_SPD,
         HOME_START,
         HOME_WAIT,
         HOME_ZERO_AT_L1,
@@ -54,15 +53,6 @@ private:
         ENCODER,
         STATUS,
         DI_INPUT,
-    };
-
-    // Dual-limit cal phases. Extremes latch on DI only, never on alarm.
-    enum class CalPhase : uint8_t {
-        LEG1_CRAWL = 0,
-        LEG1_RECOVER,
-        LEG2_SEEK,
-        LEG2_CRAWL,
-        LEG2_RECOVER,
     };
 
     int32_t travel_limit_pulses() const;
@@ -82,14 +72,6 @@ private:
     uint16_t home_first_method() const;
     uint16_t home_method_reg() const;
     bool dual_limit_home() const;
-    bool target_limit_di_active() const;
-    bool opposite_limit_di_active() const;
-    int16_t seek_speed_signed(uint16_t rpm) const;
-    bool cal_phase_reverse() const;
-    int16_t cal_phase_spd_signed() const;
-    void begin_di_recover(uint32_t now, const char *why);
-    void begin_forward_reapproach(uint32_t now, const char *why);
-    void latch_di_extreme_and_finish(uint32_t now);
     void home_leg_done(uint32_t now);
     uint32_t link_timeout_ms() const;
     uint32_t home_timeout_ms() const;
@@ -97,7 +79,6 @@ private:
     uint16_t run_speed_rpm() const;
     uint16_t calib_speed_rpm() const;
     uint16_t calib_crawl_rpm() const;
-    uint16_t mid_seek_speed_rpm() const;
     int32_t center_target_pulses() const;
     void send_u16(uint16_t reg, uint16_t value);
     void send_target_pos(int32_t target);
@@ -140,13 +121,11 @@ private:
     bool _saw_home_motion = false;
     bool _saw_home_clear = false;
     bool _home_read_encoder = false;
-    uint8_t _home_poll_phase = 0; // 0=encoder, 1=status, 2=DI
     bool _got_di = false;
     uint16_t _di_word = 0;
     bool _di_log_inited = false;
     uint16_t _di_log_word = 0;
     uint16_t _di_raw_log = 0;
-    bool _saw_target_di_clear = false;
     bool _home_center_run_spd = false;
     uint8_t _home_center_prep = 0;
     bool _center_resend = false;
@@ -175,29 +154,6 @@ private:
     int32_t _center_encoder_origin = 0;
     int32_t _measured_half_travel = 0;
     uint8_t _home_leg = 0;
-    bool _home_stop_pending = false;
-    bool _home_clear_pending = false;
-    bool _home_enable_pending = false;
-    bool _home_speed_leg = false;
-    bool _home_soft_spd_pending = false;
-    bool _home_crawl_resume_pending = false;
-    CalPhase _cal_phase = CalPhase::LEG1_CRAWL;
-    bool _leg1_recovered = false;
-    bool _recover_saw_motion = false;
-    uint32_t _recover_start_ms = 0;
-    uint8_t _reapproach_count = 0;
-    uint32_t _reapproach_last_ms = 0;
-    uint8_t _recover_nudge_count = 0;
-    bool _di_extreme_latched = false;
-    bool _leg2_left_l1 = false;
-    bool _leg2_saw_l1_di = false;
-    uint32_t _leg2_seek_ms = 0;
-    // Any leg: opposite DI seen then cleared (stale OT after leave).
-    bool _saw_opp_di = false;
-    uint32_t _left_opp_ms = 0;
-    bool _home_retry_clear_next = true;
-    bool _di_both_ignore = false;
-    uint32_t _di_both_since_ms = 0;
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
@@ -224,10 +180,10 @@ private:
     AP_Int8  rst_ch;
     AP_Int8  cal_ch;
     AP_Int8  cal_mth;
-    AP_Int16 seek_speed;
+    AP_Int16 home_speed;   // CL57R 0x0041 HOME_SPD (+ mid-return cruise)
     AP_Int8  cal_trig;
     AP_Int8  cal_mode;
-    AP_Int16 crawl_speed;
+    AP_Int16 crawl_speed;  // CL57R 0x0042 HOME_CRAWL (+ leave-limit crawl)
     AP_Int16 link_timeout;
     AP_Int16 cal_timeout_s;
     AP_Int8  di_inv;

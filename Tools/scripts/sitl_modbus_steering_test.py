@@ -413,7 +413,7 @@ def run_param_trigger():
         time.sleep(0.5)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_SEEK_SPD", 500, int16)
+        set_param(mavlink, "OB_STR_HOME_SPD", 500, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -534,7 +534,7 @@ def run_rc_buttons():
         set_param(mavlink, "OB_STR_CAL_CH", 7, int8)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_SEEK_SPD", 500, int16)
+        set_param(mavlink, "OB_STR_HOME_SPD", 500, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -622,7 +622,7 @@ def run_rc_buttons():
         if not restored:
             print("FAIL: run speed 1300 not restored after mid")
             return 1
-        print("PASS: home speed 500, mid return, run speed restored to 1300")
+        print("PASS: HOME_SPD 500, mid return, run speed restored to 1300")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
@@ -742,13 +742,13 @@ def connect_ready():
     return mavlink, events
 
 
-def set_cal_defaults(mavlink, cal_mode=1, cal_mth=17, crawl_spd=200, seek_spd=500):
+def set_cal_defaults(mavlink, cal_mode=1, cal_mth=17, crawl_spd=200, home_spd=500):
     int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
     int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
     set_param(mavlink, "OB_STR_CAL_TRIG", 0, int8)
     set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
     set_param(mavlink, "OB_STR_RATIO", 10, int16)
-    set_param(mavlink, "OB_STR_SEEK_SPD", seek_spd, int16)
+    set_param(mavlink, "OB_STR_HOME_SPD", home_spd, int16)
     set_param(mavlink, "OB_STR_CRAWL_SPD", crawl_spd, int16)
     set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
     set_param(mavlink, "OB_STR_CAL_MODE", cal_mode, int8)
@@ -1011,7 +1011,7 @@ def run_cal_rx_abort():
         if mavlink is None:
             return 1
         # Slow crawl so DROP can win the race before _saw_home_motion latches.
-        set_cal_defaults(mavlink, crawl_spd=5, seek_spd=5)
+        set_cal_defaults(mavlink, crawl_spd=5, home_spd=5)
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
         # Reach HOME_WAIT (prep needs link), then drop before encoder motion.
         seek_started = False
@@ -1093,7 +1093,7 @@ def run_cal_timeout():
         if mavlink is None:
             return 1
         # Slow crawl so the leg cannot finish before CAL_TO fires.
-        set_cal_defaults(mavlink, crawl_spd=5, seek_spd=5)
+        set_cal_defaults(mavlink, crawl_spd=5, home_spd=5)
         set_param(mavlink, "OB_STR_CAL_TO", 3, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
         deadline = time.time() + 20
@@ -1131,7 +1131,7 @@ def run_cal_stall():
         mavlink, events = connect_ready()
         if mavlink is None:
             return 1
-        set_cal_defaults(mavlink, crawl_spd=200, seek_spd=400)
+        set_cal_defaults(mavlink, crawl_spd=200, home_spd=400)
         set_param(mavlink, "OB_STR_CAL_TO", 5, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
         write_sim_control(ctl, "STALL")
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
@@ -1176,7 +1176,7 @@ def run_cal_both_di():
         mavlink, events = connect_ready()
         if mavlink is None:
             return 1
-        set_cal_defaults(mavlink, crawl_spd=200, seek_spd=400)
+        set_cal_defaults(mavlink, crawl_spd=200, home_spd=400)
         write_sim_control(ctl, "BOTHDI")
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
         if not wait_calibrated(mavlink, events, timeout_s=55):
