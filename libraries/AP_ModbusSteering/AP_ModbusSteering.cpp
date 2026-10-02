@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.4";
+constexpr const char *CL57R_FW_TAG = "v12.5";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -970,7 +970,18 @@ void AP_ModbusSteering::consume_rx()
                 _status_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 _got_status = true;
             } else if (_rx_expect == RxExpect::DI_INPUT && byte_count >= 2) {
-                _di_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
+                const uint16_t di = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
+                // Log only on change (bring-up: verify X1/X2 wiring).
+                if (!_di_log_inited || di != _di_log_word) {
+                    _di_log_inited = true;
+                    _di_log_word = di;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: DI %04x X1=%u X2=%u",
+                                  (unsigned)di,
+                                  (unsigned)((di & DI_X1) != 0 ? 1 : 0),
+                                  (unsigned)((di & DI_X2) != 0 ? 1 : 0));
+                }
+                _di_word = di;
                 _got_di = true;
             } else if (_rx_expect == RxExpect::ENCODER && byte_count == 0x04 && frame_len >= 9) {
                 const uint16_t high_word = (_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
@@ -2070,14 +2081,19 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     }
     case DriveState::RUN_READ:
-        if (_read_status_next) {
+        // Round-robin encoder / status / DI so limit switches are visible
+        // outside of cal (STATUSTEXT on DI change).
+        if (_run_poll_phase == 0) {
+            _rx_expect = RxExpect::ENCODER;
+            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+        } else if (_run_poll_phase == 1) {
             _rx_expect = RxExpect::STATUS;
             modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
         } else {
-            _rx_expect = RxExpect::ENCODER;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+            _rx_expect = RxExpect::DI_INPUT;
+            modbus_create_read_packet((uint8_t)slave_id.get(), REG_DI_STATUS, 1, tx_packet);
         }
-        _read_status_next = !_read_status_next;
+        _run_poll_phase = (uint8_t)((_run_poll_phase + 1) % 3);
         _uart->write(tx_packet, 8);
         _state = DriveState::RUN_WRITE;
         break;

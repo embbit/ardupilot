@@ -139,6 +139,8 @@ private:
     uint8_t _home_poll_phase = 0; // 0=encoder, 1=status, 2=DI
     bool _got_di = false;
     uint16_t _di_word = 0;
+    bool _di_log_inited = false;
+    uint16_t _di_log_word = 0;
     bool _saw_target_di_clear = false;
     bool _home_center_run_spd = false;
     uint8_t _home_center_prep = 0;
@@ -189,7 +191,7 @@ private:
     uint8_t _follow_alarm_count = 0;
     int32_t _follow_peak_toward = 0;
     int32_t _last_stick_log = 0;
-    bool _read_status_next = false;
+    uint8_t _run_poll_phase = 0; // 0=encoder, 1=status, 2=DI
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
     uint16_t _status_word = 0;
