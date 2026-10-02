@@ -46,8 +46,12 @@ class Nema23Motor:
         self.reported_position = 0.0
         self.home_done = False
         self.home_rpm = 0
+        self.home_method = 17  # CL57R 0x0040: 17=X2 N-OT, 18=X1 P-OT
         self.home_finish_at = 0.0
         self.home_runs = 0
+        # World-frame offset: encoder position + mech_offset = mechanical shaft.
+        # Native MOTION_HOME zeros the encoder at the limit without moving the shaft.
+        self.mech_offset = 0.0
         # When True, ignore position commands until alarm-clear (0x0037=0x0004).
         self.alarmed = False
         # When True, freeze shaft (no alarm) until cleared — HW stall / missing DI.
@@ -56,6 +60,9 @@ class Nema23Motor:
         self.di_disabled = False
         # When True, force X1+X2 active (HW both-DI stuck).
         self.force_both_di = False
+
+    def mech_pos(self):
+        return self.position + self.mech_offset
 
     def di_word(self):
         # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT.
@@ -66,11 +73,30 @@ class Nema23Motor:
             return (1 << 1) | (1 << 2)
         word = 0
         margin = max(int(SPEED_HARD_STOP * 0.05), 200)
-        if self.position >= SPEED_HARD_STOP - margin:
+        mech = self.mech_pos()
+        if mech >= SPEED_HARD_STOP - margin:
             word |= (1 << 2)  # X2 at positive hard stop (M17 target)
-        if self.position <= -SPEED_HARD_STOP + margin:
+        if mech <= -SPEED_HARD_STOP + margin:
             word |= (1 << 1)  # X1 at negative hard stop (M18 target)
         return word
+
+    def home_limit_encoder_target(self):
+        """Encoder-space target for native MOTION_HOME given current mech_offset."""
+        if self.home_method == 18:
+            world = float(-SPEED_HARD_STOP)
+        else:
+            world = float(SPEED_HARD_STOP)
+        return int(round(world - self.mech_offset))
+
+    def apply_native_home_zero(self):
+        """CL57R zeros position reference at the limit after MOTION_HOME."""
+        self.mech_offset += self.position
+        self.position = 0.0
+        self.reported_position = 0.0
+        self.driver_target = 0
+        self.velocity = 0.0
+        self.home_finish_at = 0.0
+        self.home_done = True
 
     def refresh_status(self):
         status = 0
@@ -150,24 +176,23 @@ class Nema23Motor:
             self.speed_mode = False
         elif self.home_finish_at > 0.0:
             self.speed_mode = False
-            error = self.driver_target - self.position
-            if abs(error) > 80.0:
-                direction = 1.0 if error > 0 else -1.0
-                self.velocity = self.max_vel * 0.4 * direction
-                new_pos = self.position + self.velocity * dt_s
-                if ((self.position - self.driver_target) * (new_pos - self.driver_target)) <= 0:
-                    self.position = float(self.driver_target)
-                    self.velocity = 0.0
-                else:
-                    self.position = new_pos
-            else:
-                # Arrived at limit: CL57R native home zeros the position reference.
-                self.home_finish_at = 0.0
-                self.home_done = True
-                self.position = 0.0
-                self.reported_position = 0.0
-                self.driver_target = 0
+            if self.force_stall and link_active:
+                # Jam during native home: shaft frozen, home_done stays clear.
                 self.velocity = 0.0
+            else:
+                error = self.driver_target - self.position
+                if abs(error) > 80.0:
+                    direction = 1.0 if error > 0 else -1.0
+                    self.velocity = self.max_vel * 0.4 * direction
+                    new_pos = self.position + self.velocity * dt_s
+                    if ((self.position - self.driver_target) * (new_pos - self.driver_target)) <= 0:
+                        self.position = float(self.driver_target)
+                        self.velocity = 0.0
+                    else:
+                        self.position = new_pos
+                else:
+                    # Arrived at limit: CL57R native home zeros the position reference.
+                    self.apply_native_home_zero()
         elif not self.motor_enabled:
             self.speed_mode = False
             self._decay_velocity(dt_s, self.max_decel * 2)
@@ -194,15 +219,16 @@ class Nema23Motor:
                 self.velocity = max(target_vel, self.velocity - self.max_accel * dt_s)
             self.position += self.velocity * dt_s
             self.driver_target = int(round(self.position))
-            # Hard stop models hitting a mechanical limit during dual-limit seek.
-            if self.position >= SPEED_HARD_STOP:
-                self.position = float(SPEED_HARD_STOP)
-                self.driver_target = SPEED_HARD_STOP
+            # Hard stop models hitting a mechanical limit (world / mech frame).
+            mech = self.mech_pos()
+            if mech >= SPEED_HARD_STOP:
+                self.position = float(SPEED_HARD_STOP - self.mech_offset)
+                self.driver_target = int(round(self.position))
                 self.raise_alarm()
                 print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
-            elif self.position <= -SPEED_HARD_STOP:
-                self.position = float(-SPEED_HARD_STOP)
-                self.driver_target = -SPEED_HARD_STOP
+            elif mech <= -SPEED_HARD_STOP:
+                self.position = float(-SPEED_HARD_STOP - self.mech_offset)
+                self.driver_target = int(round(self.position))
                 self.raise_alarm()
                 print(f"[CL57R Modbus Sim] ALARM raised at position={int(self.position)}")
         elif link_active:
@@ -483,6 +509,9 @@ def handle_write_single(reg_addr, val):
         motor.accel_ms = val
     elif reg_addr == 0x0032:
         motor.decel_ms = val
+    elif reg_addr == 0x0040:
+        motor.home_method = 18 if val == 18 else 17
+        print(f"[CL57R Modbus Sim] HOME_METHOD=M{motor.home_method}")
     elif reg_addr == 0x0041:
         motor.home_rpm = val
         print(f"[CL57R Modbus Sim] HOME_SPD={val}")
@@ -498,6 +527,8 @@ def handle_write_single(reg_addr, val):
             print("[CL57R Modbus Sim] ALARM CLEARED by driver")
         motor.clear_alarm()
     elif reg_addr == 0x0037 and val == 0x0008:
+        # AUX POS_ZERO: re-zero encoder without moving the shaft.
+        motor.mech_offset += motor.position
         motor.position = 0.0
         motor.reported_position = 0.0
         motor.driver_target = 0
@@ -513,14 +544,12 @@ def handle_write_single(reg_addr, val):
         motor.home_done = False
         motor.home_runs += 1
         motor.home_finish_at = time.time() + 1.5
-        if motor.home_runs == 1:
-            motor.driver_target = 0
-        else:
-            motor.driver_target = 80000
+        motor.driver_target = motor.home_limit_encoder_target()
         if motor.home_rpm:
             motor.max_rpm = motor.home_rpm
             motor.max_rpm_signed = motor.home_rpm
-        print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs}")
+        print(f"[CL57R Modbus Sim] HOME START #{motor.home_runs} "
+              f"M{motor.home_method} target={motor.driver_target}")
     elif reg_addr == 0x0036 and (val & 0x0008):
         motor.speed_mode = True
         print(f"[CL57R Modbus Sim] SPEED START rpm={motor.max_rpm_signed}")

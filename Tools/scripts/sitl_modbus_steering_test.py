@@ -413,7 +413,7 @@ def run_param_trigger():
         time.sleep(0.5)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_SEEK_SPD", 1800, int16)
+        set_param(mavlink, "OB_STR_SEEK_SPD", 500, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -440,9 +440,8 @@ def run_param_trigger():
         if not calibrated:
             print("FAIL: CAL_TRIG=1 did not finish calibration")
             return 1
-        if not (wait_for_log(sim_lines, "SPEED START", 2) or
-                wait_for_log(sim_lines, "HOME START", 2)):
-            print("FAIL: simulator did not see SPEED/HOME START")
+        if not wait_for_log(sim_lines, "HOME START", 2):
+            print("FAIL: simulator did not see HOME START")
             return 1
         # Auto mid return via speed-mode follow after cal.
         mid_ok = False
@@ -535,7 +534,7 @@ def run_rc_buttons():
         set_param(mavlink, "OB_STR_CAL_CH", 7, int8)
         set_param(mavlink, "OB_STR_OUT_REV", 2, int8)
         set_param(mavlink, "OB_STR_RATIO", 10, int16)
-        set_param(mavlink, "OB_STR_SEEK_SPD", 1800, int16)
+        set_param(mavlink, "OB_STR_SEEK_SPD", 500, int16)
         set_param(mavlink, "OB_STR_MAX_SPD", 1300, int16)
         time.sleep(0.5)
 
@@ -563,32 +562,28 @@ def run_rc_buttons():
         if not calibrated:
             print("FAIL: homing button did not finish calibration")
             return 1
-        # Dual-limit uses speed-mode seek (SPEED START); legacy native home used HOME START.
-        if not (wait_for_log(sim_lines, "SPEED START", 2) or
-                wait_for_log(sim_lines, "HOME START", 2)):
-            print("FAIL: simulator did not see SPEED/HOME START")
-            return 1
-        if not wait_for_log(sim_lines, "POSITION ZEROED", 2):
-            print("FAIL: simulator did not zero after limit 1")
+        # Dual-limit: two native MOTION_HOME legs (HOME START), then speed mid.
+        home_starts = [line for line in sim_lines if "HOME START" in line]
+        if len(home_starts) < 2:
+            print(f"FAIL: expected >=2 HOME START, got {len(home_starts)}")
             return 1
         if not any("cal done at limit" in t or "CL57R: calibrated" in t for t in events):
             # calibrated is required; offset message is best-effort
             pass
-        print("PASS: home button calibrated (alarm clear + home + center)")
+        print("PASS: home button calibrated (alarm clear + dual native home + center)")
 
-        if not any("HOME_SPD=1800" in line for line in sim_lines):
-            print("FAIL: homing did not write HOME_SPD=1800")
+        if not any("HOME_SPD=500" in line for line in sim_lines):
+            print("FAIL: homing did not write HOME_SPD=500")
             return 1
         if not any("cal@limit" in t or "cal done at limit" in t for t in events):
             print("FAIL: missing cal done at limit message")
             return 1
-        if not any("spd-follow" in t or "cal@limit" in t or "v12.1" in t or " v12" in t
-                   or "limit seek" in t or "DI extreme" in t or "soft crawl" in t or "recover DI" in t
+        if not any("cal@limit" in t or "homing leg" in t or "native L1" in t or "v13" in t
                    for t in events):
-            print("FAIL: missing speed-follow mid return message")
+            print("FAIL: missing native dual-home / cal@limit message")
             return 1
 
-        # Wait for physical mid return (speed mode at SEEK RPM).
+        # Wait for physical mid return (speed mode after native cal).
         mid_done = False
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -627,7 +622,7 @@ def run_rc_buttons():
         if not restored:
             print("FAIL: run speed 1300 not restored after mid")
             return 1
-        print("PASS: home speed 1800, mid return, run speed restored to 1300")
+        print("PASS: home speed 500, mid return, run speed restored to 1300")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
@@ -978,7 +973,7 @@ def run_cal_mode0():
 
 
 def run_cal_mth18():
-    """Dual-limit with first method M18 (positive/X1 first)."""
+    """Dual-limit with first method M18 (two native MOTION_HOME legs)."""
     procs, _sitl, sim_lines = start_rover_and_sim()
     try:
         mavlink, events = connect_ready()
@@ -988,16 +983,20 @@ def run_cal_mth18():
         if not calibrate_via_param(mavlink, events, cal_mode=1, cal_mth=18):
             return 1
         joined = "\n".join(events)
-        if not any("DI extreme" in t or "cal@limit" in t for t in events):
-            print("FAIL: missing DI extreme / cal@limit for M18")
+        if not any("cal@limit" in t for t in events):
+            print("FAIL: missing cal@limit for M18")
             return 1
-        if "M18" not in joined and "limit seek" not in joined:
-            print("FAIL: missing M18 / limit seek evidence")
+        if "M18" not in joined and "homing leg" not in joined:
+            print("FAIL: missing M18 / homing leg evidence")
             return 1
-        if not any("SPEED START" in line for line in sim_lines):
-            print("FAIL: no SPEED START during M18 cal")
+        home_m18 = [line for line in sim_lines if "HOME START" in line and "M18" in line]
+        if not home_m18:
+            print("FAIL: no HOME START M18 during M18 cal")
             return 1
-        print("PASS: CAL_MTH=18 dual-limit cal")
+        if len([line for line in sim_lines if "HOME START" in line]) < 2:
+            print("FAIL: dual native home needs two HOME START")
+            return 1
+        print("PASS: CAL_MTH=18 dual native MOTION_HOME")
         return 0
     finally:
         stop_procs(procs)
@@ -1125,7 +1124,7 @@ def run_cal_timeout():
 
 
 def run_cal_stall():
-    """Encoder freeze (no alarm, no DI) must start DI recover instead of waiting 90s."""
+    """Shaft freeze during native MOTION_HOME must not falsely calibrate; CAL_TO aborts."""
     ctl = default_control_file()
     procs, _sitl, _sim = start_rover_and_sim(control_file=ctl)
     try:
@@ -1133,34 +1132,33 @@ def run_cal_stall():
         if mavlink is None:
             return 1
         set_cal_defaults(mavlink, crawl_spd=200, seek_spd=400)
-        write_sim_control(ctl, "NODI")
+        set_param(mavlink, "OB_STR_CAL_TO", 5, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
+        write_sim_control(ctl, "STALL")
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
         deadline = time.time() + 15
-        saw_crawl = False
+        saw_home = False
         while time.time() < deadline:
             collect_mavlink_events(mavlink, 0.2, events)
-            if any("limit seek leg 1 crawl" in t for t in events):
-                saw_crawl = True
+            if any("homing leg" in t or "homing to limit" in t for t in events):
+                saw_home = True
                 break
-        if not saw_crawl:
-            print("FAIL: cal stall test never reached leg1 crawl")
+        if not saw_home:
+            print("FAIL: cal stall test never reached native home")
             return 1
-        write_sim_control(ctl, "STALL")
-        deadline = time.time() + 12
-        saw_stall = False
+        deadline = time.time() + 20
+        saw_timeout = False
         while time.time() < deadline:
             collect_mavlink_events(mavlink, 0.3, events)
-            # Encoder freeze → reverse recover (reapproach is for early alarm).
-            if any("recover DI (stall)" in t for t in events):
-                saw_stall = True
+            if any("home timeout" in t for t in events):
+                saw_timeout = True
                 break
             if any("CL57R: calibrated" in t for t in events):
-                print("FAIL: calibrated during NODI/STALL test")
+                print("FAIL: calibrated during STALL native-home test")
                 return 1
-        if not saw_stall:
-            print("FAIL: no recover DI (stall) after encoder freeze")
+        if not saw_timeout:
+            print("FAIL: no home timeout after encoder freeze during MOTION_HOME")
             return 1
-        print("PASS: approach stall starts DI recover")
+        print("PASS: native home stall aborts via CAL_TO")
         return 0
     finally:
         stop_procs(procs)
@@ -1171,7 +1169,7 @@ def run_cal_stall():
 
 
 def run_cal_both_di():
-    """Both X1+X2 stuck must not freeze cal for the full home timeout."""
+    """Stuck both-DI bits must not block native MOTION_HOME (drive seeks limits)."""
     ctl = default_control_file()
     procs, _sitl, _sim = start_rover_and_sim(control_file=ctl)
     try:
@@ -1181,32 +1179,13 @@ def run_cal_both_di():
         set_cal_defaults(mavlink, crawl_spd=200, seek_spd=400)
         write_sim_control(ctl, "BOTHDI")
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
-        deadline = time.time() + 25
-        saw_ignore = False
-        saw_abort = False
-        saw_recover = False
-        while time.time() < deadline:
-            collect_mavlink_events(mavlink, 0.3, events)
-            if any("both DI stuck" in t and "ignore mask" in t for t in events):
-                saw_ignore = True
-            if any("both DI stuck (check X1/X2 wiring)" in t for t in events):
-                saw_abort = True
-                break
-            if any("recover DI" in t for t in events):
-                saw_recover = True
-            if any("home timeout" in t for t in events):
-                print("FAIL: fell through to home timeout with both DI")
-                return 1
-            if any("CL57R: calibrated" in t for t in events):
-                print("FAIL: calibrated with BOTHDI forced")
-                return 1
-        if not saw_ignore:
-            print("FAIL: no both-DI ignore warning")
+        if not wait_calibrated(mavlink, events, timeout_s=55):
+            print("FAIL: native dual home did not finish with BOTHDI")
             return 1
-        if not (saw_abort or saw_recover):
-            print("FAIL: neither both-DI abort nor recover after ignore")
+        if not any("homing leg" in t for t in events):
+            print("FAIL: missing homing leg with BOTHDI")
             return 1
-        print("PASS: both-DI does not freeze cal for 90s")
+        print("PASS: native MOTION_HOME completes despite both-DI stuck bits")
         return 0
     finally:
         stop_procs(procs)

@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.14";
+constexpr const char *CL57R_FW_TAG = "v13.0";
 // After leaving a limit, stale OT may linger — clear+same-dir, don't reverse.
 constexpr uint32_t LEAVE_ALARM_GRACE_MS = 5000;
 constexpr uint8_t REAPPROACH_MAX = 10;
@@ -172,14 +172,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // --- calibration ---
     // @Param: CAL_MODE
     // @DisplayName: Calibration mode
-    // @Description: 0 uses one limit switch and OUT_REV/RATIO for center. 1 seeks both limits, measures lock-to-lock travel, centers at mid, saves half-travel to MAX_STEPS.
+    // @Description: 0 = one native MOTION_HOME (CL57R M17/M18) then center from OUT_REV/RATIO. 1 = two native MOTION_HOME legs (CAL_MTH then opposite), measure lock-to-lock, center at mid, save half-travel to MAX_STEPS.
     // @Values: 0:SingleLimit,1:DualLimit
     // @User: Standard
     AP_GROUPINFO("CAL_MODE", 15, AP_ModbusSteering, cal_mode, 1),
 
     // @Param: CAL_MTH
     // @DisplayName: First limit method
-    // @Description: First limit for calibration. 17 = negative limit (X2 N-OT). 18 = positive limit (X1 P-OT). DualLimit then seeks the opposite limit.
+    // @Description: CL57R home method for the first leg (reg 0x0040). 17 = X2 N-OT, 18 = X1 P-OT. DualLimit then runs the opposite method.
     // @Values: 17:NegativeLimit,18:PositiveLimit
     // @Range: 17 18
     // @User: Standard
@@ -187,7 +187,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: SEEK_SPD
     // @DisplayName: Calibration SEEK speed
-    // @Description: SEEK RPM for dual-limit cal leg2 cruise (CL57R 0x0041 / speed-mode MAX_SPD). Keep moderate — high values overshoot past the far limit. Mid return uses half of this (capped). Near-limit uses CRAWL_SPD.
+    // @Description: Written to CL57R 0x0041 (native home SEEK RPM). Also used for post-cal mid return cruise (half, capped). Keep moderate.
     // @Units: RPM
     // @Range: 5 3000
     // @User: Standard
@@ -195,7 +195,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: CRAWL_SPD
     // @DisplayName: Calibration crawl speed
-    // @Description: Slow RPM near the stops (leg1, leg2 last ~20%, pass after alarm L1). Also written to CL57R 0x0042 (capped at 300).
+    // @Description: Written to CL57R 0x0042 (native home near-limit crawl, capped at 300). Also used when leaving the post-cal limit toward mid.
     // @Units: RPM
     // @Range: 5 300
     // @User: Standard
@@ -842,26 +842,23 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
         _home_crawl_resume_pending = false;
         _home_soft_spd_pending = false;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                      "CL57R: limit 1 DI travel %d%s, clear and seek limit 2",
-                      (int)_leg1_travel,
-                      _leg1_recovered ? " (recovered)" : "");
+                      "CL57R: native L1 travel %d, home limit 2",
+                      (int)_leg1_travel);
         return;
     }
 
     if (dual_limit_home()) {
-        // CL57R native home typically zeros the encoder at the limit, so the
-        // final reading after leg 2 is near 0. Use peak displacement tracked
-        // while seeking the second limit (= measured |P2-P1| after L1 zero).
+        // Native MOTION_HOME zeros at the limit; peak while seeking L2 is
+        // measured lock-to-lock travel.
         int32_t full_travel = _leg_peak_travel;
         const int32_t abs_now = (_actual_pulses >= 0) ? _actual_pulses : -_actual_pulses;
         if (abs_now > full_travel) {
             full_travel = abs_now;
         }
         const int32_t expected = expected_full_travel_pulses();
-        // POS_ZERO race finished leg2 in ~100ms with peak≈leg1 travel.
-        // Skip when this leg latched a real DI extreme.
+        // Speed-mode only: POS_ZERO race. Native home sets di_extreme via done bit.
         const uint32_t leg2_ms = AP_HAL::millis() - _home_start_ms;
-        if (!_di_extreme_latched &&
+        if (_home_speed_leg && !_di_extreme_latched &&
             leg2_ms < 1500 &&
             expected >= 20000 &&
             full_travel >= expected / 3) {
@@ -1167,21 +1164,13 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_ENABLE;
         break;
     case DriveState::HOME_ENABLE:
-        // Dual-limit: speed-mode SEEK/CRAWL. Extremes always latched on DI.
-        if (dual_limit_home()) {
-            _home_speed_leg = true;
-            if (_home_leg == 0) {
-                _cal_phase = CalPhase::LEG1_CRAWL;
-                _leg1_recovered = false;
-            } else {
-                // Always zeroed on DI1 — start SEEK toward DI2.
-                _cal_phase = CalPhase::LEG2_SEEK;
-            }
-            _state = DriveState::HOME_SEEK_SPD;
-        } else {
-            _home_speed_leg = false;
-            _state = DriveState::HOME_START;
+        // Dual-limit: two native MOTION_HOME legs (drive seeks DI via M17/M18).
+        // Speed-mode dual seek removed — CL57R home is more reliable on HW.
+        _home_speed_leg = false;
+        if (dual_limit_home() && _home_leg == 0) {
+            _leg1_recovered = false;
         }
+        _state = DriveState::HOME_START;
         break;
     case DriveState::HOME_SEEK_SPD:
         _state = DriveState::HOME_START;
@@ -1673,8 +1662,18 @@ void AP_ModbusSteering::update(float steering_out)
                 _home_leg_settle_ms = now + 200;
             } else if (now >= _home_leg_settle_ms) {
                 _home_leg_settling = false;
+                // Native home finished on the DI — treat as extreme latch.
+                _di_extreme_latched = true;
                 home_leg_done(now);
             }
+        } else if (home_bit && !running && _saw_home_clear &&
+                   !_saw_home_motion && (now - _home_start_ms) > 1500) {
+            // Already on the limit: native home completes with little motion.
+            _di_extreme_latched = true;
+            if (_leg_peak_travel < moved) {
+                _leg_peak_travel = moved;
+            }
+            home_leg_done(now);
         } else if (_home_leg_settling && running) {
             _home_leg_settling = false;
         }
@@ -2352,12 +2351,7 @@ void AP_ModbusSteering::update(float steering_out)
         break;
     }
     case DriveState::HOME_SET_ACCEL:
-        // Dual-limit speed-mode uses run accel/decel regs, not native home accel.
-        if (dual_limit_home()) {
-            send_u16(REG_DECEL, MID_SEEK_DECEL_MS);
-        } else {
-            send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
-        }
+        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
         break;
     case DriveState::HOME_ENABLE:
         send_u16(REG_MOTOR_ENABLE, 0x0001);
