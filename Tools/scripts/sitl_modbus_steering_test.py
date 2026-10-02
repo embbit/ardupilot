@@ -747,7 +747,7 @@ def connect_ready():
     return mavlink, events
 
 
-def set_cal_defaults(mavlink, cal_mode=1, cal_mth=17, crawl_spd=200, seek_spd=1800):
+def set_cal_defaults(mavlink, cal_mode=1, cal_mth=17, crawl_spd=200, seek_spd=500):
     int8 = mavutil.mavlink.MAV_PARAM_TYPE_INT8
     int16 = mavutil.mavlink.MAV_PARAM_TYPE_INT16
     set_param(mavlink, "OB_STR_CAL_TRIG", 0, int8)

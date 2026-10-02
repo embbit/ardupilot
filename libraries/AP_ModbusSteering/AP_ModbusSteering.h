@@ -177,6 +177,7 @@ private:
     uint8_t _home_leg = 0;
     bool _home_stop_pending = false;
     bool _home_clear_pending = false;
+    bool _home_enable_pending = false;
     bool _home_speed_leg = false;
     bool _home_soft_spd_pending = false;
     bool _home_crawl_resume_pending = false;
@@ -202,6 +203,7 @@ private:
     bool _follow_halted = false;
     uint8_t _follow_alarm_count = 0;
     int32_t _follow_peak_toward = 0;
+    int32_t _follow_peak_at_alarm = 0;
     int32_t _last_stick_log = 0;
     uint8_t _run_poll_phase = 0; // 0=encoder, 1=status, 2=DI
     int32_t _last_target = 0;

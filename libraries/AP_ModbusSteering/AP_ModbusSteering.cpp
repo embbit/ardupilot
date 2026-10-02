@@ -9,12 +9,15 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.13";
+constexpr const char *CL57R_FW_TAG = "v12.14";
 // After leaving a limit, stale OT may linger — clear+same-dir, don't reverse.
 constexpr uint32_t LEAVE_ALARM_GRACE_MS = 5000;
 constexpr uint8_t REAPPROACH_MAX = 10;
 // While reversing out of a hard stop, re-clear OT a few times before abort.
-constexpr uint8_t RECOVER_NUDGE_MAX = 4;
+constexpr uint8_t RECOVER_NUDGE_MAX = 6;
+// Recover with almost no encoder motion → jammed; abort instead of 45s wait.
+constexpr uint32_t RECOVER_NOMOTION_ABORT_MS = 12000;
+constexpr int32_t RECOVER_NOMOTION_PEAK = 12000;
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -184,11 +187,11 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: SEEK_SPD
     // @DisplayName: Calibration SEEK speed
-    // @Description: Fast SEEK RPM during dual-limit cal (CL57R 0x0041 and speed-mode MAX_SPD). Used for leg2 cruise and mid return. Near-limit crawl uses CRAWL_SPD.
+    // @Description: SEEK RPM for dual-limit cal leg2 cruise (CL57R 0x0041 / speed-mode MAX_SPD). Keep moderate — high values overshoot past the far limit. Mid return uses half of this (capped). Near-limit uses CRAWL_SPD.
     // @Units: RPM
     // @Range: 5 3000
     // @User: Standard
-    AP_GROUPINFO("SEEK_SPD", 13, AP_ModbusSteering, seek_speed, 1800),
+    AP_GROUPINFO("SEEK_SPD", 13, AP_ModbusSteering, seek_speed, 500),
 
     // @Param: CRAWL_SPD
     // @DisplayName: Calibration crawl speed
@@ -520,10 +523,11 @@ uint16_t AP_ModbusSteering::calib_speed_rpm() const
 {
     const int16_t rpm = seek_speed.get();
     if (rpm < 5) {
-        return 1800;
+        return 500;
     }
-    if (rpm > 3000) {
-        return 3000;
+    // Cap SEEK — high RPM flies past the far DI into the hard stop (HW).
+    if (rpm > 800) {
+        return 800;
     }
     return (uint16_t)rpm;
 }
@@ -543,8 +547,17 @@ uint16_t AP_ModbusSteering::calib_crawl_rpm() const
 
 uint16_t AP_ModbusSteering::mid_seek_speed_rpm() const
 {
-    // Same cruise as dual-limit speed-mode seek (OB_STR_SEEK_SPD).
-    return calib_speed_rpm();
+    // Slower than leg2 SEEK — full SEEK from a pressed limit overshoots (HW).
+    const uint16_t seek = calib_speed_rpm();
+    const uint16_t crawl = calib_crawl_rpm();
+    uint16_t mid = seek / 2;
+    if (mid < crawl) {
+        mid = crawl;
+    }
+    if (mid > 400) {
+        mid = 400;
+    }
+    return mid;
 }
 
 int32_t AP_ModbusSteering::center_target_pulses() const
@@ -702,12 +715,14 @@ void AP_ModbusSteering::start_home()
     _follow_halted = false;
     _follow_alarm_count = 0;
     _follow_peak_toward = 0;
+    _follow_peak_at_alarm = 0;
     _queued_motion = 0;
     _run_link_failsafe = false;
     _last_run_link_warn_ms = 0;
     _home_retry_pending = false;
     _home_stop_pending = false;
     _home_clear_pending = false;
+    _home_enable_pending = false;
     _home_speed_leg = false;
     _home_soft_spd_pending = false;
     _home_crawl_resume_pending = false;
@@ -919,10 +934,11 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _follow_last_enc = 0;
     _follow_last_spd = 0;
     _follow_progress_ms = 0;
-    _follow_mid_retried = false;
+    _follow_mid_retried = true; // leave post-cal limit at crawl first
     _follow_halted = false;
     _follow_alarm_count = 0;
     _follow_peak_toward = 0;
+    _follow_peak_at_alarm = 0;
     _home_start_ms = AP_HAL::millis();
     _last_home_progress_ms = 0;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
@@ -969,6 +985,9 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _home_crawl_resume_pending = false;
     // Never leave speed-mode running into a hard stop after cal abort.
     queue_motion(MOTION_STOP);
+    // Drop sticky OT so the user is not stuck in "alarm latched" spam.
+    _alarm_clear_pending = true;
+    _enable_after_alarm_clear = true;
     if (cal_trig.get() == 1) {
         cal_trig.set_and_save(0);
     }
@@ -1187,6 +1206,7 @@ void AP_ModbusSteering::advance_home()
         _home_leg_settling = false;
         _home_stop_pending = false;
         _home_clear_pending = false;
+        _home_enable_pending = false;
         _home_soft_spd_pending = false;
         _home_crawl_resume_pending = false;
         _home_soft_spd_pending = false;
@@ -1366,13 +1386,14 @@ void AP_ModbusSteering::update(float steering_out)
             // Extremes always on DI. Alarm → recover (reverse crawl) → latch DI.
             const int32_t expected = expected_full_travel_pulses();
             // Prefer the longer of OUT_REV estimate and measured L1 stroke so
-            // soft-crawl @80% is not taken too early on a short estimate.
+            // soft-crawl is not taken too early on a short estimate.
             int32_t span = expected;
             if (_home_leg == 1 && _leg1_travel > span) {
                 span = _leg1_travel;
             }
+            // Soft-crawl earlier (~70%) so SEEK does not fly past the DI.
             const int32_t soft_at = (span >= 20000)
-                ? ((span * 4) / 5)
+                ? ((span * 7) / 10)
                 : 50000;
             const int32_t min_hit = (expected >= 20000)
                 ? MIN(expected / 10, (int32_t)15000)
@@ -1487,11 +1508,14 @@ void AP_ModbusSteering::update(float steering_out)
                         latch_di_extreme_and_finish(now);
                     }
                 } else if (recover_ready &&
+                           (now - _recover_start_ms) > RECOVER_NOMOTION_ABORT_MS &&
+                           _leg_peak_travel < RECOVER_NOMOTION_PEAK) {
+                    // Shaft not moving (HW: pk~6k over 45s, di=0000).
+                    abort_home("recover jammed, free shaft / check DI");
+                } else if (recover_ready &&
                            (now - _last_home_progress_ms) > 1500 &&
-                           _got_status && alarmed() &&
                            _recover_nudge_count < RECOVER_NUDGE_MAX) {
-                    // Still jammed / OT latched while backing out — re-clear
-                    // and keep reverse crawl (HW: stuck on hard stop, pk~0).
+                    // Re-clear + re-enable + reverse crawl (alarm or freeze).
                     _recover_nudge_count++;
                     _home_stop_pending = true;
                     _home_crawl_resume_pending = true;
@@ -1503,7 +1527,6 @@ void AP_ModbusSteering::update(float steering_out)
                            _got_status && alarmed() &&
                            (now - _last_home_progress_ms) > 1000 &&
                            _recover_nudge_count >= RECOVER_NUDGE_MAX) {
-                    // Hit the other hard stop without finding DI.
                     abort_home("recover alarm, DI not found");
                 } else if ((now - _recover_start_ms) > 45000) {
                     abort_home("recover timeout, DI not found");
@@ -1573,14 +1596,17 @@ void AP_ModbusSteering::update(float steering_out)
                 !both_limits_di &&
                 !on_target_di;
 
-            // Still on opposite DI, or not yet far enough toward the far DI:
-            // never reverse back into the switch we are leaving.
-            // HW v12.12: after off L1, X1 bounced on, 9x reapproach demoted to
-            // crawl, grace expired → recover reverse into L1.
+            // Same-dir only (never reverse) when:
+            // - still on / just left opposite DI, or
+            // - short stroke with motion (early OT before target DI — HW v12.13
+            //   reverse went the wrong way, pk~6k, di=0000, 45s timeout).
             const bool still_on_opp =
                 _saw_opp_di && _got_di && opposite_limit_di_active();
+            const bool short_stroke_moving =
+                _saw_home_motion && _leg_peak_travel < min_hit;
             const bool leave_guard =
                 still_on_opp ||
+                short_stroke_moving ||
                 (_leg2_left_l1 && _leg_peak_travel < min_di) ||
                 (_left_opp_ms != 0 &&
                  (_leg_peak_travel < min_hit ||
@@ -1594,6 +1620,7 @@ void AP_ModbusSteering::update(float steering_out)
 
             // Recompute: leave may have armed stop/clear/soft this cycle.
             const bool busy_now = _home_stop_pending || _home_clear_pending ||
+                                  _home_enable_pending ||
                                   _home_soft_spd_pending ||
                                   _home_crawl_resume_pending;
             if (!in_recover && !busy_now && !_home_leg_settling) {
@@ -1601,8 +1628,10 @@ void AP_ModbusSteering::update(float steering_out)
                     latch_di_extreme_and_finish(now);
                 } else if (leave_guard && _got_status && alarmed() &&
                            reapproach_ok && !past_expected) {
-                    // Leaving / not yet at far DI: clear OT, keep leave dir.
-                    const char *why = still_on_opp ? "on opp DI" : "leave OT";
+                    // Short stroke / leave: clear OT, keep approach direction.
+                    const char *why = still_on_opp ? "on opp DI"
+                                     : (short_stroke_moving ? "short stroke"
+                                                            : "leave OT");
                     begin_forward_reapproach(now, why);
                 } else if (alarm_past || past_expected || stalled || far_end_no_di) {
                     // Past leave window: reverse recover to find DI.
@@ -1713,10 +1742,11 @@ void AP_ModbusSteering::update(float steering_out)
                 _follow_slot = 0;
                 _follow_alarm_step = 0;
                 _follow_restore = 0;
-                _follow_mid_retried = false;
+                _follow_mid_retried = true;
                 _follow_halted = false;
                 _follow_alarm_count = 0;
                 _follow_peak_toward = 0;
+                _follow_peak_at_alarm = 0;
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                               "CL57R: center fail, spd-follow %d",
                               (int)_steer_cmd_offset);
@@ -1849,11 +1879,26 @@ void AP_ModbusSteering::update(float steering_out)
             }
             _last_target = target;
 
-            // Track peak progress toward mid (used to avoid false "no progress").
+            // Track peak progress toward mid. Ignore encoder snaps that jump
+            // near the full mid distance in one sample (HW: alarm then false ready).
             if (_steer_cmd_offset != 0) {
+                const int32_t abs_goal_pk = (_steer_cmd_offset >= 0) ?
+                                           _steer_cmd_offset : -_steer_cmd_offset;
                 const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
                 if (toward > _follow_peak_toward) {
-                    _follow_peak_toward = toward;
+                    const int32_t jump = toward - _follow_peak_toward;
+                    if (abs_goal_pk > 10000 &&
+                        jump > abs_goal_pk / 5 &&
+                        _follow_peak_toward < abs_goal_pk / 4) {
+                        // snap — do not credit as travel
+                    } else {
+                        _follow_peak_toward = toward;
+                    }
+                }
+                // Finished leaving the post-cal limit — allow mid cruise RPM.
+                if (_follow_mid_retried &&
+                    _follow_peak_toward > abs_goal_pk / 10) {
+                    _follow_mid_retried = false;
                 }
             }
 
@@ -1944,18 +1989,15 @@ void AP_ModbusSteering::update(float steering_out)
                     const bool mid_return = (_steer_cmd_offset != 0);
                     const int32_t abs_goal = (_steer_cmd_offset >= 0) ?
                                             _steer_cmd_offset : -_steer_cmd_offset;
-                    // Require real progress toward mid. Encoder glitches after
-                    // alarm clear can look "past" mid with peak still ~0.
+                    // Use peak captured at alarm time — post-clear enc snaps
+                    // can look like full mid travel (HW: ready after 160 pulses).
+                    const int32_t peak = _follow_peak_at_alarm;
                     const bool mid_progress =
-                        mid_return && _follow_peak_toward > (abs_goal / 3);
+                        mid_return && peak > (abs_goal / 3);
                     const bool near_or_past =
                         mid_progress &&
-                        (_follow_peak_toward > (abs_goal - mid_stop) ||
-                         abs_err <= mid_stop ||
-                         (_follow_sign < 0 && enc <= target) ||
-                         (_follow_sign > 0 && enc >= target) ||
-                         (_steer_cmd_offset < 0 && enc <= _steer_cmd_offset) ||
-                         (_steer_cmd_offset > 0 && enc >= _steer_cmd_offset));
+                        (peak > (abs_goal - mid_stop) ||
+                         (abs_err <= mid_stop && peak > (abs_goal / 2)));
                     if (mid_return && near_or_past) {
                         send_u16(REG_MOTION, MOTION_STOP);
                         _center_encoder_origin = _actual_pulses;
@@ -1971,23 +2013,26 @@ void AP_ModbusSteering::update(float steering_out)
                         _follow_restore = 1;
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
                     } else if (mid_return &&
-                               _follow_peak_toward < abs_goal / 8 &&
-                               _follow_alarm_count < 5) {
+                               peak < abs_goal / 8 &&
+                               _follow_alarm_count < 8) {
                         // Still on the post-cal limit — leave at crawl, keep goal.
-                        // Force crawl RPM via mid_retried; keep alarm_count.
                         _follow_mid_retried = true;
                         _follow_moving = false;
                         _follow_sign = 0;
                         _follow_slot = 0;
                         _follow_last_spd = 0;
                         _follow_alarm_step = 0;
+                        // Drop bogus peak from enc snap during clear.
+                        if (_follow_peak_toward > peak + abs_goal / 5) {
+                            _follow_peak_toward = peak;
+                        }
                         GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                                       "CL57R: mid leave limit, crawl");
                     } else if (mid_return && !_follow_mid_retried) {
                         const int32_t remain = target - enc;
                         // Refuse a near-full-travel rebase after encoder wipe.
                         const int32_t abs_remain = (remain >= 0) ? remain : -remain;
-                        if (abs_remain > abs_goal / 2 && _follow_peak_toward > abs_goal / 3) {
+                        if (abs_remain > abs_goal / 2 && peak > abs_goal / 3) {
                             _center_encoder_origin = _actual_pulses;
                             _steer_cmd_offset = 0;
                             _follow_moving = false;
@@ -2044,14 +2089,15 @@ void AP_ModbusSteering::update(float steering_out)
 
             if (_got_status && alarmed()) {
                 _follow_alarm_count++;
+                _follow_peak_at_alarm = _follow_peak_toward;
                 _follow_moving = false;
                 _follow_sign = 0;
                 _follow_slot = 0;
                 _follow_alarm_step = 1;
                 send_u16(REG_MOTION, MOTION_STOP);
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: follow alarm %d->%d",
-                              (int)enc, (int)target);
+                              "CL57R: follow alarm enc=%d tgt=%d pk=%d",
+                              (int)enc, (int)target, (int)_follow_peak_at_alarm);
                 _state = DriveState::RUN_READ;
                 break;
             }
@@ -2338,6 +2384,12 @@ void AP_ModbusSteering::update(float steering_out)
         if (_home_clear_pending) {
             _home_clear_pending = false;
             send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+            _home_enable_pending = true;
+            break;
+        }
+        if (_home_enable_pending) {
+            _home_enable_pending = false;
+            send_u16(REG_MOTOR_ENABLE, 0x0001);
             break;
         }
         if (_home_soft_spd_pending) {
