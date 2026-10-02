@@ -526,7 +526,7 @@ def handle_write_single(reg_addr, val):
         print(f"[CL57R Modbus Sim] SPEED START rpm={motor.max_rpm_signed}")
     elif reg_addr == 0x0036 and (val & 0x0020):
         motor.speed_mode = False
-        motor.force_stall = False
+        # Keep force_stall across STOP — only UNSTALL clears it (HW jam).
         motor.velocity = 0.0
         motor.driver_target = int(round(motor.position))
         print("[CL57R Modbus Sim] MOTION STOP")

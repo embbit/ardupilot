@@ -1548,21 +1548,20 @@ void AP_ModbusSteering::update(float steering_out)
                 if (di_hit || start_on_limit) {
                     latch_di_extreme_and_finish(now);
                 } else if (alarm_past || past_expected || stalled || far_end_no_di) {
-                    // Never finish without DI. Prefer forward reapproach while
-                    // still short of the far end; reverse only after overshoot
-                    // or exhausted reapproach attempts.
+                    // Never finish without DI. Early leg2 / mid-stroke alarm:
+                    // clear and keep same direction (HW: reverse returned to L1).
+                    // Encoder freeze or past-estimate: reverse-crawl to find DI.
                     const bool want_reverse =
                         past_expected ||
+                        (stalled && !alarm_past) ||
                         (_reapproach_count >= REAPPROACH_MAX) ||
                         (far_end_no_di && !leg2_early &&
                          _reapproach_count >= 2);
                     if (!want_reverse && reapproach_ok &&
-                        (alarm_past || stalled || far_end_no_di || leg2_early)) {
+                        (alarm_past || far_end_no_di || leg2_early)) {
                         const char *why = "alarm";
                         if (leg2_early) {
                             why = "early L2";
-                        } else if (stalled && !alarm_past) {
-                            why = "stall";
                         } else if (far_end_no_di && !alarm_past) {
                             why = "far end no DI";
                         }

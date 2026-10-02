@@ -1150,6 +1150,7 @@ def run_cal_stall():
         saw_stall = False
         while time.time() < deadline:
             collect_mavlink_events(mavlink, 0.3, events)
+            # Encoder freeze → reverse recover (reapproach is for early alarm).
             if any("recover DI (stall)" in t for t in events):
                 saw_stall = True
                 break
