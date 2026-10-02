@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack (cal v12 + link failsafe).
-constexpr const char *CL57R_FW_TAG = "v12.7";
+constexpr const char *CL57R_FW_TAG = "v12.8";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -690,6 +690,7 @@ void AP_ModbusSteering::start_home()
     _leg1_recovered = false;
     _leg2_left_l1 = false;
     _leg2_saw_l1_di = false;
+    _leg2_seek_ms = 0;
     _home_retry_clear_next = true;
     _di_both_ignore = false;
     _di_both_since_ms = 0;
@@ -1168,6 +1169,7 @@ void AP_ModbusSteering::advance_home()
             // Leg2 always leaves L1 at crawl until opposite DI clears.
             _leg2_left_l1 = false;
             _leg2_saw_l1_di = false;
+            _leg2_seek_ms = 0;
         }
         if (_home_speed_leg) {
             const char *phase = "crawl";
@@ -1321,8 +1323,14 @@ void AP_ModbusSteering::update(float steering_out)
         } else if (_home_speed_leg) {
             // Extremes always on DI. Alarm → recover (reverse crawl) → latch DI.
             const int32_t expected = expected_full_travel_pulses();
-            const int32_t soft_at = (expected >= 20000)
-                ? ((expected * 4) / 5)
+            // Prefer the longer of OUT_REV estimate and measured L1 stroke so
+            // soft-crawl @80% is not taken too early on a short estimate.
+            int32_t span = expected;
+            if (_home_leg == 1 && _leg1_travel > span) {
+                span = _leg1_travel;
+            }
+            const int32_t soft_at = (span >= 20000)
+                ? ((span * 4) / 5)
                 : 50000;
             const int32_t min_hit = (expected >= 20000)
                 ? MIN(expected / 10, (int32_t)15000)
@@ -1380,6 +1388,7 @@ void AP_ModbusSteering::update(float steering_out)
                 (_leg2_saw_l1_di || _saw_home_motion ||
                  (now - _home_start_ms) > 2000)) {
                 _leg2_left_l1 = true;
+                _leg2_seek_ms = now;
                 _home_soft_spd_pending = true;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                               "CL57R: off L1, SEEK cruise @%d",
@@ -1387,15 +1396,18 @@ void AP_ModbusSteering::update(float steering_out)
             }
 
             // SEEK → crawl for the last ~20% of estimated lock-to-lock.
+            // Require a short SEEK window so we do not immediately drop back
+            // to crawl when peak already near soft_at after leave.
             if (_cal_phase == CalPhase::LEG2_SEEK && _leg2_left_l1 && !busy &&
-                expected >= 20000 && _saw_home_motion &&
+                span >= 20000 && _saw_home_motion &&
                 _leg_peak_travel >= soft_at &&
-                (now - _home_start_ms) > 500) {
+                _leg2_seek_ms != 0 &&
+                (now - _leg2_seek_ms) > 800) {
                 _cal_phase = CalPhase::LEG2_CRAWL;
                 _home_soft_spd_pending = true;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                              "CL57R: soft crawl @%d",
-                              (int)_leg_peak_travel);
+                              "CL57R: soft crawl @%d (span %d)",
+                              (int)_leg_peak_travel, (int)span);
             }
 
             // --- Recover: latch extreme on target DI (no clear required) ---
@@ -2207,9 +2219,12 @@ void AP_ModbusSteering::update(float steering_out)
             break;
         }
         if (_home_soft_spd_pending) {
+            // CL57R often ignores MAX_SPD changes until SPEED start is
+            // reasserted — without this, log shows SEEK but shaft stays at crawl.
             _home_soft_spd_pending = false;
             const int16_t spd = cal_phase_spd_signed();
             send_u16(REG_MAX_SPD, (uint16_t)spd);
+            _queued_motion = MOTION_SPEED;
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: phase spd=%d", (int)spd);
             break;
         }

@@ -186,6 +186,7 @@ private:
     bool _di_extreme_latched = false;
     bool _leg2_left_l1 = false;
     bool _leg2_saw_l1_di = false;
+    uint32_t _leg2_seek_ms = 0;
     bool _home_retry_clear_next = true;
     bool _di_both_ignore = false;
     uint32_t _di_both_since_ms = 0;
