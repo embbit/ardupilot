@@ -9,12 +9,14 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack.
-constexpr const char *CL57R_FW_TAG = "v13.3";
+constexpr const char *CL57R_FW_TAG = "v13.4";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 // Native MOTION_HOME ignored on some CL57R (st=enable+done, enc stuck):
 // after this many no-motion re-arms, fall back to signed SPEED toward OT.
 constexpr uint8_t HOME_NATIVE_FAILS_TO_SPEED = 2;
 constexpr uint32_t HOME_SPEED_STALL_MS = 2500;
+// Keep stick targets inside physical OT (full stick used to map onto the switch).
+constexpr int32_t STICK_SOFT_MARGIN_PULSES = 8000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
@@ -586,6 +588,7 @@ void AP_ModbusSteering::start_home()
     _follow_progress_ms = 0;
     _follow_mid_retried = false;
     _follow_halted = false;
+    _follow_need_center = false;
     _follow_alarm_count = 0;
     _follow_peak_toward = 0;
     _follow_peak_at_alarm = 0;
@@ -753,6 +756,7 @@ void AP_ModbusSteering::home_leg_done(uint32_t now)
     _follow_progress_ms = 0;
     _follow_mid_retried = true; // leave post-cal limit at crawl first
     _follow_halted = false;
+    _follow_need_center = false;
     _follow_alarm_count = 0;
     _follow_peak_toward = 0;
     _follow_peak_at_alarm = 0;
@@ -1056,8 +1060,13 @@ void AP_ModbusSteering::update(float steering_out)
     _was_armed = armed;
 
     const int32_t max_pulses = travel_limit_pulses();
-    const int32_t stick_pulses = constrain_int32((int32_t)(steering_out * (float)max_pulses),
-                                                 -max_pulses, max_pulses);
+    // Leave a soft margin so full stick does not command onto the OT switch.
+    int32_t stick_span = max_pulses;
+    if (stick_span > STICK_SOFT_MARGIN_PULSES * 2) {
+        stick_span -= STICK_SOFT_MARGIN_PULSES;
+    }
+    const int32_t stick_pulses = constrain_int32((int32_t)(steering_out * (float)stick_span),
+                                                 -stick_span, stick_span);
     if (now - _last_vect_ms >= 200) {
         _last_vect_ms = now;
         gcs().send_debug_vect("STEER",
@@ -1265,6 +1274,7 @@ void AP_ModbusSteering::update(float steering_out)
                 _follow_restore = 0;
                 _follow_mid_retried = true;
                 _follow_halted = false;
+                _follow_need_center = false;
                 _follow_alarm_count = 0;
                 _follow_peak_toward = 0;
                 _follow_peak_at_alarm = 0;
@@ -1477,11 +1487,18 @@ void AP_ModbusSteering::update(float steering_out)
                 break;
             }
 
-            if (_follow_halted) {
-                // Do not keep slamming a limit after wrong-way / repeat alarms.
-                // Stick deflection releases control from the current pose.
-                if (stick_pulses > arrive_db || stick_pulses < -arrive_db) {
+            if (_follow_halted || _follow_need_center) {
+                // HW: takeover-on-deflection rebased origin at the OT then
+                // immediately chased full stick back into the same switch.
+                // Release only after stick returns near center.
+                if (stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
+                    if (_follow_moving) {
+                        send_u16(REG_MOTION, MOTION_STOP);
+                    } else {
+                        send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    }
                     _follow_halted = false;
+                    _follow_need_center = false;
                     _follow_alarm_count = 0;
                     _steer_cmd_offset = 0;
                     _center_encoder_origin = _actual_pulses;
@@ -1489,9 +1506,17 @@ void AP_ModbusSteering::update(float steering_out)
                     _follow_sign = 0;
                     _follow_slot = 0;
                     _pending_run_spd = true;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: follow stick takeover");
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: follow ready (stick center)");
                 } else {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    if (_follow_moving) {
+                        send_u16(REG_MOTION, MOTION_STOP);
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                    } else {
+                        send_u16(REG_MOTOR_ENABLE, 0x0001);
+                    }
                 }
                 _state = DriveState::RUN_READ;
                 break;
@@ -1583,14 +1608,27 @@ void AP_ModbusSteering::update(float steering_out)
                         }
                     } else if (mid_return) {
                         _follow_halted = true;
+                        _follow_need_center = true;
                         _follow_moving = false;
                         _follow_sign = 0;
                         _follow_slot = 0;
                         _follow_alarm_step = 0;
                         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
                                       "CL57R: mid halt after alarm");
+                    } else if (_got_di && (_di_word & DI_LIMIT_MASK) != 0) {
+                        // Stick into OT: halt until stick centers (no resume slam).
+                        _follow_halted = true;
+                        _follow_need_center = true;
+                        _follow_moving = false;
+                        _follow_sign = 0;
+                        _follow_slot = 0;
+                        _follow_alarm_step = 0;
+                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                                      "CL57R: follow halt on DI %04x",
+                                      (unsigned)_di_word);
                     } else if (_follow_alarm_count >= 3) {
                         _follow_halted = true;
+                        _follow_need_center = true;
                         _follow_moving = false;
                         _follow_sign = 0;
                         _follow_slot = 0;
@@ -1709,7 +1747,37 @@ void AP_ModbusSteering::update(float steering_out)
                                       "CL57R: stick center, return mid");
                     }
                 }
-                const int8_t want_sign = (err > 0) ? 1 : -1;
+                int8_t want_sign = (err > 0) ? 1 : -1;
+                // Soft OT: with a limit DI pressed, never continue farther from
+                // mid (enc=0). Leave-toward-mid is still allowed.
+                if (_got_di && (_di_word & DI_LIMIT_MASK) != 0 &&
+                    _steer_cmd_offset == 0) {
+                    const bool into_end =
+                        (enc > arrive_db && want_sign > 0) ||
+                        (enc < -arrive_db && want_sign < 0);
+                    // After origin rebase on the switch, enc≈0 but stick still
+                    // commands a huge move into the same OT.
+                    const int32_t half = travel_limit_pulses();
+                    const bool on_switch_huge_cmd =
+                        (enc <= arrive_db && enc >= -arrive_db) &&
+                        abs_err > half / 4;
+                    if (into_end || on_switch_huge_cmd) {
+                        if (_follow_moving) {
+                            send_u16(REG_MOTION, MOTION_STOP);
+                            _follow_moving = false;
+                            _follow_sign = 0;
+                            _follow_slot = 0;
+                            _follow_last_spd = 0;
+                        } else {
+                            send_u16(REG_MOTOR_ENABLE, 0x0001);
+                        }
+                        if (stick_pulses > arrive_db || stick_pulses < -arrive_db) {
+                            _follow_need_center = true;
+                        }
+                        _state = DriveState::RUN_READ;
+                        break;
+                    }
+                }
                 // Mid return: HOME_SPD; stick-center return to mid: gentle.
                 uint16_t max_rpm = (_steer_cmd_offset != 0) ?
                                    calib_speed_rpm() : run_speed_rpm();

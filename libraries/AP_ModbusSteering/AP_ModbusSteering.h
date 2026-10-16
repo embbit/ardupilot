@@ -164,6 +164,7 @@ private:
     int32_t _leg1_travel = 0;
     bool _follow_mid_retried = false;
     bool _follow_halted = false;
+    bool _follow_need_center = false; // after OT/halt: wait stick center before move
     uint8_t _follow_alarm_count = 0;
     int32_t _follow_peak_toward = 0;
     int32_t _follow_peak_at_alarm = 0;
