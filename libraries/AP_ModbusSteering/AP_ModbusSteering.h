@@ -40,6 +40,7 @@ private:
         HOME_SET_CRAWL,
         HOME_SET_ACCEL,
         HOME_ENABLE,
+        HOME_ARM_STOP,   // STOP so MOTION_HOME sees a rising edge
         HOME_START,
         HOME_WAIT,
         HOME_ZERO_AT_L1,
@@ -142,6 +143,7 @@ private:
     uint32_t _follow_progress_ms = 0;
     uint16_t _queued_motion = 0;
     bool _home_retry_pending = false;
+    uint8_t _home_retry_step = 0; // 0=idle, 1..5 = STOP/CLEAR/EN/0/HOME
     bool _home_leg_settling = false;
     uint32_t _home_leg_settle_ms = 0;
     bool _center_step_settling = false;

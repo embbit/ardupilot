@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack.
-constexpr const char *CL57R_FW_TAG = "v13.1";
+constexpr const char *CL57R_FW_TAG = "v13.2";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
@@ -568,6 +568,7 @@ void AP_ModbusSteering::start_home()
     _run_link_failsafe = false;
     _last_run_link_warn_ms = 0;
     _home_retry_pending = false;
+    _home_retry_step = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
@@ -766,6 +767,8 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _state = DriveState::RUN_WRITE;
     _have_target = false;
     _rx_expect = RxExpect::NONE;
+    _home_retry_pending = false;
+    _home_retry_step = 0;
     // Stop any in-progress home / speed motion after cal abort.
     queue_motion(MOTION_STOP);
     // Drop sticky OT so the user is not stuck in "alarm latched" spam.
@@ -950,6 +953,10 @@ void AP_ModbusSteering::advance_home()
         _state = DriveState::HOME_ENABLE;
         break;
     case DriveState::HOME_ENABLE:
+        // STOP before MOTION_HOME so Bit4 sees a clean rising edge (CL57R).
+        _state = DriveState::HOME_ARM_STOP;
+        break;
+    case DriveState::HOME_ARM_STOP:
         _state = DriveState::HOME_START;
         break;
     case DriveState::HOME_START:
@@ -968,6 +975,8 @@ void AP_ModbusSteering::advance_home()
         _saw_home_motion = false;
         _saw_home_clear = false;
         _home_leg_settling = false;
+        _home_retry_pending = false;
+        _home_retry_step = 0;
         if (dual_limit_home()) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
                           (unsigned)(_home_leg + 1), (int)home_method_reg());
@@ -1802,14 +1811,44 @@ void AP_ModbusSteering::update(float steering_out)
     case DriveState::HOME_ENABLE:
         send_u16(REG_MOTOR_ENABLE, 0x0001);
         break;
+    case DriveState::HOME_ARM_STOP:
+        send_u16(REG_MOTION, MOTION_STOP);
+        break;
     case DriveState::HOME_START:
         send_u16(REG_MOTION, MOTION_HOME);
         break;
     case DriveState::HOME_WAIT:
-        if (_home_retry_pending) {
-            _home_retry_pending = false;
-            send_u16(REG_MOTION, MOTION_HOME);
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
+        // No-motion re-arm: STOP→CLEAR→ENABLE→motion0→HOME (edge + drop sticky OT).
+        if (_home_retry_pending || _home_retry_step != 0) {
+            if (_home_retry_pending) {
+                _home_retry_pending = false;
+                _home_retry_step = 1;
+            }
+            switch (_home_retry_step) {
+            case 1:
+                send_u16(REG_MOTION, MOTION_STOP);
+                _home_retry_step = 2;
+                break;
+            case 2:
+                send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+                _home_retry_step = 3;
+                break;
+            case 3:
+                send_u16(REG_MOTOR_ENABLE, 0x0001);
+                _home_retry_step = 4;
+                break;
+            case 4:
+                send_u16(REG_MOTION, 0x0000);
+                _home_retry_step = 5;
+                break;
+            default:
+                send_u16(REG_MOTION, MOTION_HOME);
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "CL57R: home retry st=%04x enc=%d",
+                              (unsigned)_status_word, (int)_actual_pulses);
+                _home_retry_step = 0;
+                break;
+            }
             break;
         }
         if (_home_read_encoder) {
