@@ -9,7 +9,7 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack.
-constexpr const char *CL57R_FW_TAG = "v13.4";
+constexpr const char *CL57R_FW_TAG = "v13.5";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 // Native MOTION_HOME ignored on some CL57R (st=enable+done, enc stuck):
 // after this many no-motion re-arms, fall back to signed SPEED toward OT.
@@ -1393,7 +1393,11 @@ void AP_ModbusSteering::update(float steering_out)
         }
         if (_speed_follow) {
             // Speed-mode follow: after native home Bit0 abs starts are ignored.
-            const int32_t target = stick_pulses + _steer_cmd_offset;
+            // Post-cal mid return: ignore stick so RC deflection cannot skew the
+            // mid target (HW: ofs -194k became -147k → early "ready" + jerk).
+            const int32_t stick_cmd =
+                (_steer_cmd_offset != 0) ? 0 : stick_pulses;
+            const int32_t target = stick_cmd + _steer_cmd_offset;
             const int32_t enc = _actual_pulses - _center_encoder_origin;
             const int32_t err = target - enc;
             const int32_t abs_err = (err >= 0) ? err : -err;
@@ -1559,6 +1563,7 @@ void AP_ModbusSteering::update(float steering_out)
                         _follow_alarm_step = 0;
                         _follow_alarm_count = 0;
                         _follow_halted = false;
+                        _follow_need_center = true;
                         _follow_restore = 1;
                         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
                     } else if (mid_return &&
@@ -1686,6 +1691,8 @@ void AP_ModbusSteering::update(float steering_out)
                 _last_target = 0;
                 _follow_alarm_count = 0;
                 _follow_halted = false;
+                // Wait stick center before accepting RC (avoids post-cal yank).
+                _follow_need_center = true;
                 _follow_restore = 1;
                 GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
                 _state = DriveState::RUN_READ;
