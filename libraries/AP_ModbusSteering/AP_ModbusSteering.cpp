@@ -9,8 +9,12 @@ extern const AP_HAL::HAL &hal;
 
 namespace {
 // Frozen release tag for this CL57R steering stack.
-constexpr const char *CL57R_FW_TAG = "v13.2";
+constexpr const char *CL57R_FW_TAG = "v13.3";
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
+// Native MOTION_HOME ignored on some CL57R (st=enable+done, enc stuck):
+// after this many no-motion re-arms, fall back to signed SPEED toward OT.
+constexpr uint8_t HOME_NATIVE_FAILS_TO_SPEED = 2;
+constexpr uint32_t HOME_SPEED_STALL_MS = 2500;
 constexpr uint16_t REG_STATUS = 0x0003;
 constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
@@ -374,6 +378,27 @@ uint16_t AP_ModbusSteering::home_method_reg() const
     return first;
 }
 
+bool AP_ModbusSteering::target_limit_di_active() const
+{
+    if (!_got_di) {
+        return false;
+    }
+    // M17 → X2 N-OT; M18 → X1 P-OT.
+    if (home_method_reg() == 18) {
+        return (_di_word & DI_X1) != 0;
+    }
+    return (_di_word & DI_X2) != 0;
+}
+
+int16_t AP_ModbusSteering::seek_speed_signed(uint16_t rpm) const
+{
+    int16_t spd = (int16_t)rpm;
+    if (home_method_reg() == 18) {
+        spd = (int16_t)(-spd);
+    }
+    return spd;
+}
+
 uint16_t AP_ModbusSteering::run_speed_rpm() const
 {
     const int16_t rpm = max_speed.get();
@@ -569,6 +594,9 @@ void AP_ModbusSteering::start_home()
     _last_run_link_warn_ms = 0;
     _home_retry_pending = false;
     _home_retry_step = 0;
+    _home_native_fails = 0;
+    _home_speed_leg = false;
+    _home_poll_phase = 0;
     _leg1_travel = 0;
     _state = DriveState::HOME_CLEAR_ALARM;
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
@@ -769,6 +797,8 @@ void AP_ModbusSteering::abort_home(const char *reason)
     _rx_expect = RxExpect::NONE;
     _home_retry_pending = false;
     _home_retry_step = 0;
+    _home_native_fails = 0;
+    _home_speed_leg = false;
     // Stop any in-progress home / speed motion after cal abort.
     queue_motion(MOTION_STOP);
     // Drop sticky OT so the user is not stuck in "alarm latched" spam.
@@ -977,6 +1007,9 @@ void AP_ModbusSteering::advance_home()
         _home_leg_settling = false;
         _home_retry_pending = false;
         _home_retry_step = 0;
+        _home_native_fails = 0;
+        _home_speed_leg = false;
+        _home_poll_phase = 0;
         if (dual_limit_home()) {
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
                           (unsigned)(_home_leg + 1), (int)home_method_reg());
@@ -1110,6 +1143,33 @@ void AP_ModbusSteering::update(float steering_out)
         }
         if (now - _home_start_ms > home_timeout_ms()) {
             abort_home("home timeout");
+        } else if (_home_speed_leg) {
+            // SPEED fallback: finish on target DI, or stall/alarm after travel.
+            const int32_t min_hit = 2000;
+            const bool di_hit = _got_di && target_limit_di_active() &&
+                                _saw_home_motion && _leg_peak_travel >= min_hit;
+            const bool stalled = _saw_home_motion &&
+                (now - _last_home_progress_ms) >= HOME_SPEED_STALL_MS;
+            const bool alarm_hit = _saw_home_motion && _got_status && alarmed() &&
+                                   _leg_peak_travel >= min_hit;
+            if (!_home_leg_settling && (di_hit || stalled || alarm_hit)) {
+                _home_leg_settling = true;
+                _home_leg_settle_ms = now + 120;
+                queue_motion(MOTION_STOP);
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "CL57R: speed-home done pk=%d di=%04x%s%s",
+                              (int)_leg_peak_travel, (unsigned)_di_word,
+                              di_hit ? " DI" : "",
+                              stalled ? " stall" : (alarm_hit ? " alm" : ""));
+            } else if (_home_leg_settling && now >= _home_leg_settle_ms) {
+                _home_leg_settling = false;
+                home_leg_done(now);
+            } else if (!_saw_home_motion && (now - _last_home_progress_ms) > 5000) {
+                _last_home_progress_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                              "CL57R: speed-home seeking @%d",
+                              (int)seek_speed_signed(calib_crawl_rpm()));
+            }
         } else if (home_bit && !running && !_saw_home_motion &&
                    (now - _home_start_ms) > 5000) {
             if (now - _last_home_retry_ms > 3000) {
@@ -1841,17 +1901,50 @@ void AP_ModbusSteering::update(float steering_out)
                 send_u16(REG_MOTION, 0x0000);
                 _home_retry_step = 5;
                 break;
-            default:
-                send_u16(REG_MOTION, MOTION_HOME);
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                              "CL57R: home retry st=%04x enc=%d",
-                              (unsigned)_status_word, (int)_actual_pulses);
+            default: {
+                _home_native_fails++;
+                if (!_home_speed_leg &&
+                    _home_native_fails >= HOME_NATIVE_FAILS_TO_SPEED) {
+                    // MOTION_HOME ignored (HW: st=0011 enc=0). Seek OT in SPEED.
+                    _home_speed_leg = true;
+                    const int16_t spd = seek_speed_signed(calib_crawl_rpm());
+                    send_u16(REG_MAX_SPD, (uint16_t)spd);
+                    _queued_motion = MOTION_SPEED;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: native home dead, SPEED @%d st=%04x",
+                                  (int)spd, (unsigned)_status_word);
+                } else if (_home_speed_leg) {
+                    const int16_t spd = seek_speed_signed(calib_crawl_rpm());
+                    send_u16(REG_MAX_SPD, (uint16_t)spd);
+                    _queued_motion = MOTION_SPEED;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: speed-home retry @%d", (int)spd);
+                } else {
+                    send_u16(REG_MOTION, MOTION_HOME);
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: home retry st=%04x enc=%d n=%u",
+                                  (unsigned)_status_word, (int)_actual_pulses,
+                                  (unsigned)_home_native_fails);
+                }
                 _home_retry_step = 0;
                 break;
             }
+            }
             break;
         }
-        if (_home_read_encoder) {
+        if (_home_speed_leg) {
+            if (_home_poll_phase == 0) {
+                _rx_expect = RxExpect::ENCODER;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
+            } else if (_home_poll_phase == 1) {
+                _rx_expect = RxExpect::STATUS;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
+            } else {
+                _rx_expect = RxExpect::DI_INPUT;
+                modbus_create_read_packet((uint8_t)slave_id.get(), REG_DI_STATUS, 1, tx_packet);
+            }
+            _home_poll_phase = (uint8_t)((_home_poll_phase + 1) % 3);
+        } else if (_home_read_encoder) {
             _rx_expect = RxExpect::ENCODER;
             modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
             _home_read_encoder = false;

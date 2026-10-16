@@ -73,6 +73,8 @@ private:
     uint16_t home_first_method() const;
     uint16_t home_method_reg() const;
     bool dual_limit_home() const;
+    bool target_limit_di_active() const;
+    int16_t seek_speed_signed(uint16_t rpm) const;
     void home_leg_done(uint32_t now);
     uint32_t link_timeout_ms() const;
     uint32_t home_timeout_ms() const;
@@ -144,6 +146,9 @@ private:
     uint16_t _queued_motion = 0;
     bool _home_retry_pending = false;
     uint8_t _home_retry_step = 0; // 0=idle, 1..5 = STOP/CLEAR/EN/0/HOME
+    uint8_t _home_native_fails = 0;
+    bool _home_speed_leg = false; // SPEED fallback when MOTION_HOME won't run
+    uint8_t _home_poll_phase = 0; // 0=enc 1=status 2=DI (speed leg)
     bool _home_leg_settling = false;
     uint32_t _home_leg_settle_ms = 0;
     bool _center_step_settling = false;
