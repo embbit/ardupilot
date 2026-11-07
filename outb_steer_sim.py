@@ -65,8 +65,8 @@ class Nema23Motor:
         return self.position + self.mech_offset
 
     def di_word(self):
-        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT.
-        # Match firmware: M17 seeks + toward X2 (N-OT); M18 seeks - toward X1 (P-OT).
+        # 0x0005 is raw: bit1=X1, bit2=X2. CL57R manual: X1 is P-OT
+        # (method 18, positive) and X2 is N-OT (method 17, negative).
         if self.di_disabled:
             return 0
         if self.force_both_di:
@@ -75,17 +75,17 @@ class Nema23Motor:
         margin = max(int(SPEED_HARD_STOP * 0.05), 200)
         mech = self.mech_pos()
         if mech >= SPEED_HARD_STOP - margin:
-            word |= (1 << 2)  # X2 at positive hard stop (M17 target)
+            word |= (1 << 1)  # X1 P-OT at the positive stop (M18)
         if mech <= -SPEED_HARD_STOP + margin:
-            word |= (1 << 1)  # X1 at negative hard stop (M18 target)
+            word |= (1 << 2)  # X2 N-OT at the negative stop (M17)
         return word
 
     def home_limit_encoder_target(self):
         """Encoder-space target for native MOTION_HOME given current mech_offset."""
         if self.home_method == 18:
-            world = float(-SPEED_HARD_STOP)
-        else:
             world = float(SPEED_HARD_STOP)
+        else:
+            world = float(-SPEED_HARD_STOP)
         return int(round(world - self.mech_offset))
 
     def apply_native_home_zero(self):
@@ -204,12 +204,12 @@ class Nema23Motor:
             # Continuous speed mode (0x0036 Bit3): run at signed MAX_SPD.
             direction = 1.0 if self.max_rpm_signed >= 0 else -1.0
             target_vel = self.max_vel * direction
-            # Limit switches block further travel into the stop, not leave.
-            # X1 at negative end → block more -vel; X2 at positive end → block +vel.
+            # Limit switches block travel further into that stop.
+            # X1 P-OT at the positive end blocks +vel; X2 N-OT blocks -vel.
             di = self.di_word()
-            if (di & (1 << 1)) and target_vel < 0:
+            if (di & (1 << 1)) and target_vel > 0:
                 target_vel = 0.0
-            if (di & (1 << 2)) and target_vel > 0:
+            if (di & (1 << 2)) and target_vel < 0:
                 target_vel = 0.0
             if abs(self.velocity - target_vel) < 1.0:
                 self.velocity = target_vel
@@ -562,8 +562,17 @@ def handle_write_single(reg_addr, val):
     elif reg_addr == 0x0036 and (val & 0x0008):
         motor.speed_mode = True
         print(f"[CL57R Modbus Sim] SPEED START rpm={motor.max_rpm_signed}")
+    elif reg_addr == 0x0036 and (val & 0x0040):
+        motor.speed_mode = False
+        motor.home_finish_at = 0.0
+        motor.velocity = 0.0
+        motor.driver_target = int(round(motor.position))
+        motor.raise_alarm()
+        print("[CL57R Modbus Sim] MOTION ESTOP")
     elif reg_addr == 0x0036 and (val & 0x0020):
         motor.speed_mode = False
+        motor.home_finish_at = 0.0
+        motor.home_done = False
         # Keep force_stall across STOP — only UNSTALL clears it (HW jam).
         motor.velocity = 0.0
         motor.driver_target = int(round(motor.position))

@@ -572,8 +572,12 @@ void Rover::modbus_steering_update()
     // Prefer fresh MANUAL_CONTROL from QGC — RC overrides are cleared on Radio
     // Failsafe, which always trips when no physical TX is present.
     const uint32_t now_ms = AP_HAL::millis();
-    if (gcs_steering_ms != 0 && (now_ms - gcs_steering_ms) < 500) {
+    const bool gcs_stick_fresh = (gcs_steering_ms != 0 && (now_ms - gcs_steering_ms) < 500);
+    if (gcs_stick_fresh) {
         current_steering = gcs_steering_norm;
+    } else if (AP_Notify::flags.failsafe_radio) {
+        // No TX / radio FS: do not follow stale extreme RC into a rail.
+        current_steering = 0.0f;
     } else if (control_mode == &mode_manual) {
         // Physical RC / RC_CHANNELS_OVERRIDE path.
         RC_Channel *steer_ch = channel_steer;
