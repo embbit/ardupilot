@@ -8,11 +8,9 @@
 extern const AP_HAL::HAL &hal;
 
 namespace {
-// Frozen release tag for this CL57R steering stack.
-constexpr const char *CL57R_FW_TAG = "v13.1";
-constexpr int32_t CL57R_STEPS_PER_REV = 4000;
+constexpr const char *CL57R_FW_TAG = "v14.4-run";
 constexpr uint16_t REG_STATUS = 0x0003;
-constexpr uint16_t REG_DI_STATUS = 0x0005; // X0..X6 input terminal flags
+constexpr uint16_t REG_DI_STATUS = 0x0005;
 constexpr uint16_t REG_ENCODER_POS = 0x0007;
 constexpr uint16_t REG_SUBDIVISION = 0x0023;
 constexpr uint16_t REG_START_SPD = 0x0030;
@@ -31,48 +29,41 @@ constexpr uint16_t REG_HOME_ACCEL = 0x0043;
 constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t AUX_POS_ZERO = 0x0008;
-// CL57R 0x0036 (official Modbus doc):
-// Bit0 position start, Bit1 abs/rel, Bit2 irq, Bit3 speed start,
-// Bit4 home, Bit5 stop, Bit6 e-stop.
-// After native home the drive often ignores Bit0 until Bit5 stop exits home mode.
-constexpr uint16_t MOTION_START_REL = 0x0001;
 constexpr uint16_t MOTION_START_ABS = 0x0003;
-constexpr uint16_t MOTION_START_ABS_IRQ = 0x0007;
 constexpr uint16_t MOTION_SPEED = 0x0008;
 constexpr uint16_t MOTION_HOME = 0x0010;
 constexpr uint16_t MOTION_STOP = 0x0020;
 constexpr uint16_t MOTION_ESTOP = 0x0040;
 constexpr uint16_t STATUS_HOME_DONE = (1U << 1);
 constexpr uint16_t STATUS_RUNNING = (1U << 2);
-// CL57R 0x0005: Bit1=X1 (default P-OT), Bit2=X2 (default N-OT).
+constexpr uint16_t STATUS_ALARM = (1U << 3);
 constexpr uint16_t DI_X1 = (1U << 1);
 constexpr uint16_t DI_X2 = (1U << 2);
 constexpr uint16_t DI_LIMIT_MASK = (DI_X1 | DI_X2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
-constexpr uint16_t MID_SEEK_ACCEL_MS = 800;
-constexpr uint16_t MID_SEEK_DECEL_MS = 800;
-constexpr uint32_t SEND_INTERVAL_MS = 50;
-constexpr uint32_t BUTTON_LOCKOUT_MS = 300;
-constexpr uint32_t HOME_TIMEOUT_DEFAULT_MS = 90000;
-constexpr uint32_t WAIT_ECHO_WARN_MS = 5000;
-constexpr uint32_t HOME_RX_LOST_WARN_MS = 15000;
-constexpr uint32_t HOME_RX_ABORT_MS = 30000;
-constexpr uint32_t HOME_RX_SILENCE_MS = 12000;
-// Used by link_ok() when LINK_TO is 0 (run failsafe stop disabled).
-constexpr uint32_t LINK_OK_DEFAULT_MS = 2000;
-constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
-// Half-duplex RS485 often corrupts replies during TX; require sustained
-// silence (no good CRC and no slave-addressed junk) before STOP.
-constexpr uint32_t LINK_LOST_CONFIRM_MS = 500;
 constexpr uint16_t TRACK_ERR_LIMIT = 65535;
+constexpr uint32_t SEND_INTERVAL_MS = 50;
+constexpr uint32_t ECHO_TIMEOUT_MS = 300;
+constexpr uint8_t INIT_MAX_ATTEMPTS = 8;
+constexpr uint32_t LINK_OK_DEFAULT_MS = 2000;
+constexpr uint32_t HOME_TIMEOUT_DEFAULT_MS = 90000;
+constexpr uint32_t STALL_GRACE_MS = 1000;
+constexpr uint32_t STALL_WINDOW_MS = 800;
+constexpr int32_t STALL_MIN_PULSES = 80;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
-constexpr int32_t MIN_HOME_LEG_MOTION = 2000;
+constexpr int32_t MID_POS_TOL = 800;
+constexpr uint32_t BACK_MAX_MS = 4000;
+constexpr int32_t BACK_RELEASE_PULSES = 1500;
+constexpr int32_t BACK_CAP_PULSES = 12000;
+constexpr uint8_t BACK_MAX_TRIES = 2;
+constexpr int32_t CL57R_STEPS_PER_REV = 4000;
+constexpr uint32_t LINK_LOST_CONFIRM_MS = 500;
+constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
-    // --- link ---
     // @Param: SLAVE_ID
     // @DisplayName: Modbus Slave ID
     // @Description: CL57R Modbus slave address
@@ -86,10 +77,9 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("REG_ADDR", 2, AP_ModbusSteering, reg_address, 52),
 
-    // --- geometry ---
     // @Param: OUT_REV
     // @DisplayName: Rudder Lock-to-Lock Turns
-    // @Description: Output-shaft turns lock-to-lock. If >0, travel limit is OUT_REV*RATIO*4000/2 pulses.
+    // @Description: Output-shaft turns lock-to-lock. If >0, travel sanity uses OUT_REV*RATIO*4000.
     // @Units: rev
     // @Range: 0 20
     // @User: Standard
@@ -104,14 +94,13 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: MAX_STEPS
     // @DisplayName: Maximum Steering Steps
-    // @Description: Pulses at full stick (+/-1) when OUT_REV=0. Dual-limit cal overwrites with measured half-travel.
+    // @Description: Half-travel pulses. Dual-limit cal overwrites with measured half-travel.
     // @User: Standard
     AP_GROUPINFO("MAX_STEPS", 3, AP_ModbusSteering, max_steps, 200000),
 
-    // --- armed run ---
     // @Param: START_SPD
     // @DisplayName: Positioning start speed
-    // @Description: CL57R trapezoid start speed (register 0x0030) for positioning/speed moves after init
+    // @Description: CL57R trapezoid start speed (register 0x0030)
     // @Units: RPM
     // @Range: 2 300
     // @User: Standard
@@ -119,7 +108,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: MAX_SPD
     // @DisplayName: Armed run speed
-    // @Description: CL57R max speed (register 0x0033) while armed / normal stick steering after calibration
+    // @Description: CL57R max speed (register 0x0033) while armed / normal stick steering
     // @Units: RPM
     // @Range: 1 3000
     // @User: Standard
@@ -127,7 +116,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: POS_DB
     // @DisplayName: Position Deadband
-    // @Description: Skip a new position write if the stick target changed by less than this (pulses). 0 = always write.
+    // @Description: Skip a new position write if the stick target changed by less than this (pulses).
     // @Units: pulses
     // @Range: 0 50000
     // @User: Standard
@@ -139,32 +128,30 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("RET_SLEW", 7, AP_ModbusSteering, ret_slew, 0),
 
-    // --- RC ---
     // @Param: RST_CH
     // @DisplayName: Alarm reset RC channel
-    // @Description: RC channel that clears the CL57R alarm on a rising edge (PWM above 1800). 0 disables the button.
+    // @Description: RC channel that clears the CL57R alarm on a rising edge (PWM above 1800). 0 disables.
     // @Range: 0 16
     // @User: Standard
     AP_GROUPINFO("RST_CH", 10, AP_ModbusSteering, rst_ch, 0),
 
     // @Param: CAL_CH
     // @DisplayName: Calibration RC channel
-    // @Description: RC channel that starts dual-limit calibration on a rising edge (PWM above 1800). Ignored while armed. 0 disables.
+    // @Description: RC channel that starts dual-limit calibration on a rising edge. Ignored while armed. 0 disables.
     // @Range: 0 16
     // @User: Standard
     AP_GROUPINFO("CAL_CH", 11, AP_ModbusSteering, cal_ch, 0),
 
-    // --- calibration ---
     // @Param: CAL_MODE
     // @DisplayName: Calibration mode
-    // @Description: 0 = one native MOTION_HOME (CL57R M17/M18) then center from OUT_REV/RATIO. 1 = two native MOTION_HOME legs (CAL_MTH then opposite), measure lock-to-lock, center at mid, save half-travel to MAX_STEPS.
-    // @Values: 0:SingleLimit,1:DualLimit
+    // @Description: Reserved. Dual-limit native MOTION_HOME is the only path in v14+.
+    // @Values: 0:Unused,1:DualLimit
     // @User: Standard
     AP_GROUPINFO("CAL_MODE", 15, AP_ModbusSteering, cal_mode, 1),
 
     // @Param: CAL_MTH
     // @DisplayName: First limit method
-    // @Description: CL57R home method for the first leg (reg 0x0040). 17 = X2 N-OT, 18 = X1 P-OT. DualLimit then runs the opposite method.
+    // @Description: CL57R home method for the first leg (reg 0x0040). 17 = X2 N-OT, 18 = X1 P-OT.
     // @Values: 17:NegativeLimit,18:PositiveLimit
     // @Range: 17 18
     // @User: Standard
@@ -172,7 +159,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: HOME_SPD
     // @DisplayName: Native home SEEK speed
-    // @Description: Written to CL57R 0x0041 (MOTION_HOME SEEK RPM). Also used as post-cal mid-return cruise RPM (leave-limit still uses CRAWL_SPD first).
+    // @Description: Written to CL57R 0x0041 (MOTION_HOME SEEK RPM). Also used for mid cruise.
     // @Units: RPM
     // @Range: 5 3000
     // @User: Standard
@@ -180,7 +167,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: CRAWL_SPD
     // @DisplayName: Native home crawl speed
-    // @Description: Written to CL57R 0x0042 (MOTION_HOME near-limit crawl; driver max 300). Also used when leaving the post-cal limit toward mid.
+    // @Description: Written to CL57R 0x0042 (MOTION_HOME near-limit crawl; driver max 300).
     // @Units: RPM
     // @Range: 5 300
     // @User: Standard
@@ -188,14 +175,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: CAL_TRIG
     // @DisplayName: Calibration trigger
-    // @Description: GCS trigger. 1 = start calibration. 2 = clear alarm only. Ignored while armed. Resets to 0 when done or rejected.
+    // @Description: GCS trigger. 1 = start calibration. 2 = clear alarm only. Ignored while armed.
     // @Values: 0:None,1:Calibrate,2:ClearAlarm
     // @User: Standard
     AP_GROUPINFO("CAL_TRIG", 14, AP_ModbusSteering, cal_trig, 0),
 
     // @Param: LINK_TO
     // @DisplayName: Modbus link timeout
-    // @Description: After calibration, if no Modbus bus activity (good CRC or slave-addressed frames) for this many ms, send MOTION STOP and halt stick follow until the link returns. Also used by arming link_ok(). Half-duplex CRC noise alone does not trip. 0 disables run failsafe stop (not recommended).
+    // @Description: No Modbus bus activity for this many ms fails link_ok(). 0 uses 2000 ms for link_ok only.
     // @Units: ms
     // @Range: 0 30000
     // @User: Standard
@@ -203,7 +190,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: CAL_TO
     // @DisplayName: Calibration leg timeout
-    // @Description: Abort calibration if a seek/crawl/recover leg or mid move does not finish within this many seconds. Use a short value in SITL to test the abort path. 0 keeps the 90s default.
+    // @Description: Abort calibration if a leg does not finish within this many seconds. 0 keeps 90s default.
     // @Units: s
     // @Range: 0 600
     // @User: Advanced
@@ -211,7 +198,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: DI_INV
     // @DisplayName: Invert limit DI X1/X2
-    // @Description: Invert CL57R DI bits for X1 (P-OT) and X2 (N-OT) after read. Use 1 for NC / active-low switches that read both ON when neither end is pressed (raw di=0006 at mid).
+    // @Description: Invert CL57R DI bits for X1 (P-OT) and X2 (N-OT) after read.
     // @Values: 0:Normal,1:InvertX1X2
     // @User: Standard
     AP_GROUPINFO("DI_INV", 19, AP_ModbusSteering, di_inv, 0),
@@ -224,28 +211,9 @@ AP_ModbusSteering::AP_ModbusSteering()
     AP_Param::setup_object_defaults(this, var_info);
 }
 
-int32_t AP_ModbusSteering::travel_limit_pulses() const
+bool AP_ModbusSteering::homing() const
 {
-    if (_measured_half_travel > 0) {
-        return _measured_half_travel;
-    }
-    if (out_rev.get() > 0 && ratio.get() > 0) {
-        return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV / 2;
-    }
-    return max_steps.get();
-}
-
-int32_t AP_ModbusSteering::expected_full_travel_pulses() const
-{
-    if (out_rev.get() > 0 && ratio.get() > 0) {
-        return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV;
-    }
-    return max_steps.get() * 2;
-}
-
-bool AP_ModbusSteering::in_run() const
-{
-    return _state == DriveState::RUN_WRITE || _state == DriveState::RUN_READ;
+    return in_cal();
 }
 
 uint32_t AP_ModbusSteering::link_timeout_ms() const
@@ -274,7 +242,6 @@ bool AP_ModbusSteering::link_ok() const
     const uint32_t to = link_timeout_ms();
     const uint32_t limit = (to > 0U) ? to : LINK_OK_DEFAULT_MS;
     const uint32_t now = AP_HAL::millis();
-    // Good CRC frames, or recent slave-addressed traffic (incl. CRC junk).
     if ((now - _last_rx_ms) <= limit) {
         return true;
     }
@@ -284,139 +251,69 @@ bool AP_ModbusSteering::link_ok() const
     return false;
 }
 
-void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
+uint16_t AP_ModbusSteering::run_speed_rpm() const
 {
-    // Param contract: run-link STOP applies after calibration only.
-    if (!_homed) {
-        return;
-    }
-    const uint32_t to = link_timeout_ms();
-    if (to == 0U || _last_rx_ms == 0U) {
-        _link_lost_candidate_ms = 0;
-        return;
-    }
-    // Bus is up if we still see CRC-valid frames OR slave-addressed noise
-    // (half-duplex collisions during speed-follow look like "silence" on
-    // _last_rx_ms alone and were flapping lost/restored every few seconds).
-    const uint32_t good_age = now - _last_rx_ms;
-    const uint32_t bus_ms = (_last_bus_ms != 0U) ? _last_bus_ms : _last_rx_ms;
-    const uint32_t bus_age = now - bus_ms;
-    if (good_age <= to || bus_age <= to) {
-        _link_lost_candidate_ms = 0;
-        if (_run_link_failsafe) {
-            _run_link_failsafe = false;
-            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE,
-                          "CL57R: Modbus link restored (crc_err=%u)",
-                          (unsigned)_rx_crc_err);
-        }
-        return;
-    }
-
-    if (_link_lost_candidate_ms == 0U) {
-        _link_lost_candidate_ms = now;
-        return;
-    }
-    if ((now - _link_lost_candidate_ms) < LINK_LOST_CONFIRM_MS) {
-        return;
-    }
-
-    if (!_run_link_failsafe) {
-        _run_link_failsafe = true;
-        _follow_moving = false;
-        _follow_sign = 0;
-        _follow_slot = 0;
-        _follow_last_spd = 0;
-        // Replace any pending motion with a half-duplex-safe STOP.
-        queue_motion(MOTION_STOP);
-        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                      "CL57R: Modbus link lost, STOP (silent %ums crc_err=%u)",
-                      (unsigned)good_age, (unsigned)_rx_crc_err);
-        _last_run_link_warn_ms = now;
-        return;
-    }
-
-    if (_last_run_link_warn_ms == 0U ||
-        (now - _last_run_link_warn_ms) >= LINK_WARN_INTERVAL_MS) {
-        _last_run_link_warn_ms = now;
-        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                      "CL57R: Modbus link still down (crc_err=%u)",
-                      (unsigned)_rx_crc_err);
-    }
+    return (uint16_t)constrain_int16(max_speed.get(), 1, 3000);
 }
 
-bool AP_ModbusSteering::in_home() const
+uint16_t AP_ModbusSteering::home_seek_rpm() const
 {
-    return _state >= DriveState::HOME_CLEAR_ALARM;
+    return (uint16_t)constrain_int16(home_speed.get(), 5, 3000);
 }
 
-bool AP_ModbusSteering::home_prep_wait_echo() const
+uint16_t AP_ModbusSteering::home_crawl_rpm() const
 {
-    return (_state >= DriveState::HOME_CLEAR_ALARM && _state <= DriveState::HOME_START) ||
-           _state == DriveState::HOME_ZERO || _state == DriveState::HOME_ZERO_AT_L1;
-}
-
-bool AP_ModbusSteering::dual_limit_home() const
-{
-    return cal_mode.get() == 1;
+    return (uint16_t)constrain_int16(crawl_speed.get(), 5, 300);
 }
 
 uint16_t AP_ModbusSteering::home_first_method() const
 {
-    return cal_mth.get() == 18 ? 18 : 17;
+    const int8_t m = cal_mth.get();
+    return (m == 18) ? 18 : 17;
 }
 
-uint16_t AP_ModbusSteering::home_method_reg() const
+uint16_t AP_ModbusSteering::home_method_now() const
 {
     const uint16_t first = home_first_method();
-    if (dual_limit_home() && _home_leg == 1) {
-        return first == 17 ? 18 : 17;
+    if (_home_leg == 0) {
+        return first;
     }
-    return first;
+    return (first == 17) ? 18 : 17;
 }
 
-uint16_t AP_ModbusSteering::run_speed_rpm() const
+uint16_t AP_ModbusSteering::home_limit_bit() const
 {
-    const int16_t rpm = max_speed.get();
-    if (rpm < 1) {
-        return 1300;
-    }
-    return (uint16_t)rpm;
+    // Method 17 = N-OT on X2; method 18 = P-OT on X1.
+    return (home_method_now() == 18) ? DI_X1 : DI_X2;
 }
 
-uint16_t AP_ModbusSteering::calib_speed_rpm() const
+int32_t AP_ModbusSteering::expected_full_travel() const
 {
-    const int16_t rpm = home_speed.get();
-    if (rpm < 5) {
-        return 500;
+    if (out_rev.get() > 0 && ratio.get() > 0) {
+        return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV;
     }
-    if (rpm > 3000) {
-        return 3000;
-    }
-    return (uint16_t)rpm;
+    return 0;
 }
 
-uint16_t AP_ModbusSteering::calib_crawl_rpm() const
+int32_t AP_ModbusSteering::travel_limit_pulses() const
 {
-    // CL57R 0x0042 HOME_CRAWL is 5..300.
-    const int16_t rpm = crawl_speed.get();
-    if (rpm < 5) {
-        return 30;
+    if (_measured_half_travel > 0) {
+        return _measured_half_travel;
     }
-    if (rpm > 300) {
-        return 300;
+    if (out_rev.get() > 0 && ratio.get() > 0) {
+        return (int32_t)out_rev.get() * ratio.get() * CL57R_STEPS_PER_REV / 2;
     }
-    return (uint16_t)rpm;
+    return max_steps.get();
 }
 
-int32_t AP_ModbusSteering::center_target_pulses() const
+int16_t AP_ModbusSteering::backoff_signed_rpm() const
 {
-    const int32_t limit = travel_limit_pulses();
-    // After finishing on method M17 the free mid lies in the negative
-    // command direction; after M18 it is positive (matches measured leg sign).
-    if (home_method_reg() == 18) {
-        return limit;
+    // Back away from the active limit: from X1/P-OT go negative; from X2/N-OT go positive.
+    const int16_t rpm = (int16_t)home_crawl_rpm();
+    if ((home_limit_bit() & DI_X1) != 0) {
+        return (int16_t)(-rpm);
     }
-    return -limit;
+    return rpm;
 }
 
 uint8_t AP_ModbusSteering::rtu_frame_len(const uint8_t *buf, uint8_t avail) const
@@ -442,342 +339,74 @@ uint8_t AP_ModbusSteering::rtu_frame_len(const uint8_t *buf, uint8_t avail) cons
 
 void AP_ModbusSteering::init(AP_SerialManager &serial_manager)
 {
-    _uart = serial_manager.find_serial((AP_SerialManager::SerialProtocol)101, 0);
+    _uart = serial_manager.find_serial(AP_SerialManager::SerialProtocol_ModbusSteer, 0);
     if (_uart != nullptr) {
         _uart->begin(115200);
-        const int8_t port = serial_manager.find_portnum((AP_SerialManager::SerialProtocol)101, 0);
+        _phase = Phase::INIT_ENABLE;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        _homed = false;
+        const int8_t port = serial_manager.find_portnum(AP_SerialManager::SerialProtocol_ModbusSteer, 0);
         if (port >= 0) {
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: using SERIAL%d", (int)port);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: using SERIAL%d %s", (int)port, CL57R_FW_TAG);
         }
     }
 }
 
 void AP_ModbusSteering::send_u16(uint16_t reg, uint16_t value)
 {
+    if (_uart == nullptr) {
+        return;
+    }
     uint8_t tx_packet[8];
     modbus_create_write_packet((uint8_t)slave_id.get(), reg, value, tx_packet);
     _uart->write(tx_packet, 8);
+    _last_send_ms = AP_HAL::millis();
+    _awaiting_echo = true;
+    _got_echo = false;
+    _rx_expect = RxExpect::NONE;
 }
 
 void AP_ModbusSteering::send_target_pos(int32_t target)
 {
+    if (_uart == nullptr) {
+        return;
+    }
     uint8_t tx_packet[16];
     uint16_t values[2];
     values[0] = (uint16_t)((target >> 16) & 0xFFFF);
     values[1] = (uint16_t)(target & 0xFFFF);
-    modbus_create_write_multiple_packet((uint8_t)slave_id.get(), REG_TARGET_POS, 2, values, tx_packet);
+    const uint16_t reg = (reg_address.get() > 0) ? (uint16_t)reg_address.get() : REG_TARGET_POS;
+    modbus_create_write_multiple_packet((uint8_t)slave_id.get(), reg, 2, values, tx_packet);
     _uart->write(tx_packet, 13);
     _last_target = target;
-    _have_target = true;
-}
-
-void AP_ModbusSteering::queue_motion(uint16_t motion)
-{
-    _queued_motion = motion;
-}
-
-bool AP_ModbusSteering::flush_queued_motion()
-{
-    if (_queued_motion == 0) {
-        return false;
-    }
-    send_u16(REG_MOTION, _queued_motion);
-    _queued_motion = 0;
-    return true;
-}
-
-bool AP_ModbusSteering::rc_rising_edge(int8_t ch, bool &was_high) const
-{
-    if (ch < 1 || ch > 16) {
-        return false;
-    }
-    uint16_t pwm = 0;
-    if (!rc().get_pwm((uint8_t)ch, pwm)) {
-        was_high = false;
-        return false;
-    }
-    if (pwm > RC_Channel::AUX_SWITCH_PWM_TRIGGER_HIGH) {
-        const bool edge = !was_high;
-        was_high = true;
-        return edge;
-    }
-    if (pwm < RC_Channel::AUX_SWITCH_PWM_TRIGGER_LOW) {
-        was_high = false;
-    }
-    return false;
-}
-
-void AP_ModbusSteering::request_alarm_clear()
-{
-    _alarm_clear_pending = true;
-    _enable_after_alarm_clear = true;
-    _have_target = false;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear");
-}
-
-void AP_ModbusSteering::start_home()
-{
-    if (hal.util->get_soft_armed()) {
-        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: home ignored, armed");
-        return;
-    }
-    if (in_home()) {
-        return;
-    }
-    if (_state < DriveState::RUN_WRITE) {
-        if (!_home_pending) {
-            _home_pending = true;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home queued");
-        }
-        return;
-    }
-    _alarm_clear_pending = false;
-    _homed = false;
+    _last_send_ms = AP_HAL::millis();
+    _awaiting_echo = true;
     _got_echo = false;
-    _init_attempts = 0;
-    _got_status = false;
-    _saw_home_run = false;
-    _saw_home_motion = false;
-    _saw_home_clear = false;
-    _home_center_run_spd = false;
-    _home_leg_settling = false;
-    _center_step_settling = false;
-    _home_leg = 0;
-    _measured_half_travel = 0;
-    _leg_peak_travel = 0;
-    _leg_dir_sign = 0;
-    _center_move_target = 0;
-    _steer_cmd_offset = 0;
-    _center_resend = false;
-    _speed_follow = false;
-    _follow_prep = 0;
-    _follow_moving = false;
-    _follow_sign = 0;
-    _follow_slot = 0;
-    _follow_alarm_step = 0;
-    _follow_restore = 0;
-    _follow_last_enc = 0;
-    _follow_last_spd = 0;
-    _follow_progress_ms = 0;
-    _follow_mid_retried = false;
-    _follow_halted = false;
-    _follow_alarm_count = 0;
-    _follow_peak_toward = 0;
-    _follow_peak_at_alarm = 0;
-    _queued_motion = 0;
-    _run_link_failsafe = false;
-    _last_run_link_warn_ms = 0;
-    _home_retry_pending = false;
-    _leg1_travel = 0;
-    _state = DriveState::HOME_CLEAR_ALARM;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home start");
-}
-
-void AP_ModbusSteering::poll_param_trigger()
-{
-    const int8_t trig = cal_trig.get();
-    if (!_cal_trig_inited) {
-        _cal_trig_last = trig;
-        _cal_trig_inited = true;
-        return;
-    }
-    if (trig == 0) {
-        _cal_trig_last = 0;
-        return;
-    }
-
-    if (hal.util->get_soft_armed()) {
-        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: CAL_TRIG ignored, armed");
-        cal_trig.set_and_save(0);
-        _cal_trig_last = 0;
-        return;
-    }
-
-    if (trig == _cal_trig_last) {
-        return;
-    }
-    _cal_trig_last = trig;
-
-    if (trig == 1) {
-        if (in_home()) {
-            abort_home("restart home");
-        }
-        start_home();
-    } else if (trig == 2) {
-        if (in_home()) {
-            abort_home("alarm clear");
-        }
-        request_alarm_clear();
-        cal_trig.set_and_save(0);
-        _cal_trig_last = 0;
-    } else {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: invalid CAL_TRIG %d", (int)trig);
-        cal_trig.set_and_save(0);
-        _cal_trig_last = 0;
-    }
-}
-
-void AP_ModbusSteering::poll_rc_buttons()
-{
-    const uint32_t now = AP_HAL::millis();
-    const bool rst_edge = rc_rising_edge(rst_ch.get(), _rst_was_high);
-    const bool home_edge = rc_rising_edge(cal_ch.get(), _home_was_high);
-    if (now - _last_button_ms < BUTTON_LOCKOUT_MS) {
-        return;
-    }
-    if (home_edge) {
-        _last_button_ms = now;
-        start_home();
-        return;
-    }
-    if (rst_edge) {
-        _last_button_ms = now;
-        request_alarm_clear();
-    }
-}
-
-void AP_ModbusSteering::home_leg_done(uint32_t now)
-{
-    (void)now;
-    if (dual_limit_home() && _home_leg == 0) {
-        _leg1_travel = _leg_peak_travel;
-        _home_leg = 1;
-        // Clear residual L1 alarm only (no AUX_POS_ZERO on pressed DI).
-        _state = DriveState::HOME_ZERO_AT_L1;
-        _got_echo = false;
-        _init_attempts = 0;
-        _home_leg_settling = false;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                      "CL57R: native L1 travel %d, home limit 2",
-                      (int)_leg1_travel);
-        return;
-    }
-
-    if (dual_limit_home()) {
-        // Native MOTION_HOME zeros at the limit; peak while seeking L2 is
-        // measured lock-to-lock travel.
-        int32_t full_travel = _leg_peak_travel;
-        const int32_t abs_now = (_actual_pulses >= 0) ? _actual_pulses : -_actual_pulses;
-        if (abs_now > full_travel) {
-            full_travel = abs_now;
-        }
-        const int32_t expected = expected_full_travel_pulses();
-        // Prefer a plausible leg1 stroke if leg2 came up short.
-        if (expected >= 20000 && full_travel < expected / 4 &&
-            _leg1_travel >= expected / 4 && _leg1_travel <= expected * 2) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                          "CL57R: leg2 short %d, use leg1 %d",
-                          (int)full_travel, (int)_leg1_travel);
-            full_travel = _leg1_travel;
-        }
-        if (full_travel < MIN_MEASURED_TRAVEL) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: travel %d pulses (min %d)",
-                          (int)full_travel, (int)MIN_MEASURED_TRAVEL);
-            abort_home("measured travel too small (need both limits?)");
-            return;
-        }
-        // OUT_REV/RATIO are approximate until dual-limit measurement replaces them.
-        if (expected >= 20000 && full_travel > expected * 5) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
-                          (int)full_travel, (int)expected);
-            abort_home("measured travel implausible");
-            return;
-        }
-        if (expected >= 20000 && full_travel < expected / 4) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: got %d, expected ~%d",
-                          (int)full_travel, (int)expected);
-            abort_home("measured travel implausible");
-            return;
-        }
-        _measured_half_travel = full_travel / 2;
-        // After leg 2 we sit on that limit (encoder ~0). Mid is BACK toward
-        // the other limit — opposite of the signed travel measured on leg 2.
-        int8_t mid_sign = 0;
-        if (_leg_dir_sign > 0) {
-            mid_sign = -1;
-        } else if (_leg_dir_sign < 0) {
-            mid_sign = 1;
-        } else {
-            mid_sign = (home_method_reg() == 18) ? 1 : -1;
-        }
-        _center_move_target = (int32_t)mid_sign * _measured_half_travel;
-        max_steps.set_and_save(_measured_half_travel);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: travel %d mid %d (legdir %d)",
-                      (int)full_travel, (int)_center_move_target, (int)_leg_dir_sign);
-    } else {
-        _center_move_target = center_target_pulses();
-    }
-
-    // Absolute moves after native home are ignored by this CL57R. Use continuous
-    // speed-mode follow toward stick + mid offset (stick=0 returns to center).
-    _center_encoder_origin = _actual_pulses;
-    _steer_cmd_offset = _center_move_target;
-    _speed_follow = true;
-    _follow_prep = 0;
-    _follow_moving = false;
-    _follow_sign = 0;
-    _follow_slot = 0;
-    _follow_alarm_step = 0;
-    _follow_restore = 0;
-    _follow_last_enc = 0;
-    _follow_last_spd = 0;
-    _follow_progress_ms = 0;
-    _follow_mid_retried = true; // leave post-cal limit at crawl first
-    _follow_halted = false;
-    _follow_alarm_count = 0;
-    _follow_peak_toward = 0;
-    _follow_peak_at_alarm = 0;
-    _home_start_ms = AP_HAL::millis();
-    _last_home_progress_ms = 0;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "CL57R: cal@limit ofs %d %s",
-                  (int)_steer_cmd_offset, CL57R_FW_TAG);
-    finish_home();
-}
-
-void AP_ModbusSteering::finish_home()
-{
-    _state = DriveState::RUN_WRITE;
-    _have_target = false;
-    _last_target = 0;
-    _homed = true;
-    // Mid return uses gentle crawl RPM first; restore run MAX_SPD after arrive.
-    if (!_speed_follow) {
-        _pending_run_spd = true;
-    }
-    _alarm_clear_pending = true;
-    _enable_after_alarm_clear = true;
     _rx_expect = RxExpect::NONE;
-    if (cal_trig.get() == 1) {
-        cal_trig.set_and_save(0);
-    }
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: calibrated");
 }
 
-void AP_ModbusSteering::abort_home(const char *reason)
+void AP_ModbusSteering::send_read(uint16_t reg, uint16_t count, RxExpect expect)
 {
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: %s", reason);
-    // Snapshot helps HW bring-up when DI/alarm/geometry are wrong.
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                  "CL57R: abort di=%04x st=%04x pk=%d",
-                  (unsigned)_di_word,
-                  (unsigned)_status_word,
-                  (int)_leg_peak_travel);
-    _state = DriveState::RUN_WRITE;
-    _have_target = false;
-    _rx_expect = RxExpect::NONE;
-    // Stop any in-progress home / speed motion after cal abort.
-    queue_motion(MOTION_STOP);
-    // Drop sticky OT so the user is not stuck in "alarm latched" spam.
-    _alarm_clear_pending = true;
-    _enable_after_alarm_clear = true;
-    if (cal_trig.get() == 1) {
-        cal_trig.set_and_save(0);
+    if (_uart == nullptr) {
+        return;
     }
+    uint8_t tx_packet[8];
+    modbus_create_read_packet((uint8_t)slave_id.get(), reg, count, tx_packet);
+    _uart->write(tx_packet, 8);
+    _rx_expect = expect;
+    _last_send_ms = AP_HAL::millis();
+    _awaiting_echo = false;
+    _got_echo = false;
 }
 
 void AP_ModbusSteering::consume_rx()
 {
+    if (_uart == nullptr) {
+        return;
+    }
+
     uint32_t available = _uart->available();
     while (available > 0) {
         if (_rx_len >= sizeof(_rx_buf)) {
@@ -806,29 +435,21 @@ void AP_ModbusSteering::consume_rx()
         }
         const uint16_t received_crc = (_rx_buf[offset + frame_len - 1] << 8) | _rx_buf[offset + frame_len - 2];
         if (modbus_crc16(&_rx_buf[offset], frame_len - 2) != received_crc) {
-            // Slave-addressed frame with bad CRC: bus is alive (typical
-            // half-duplex collide). Do not treat as link-down silence.
             _rx_crc_err++;
             _last_bus_ms = AP_HAL::millis();
             offset++;
             continue;
         }
 
-        _ever_got_rx = true;
         _last_rx_ms = AP_HAL::millis();
         _last_bus_ms = _last_rx_ms;
 
         const uint8_t fn = _rx_buf[offset + 1];
-        if (fn == 0x06) {
+        if (fn == 0x06 || fn == 0x10 || (fn & 0x80) != 0) {
+            // Keep _awaiting_echo set until advance_after_echo() consumes it;
+            // clearing here skipped the advance path and spun forever on INIT.
             _got_echo = true;
-        } else if (fn == 0x10) {
-            // FC16 echo (write-multiple) also counts as a successful exchange.
-            _got_echo = true;
-        } else if ((fn & 0x80) != 0) {
-            // Exception response still proves the slave heard us; advance so an
-            // unsupported register cannot stall homing forever.
-            _got_echo = true;
-            if (frame_len >= 3) {
+            if ((fn & 0x80) != 0 && frame_len >= 3) {
                 static uint32_t last_ex_ms;
                 const uint32_t tnow = AP_HAL::millis();
                 if (last_ex_ms == 0 || (tnow - last_ex_ms) > 2000) {
@@ -846,22 +467,8 @@ void AP_ModbusSteering::consume_rx()
             } else if (_rx_expect == RxExpect::DI_INPUT && byte_count >= 2) {
                 const uint16_t raw = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 uint16_t di = raw;
-                // NC / active-low ends: mid stroke often reads both X1+X2 ON.
                 if (di_inv.get() != 0) {
                     di = (uint16_t)(di ^ DI_LIMIT_MASK);
-                }
-                // Log only on change (bring-up: verify X1/X2 wiring / DI_INV).
-                if (!_di_log_inited || di != _di_log_word || raw != _di_raw_log) {
-                    _di_log_inited = true;
-                    _di_log_word = di;
-                    _di_raw_log = raw;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: DI raw=%04x eff=%04x X1=%u X2=%u%s",
-                                  (unsigned)raw,
-                                  (unsigned)di,
-                                  (unsigned)((di & DI_X1) != 0 ? 1 : 0),
-                                  (unsigned)((di & DI_X2) != 0 ? 1 : 0),
-                                  di_inv.get() != 0 ? " inv" : "");
                 }
                 _di_word = di;
                 _got_di = true;
@@ -870,6 +477,7 @@ void AP_ModbusSteering::consume_rx()
                 const uint16_t low_word = (_rx_buf[offset + 5] << 8) | _rx_buf[offset + 6];
                 _actual_pulses = (int32_t)(((uint32_t)high_word << 16) | low_word);
             }
+            _rx_expect = RxExpect::NONE;
         }
 
         offset = (uint16_t)(offset + frame_len);
@@ -884,1038 +492,728 @@ void AP_ModbusSteering::consume_rx()
     }
 }
 
-void AP_ModbusSteering::advance_init()
+void AP_ModbusSteering::clear_cal_trig()
 {
-    _got_echo = false;
-    _init_attempts = 0;
-    switch (_state) {
-    case DriveState::INIT_ENABLE:
-        _state = DriveState::INIT_CLEAR_ALARM;
+    if (cal_trig.get() != 0) {
+        cal_trig.set_and_save(0);
+    }
+}
+
+void AP_ModbusSteering::send_current()
+{
+    switch (_phase) {
+    case Phase::INIT_ENABLE:
+        send_u16(REG_MOTOR_ENABLE, 0x0001);
         break;
-    case DriveState::INIT_CLEAR_ALARM:
-        _state = DriveState::INIT_SUBDIVISION;
+    case Phase::INIT_CLEAR_ALARM:
+        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
         break;
-    case DriveState::INIT_SUBDIVISION:
-        _state = DriveState::INIT_START_SPD;
+    case Phase::INIT_SUBDIVISION:
+        send_u16(REG_SUBDIVISION, SUBDIVISION_PPR);
         break;
-    case DriveState::INIT_START_SPD:
-        _state = DriveState::INIT_MAX_SPD;
+    case Phase::INIT_START_SPD:
+        send_u16(REG_START_SPD, (uint16_t)constrain_int16(start_speed.get(), 2, 300));
         break;
-    case DriveState::INIT_MAX_SPD:
-        _state = DriveState::INIT_ACCEL;
+    case Phase::INIT_MAX_SPD:
+        send_u16(REG_MAX_SPD, run_speed_rpm());
         break;
-    case DriveState::INIT_ACCEL:
-        _state = DriveState::INIT_DECEL;
+    case Phase::INIT_ACCEL:
+        send_u16(REG_ACCEL, ACCEL_DEFAULT);
         break;
-    case DriveState::INIT_DECEL:
-        _state = DriveState::INIT_ABS_MODE;
+    case Phase::INIT_DECEL:
+        send_u16(REG_DECEL, DECEL_DEFAULT);
         break;
-    case DriveState::INIT_ABS_MODE:
-        _state = DriveState::INIT_TRACK_ERR;
+    case Phase::INIT_ABS_MODE:
+        send_u16(REG_POS_MODE, 0x0001);
         break;
-    case DriveState::INIT_TRACK_ERR:
-        _state = DriveState::RUN_WRITE;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: Modbus Driver READY.");
-        if (_home_pending) {
-            _home_pending = false;
-            start_home();
-        }
+    case Phase::INIT_TRACK_ERR:
+        send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
         break;
-    default:
+
+    case Phase::CAL_STOP:
+    case Phase::MID_STOP:
+    case Phase::BACK_STOP:
+        send_u16(REG_MOTION, _use_estop ? MOTION_ESTOP : MOTION_STOP);
+        break;
+    case Phase::ABORT_STOP:
+        send_u16(REG_MOTION, _use_estop ? MOTION_ESTOP : MOTION_STOP);
+        break;
+    case Phase::CAL_CLEAR:
+    case Phase::MID_CLEAR:
+    case Phase::BACK_CLEAR:
+        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+        break;
+    case Phase::CAL_ENABLE:
+    case Phase::MID_ENABLE:
+    case Phase::BACK_ENABLE:
+        send_u16(REG_MOTOR_ENABLE, 0x0001);
+        break;
+    case Phase::CAL_METHOD:
+        send_u16(REG_HOME_METHOD, home_method_now());
+        break;
+    case Phase::CAL_HOME_SPD:
+        send_u16(REG_HOME_SPD, home_seek_rpm());
+        break;
+    case Phase::CAL_CRAWL:
+        send_u16(REG_HOME_CRAWL, home_crawl_rpm());
+        break;
+    case Phase::CAL_HOME_ACCEL:
+        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
+        break;
+    case Phase::CAL_START_HOME:
+        send_u16(REG_MOTION, MOTION_HOME);
+        break;
+    case Phase::MID_MAX_SPD:
+        send_u16(REG_MAX_SPD, home_seek_rpm());
+        break;
+    case Phase::MID_TARGET:
+        send_target_pos(_mid_target);
+        break;
+    case Phase::MID_RUN:
+        send_u16(REG_MOTION, MOTION_START_ABS);
+        break;
+    case Phase::MID_ZERO:
+        send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+        break;
+    case Phase::BACK_SPD:
+        send_u16(REG_MAX_SPD, (uint16_t)backoff_signed_rpm());
+        break;
+    case Phase::BACK_START:
+        send_u16(REG_MOTION, MOTION_SPEED);
+        break;
+    case Phase::RUN_TARGET:
+        send_target_pos(_last_target);
+        break;
+    case Phase::RUN_MOTION:
+        send_u16(REG_MOTION, _queued_motion != 0 ? _queued_motion : MOTION_START_ABS);
+        break;
+    case Phase::RUN_STOP:
+        send_u16(REG_MOTION, MOTION_STOP);
+        break;
+
+    case Phase::IDLE_UNCAL:
+    case Phase::IDLE_READY:
+    case Phase::CAL_WAIT:
+    case Phase::MID_WAIT:
+    case Phase::BACK_POLL:
         break;
     }
 }
 
-void AP_ModbusSteering::advance_home()
+void AP_ModbusSteering::advance_after_echo()
 {
     _got_echo = false;
+    _awaiting_echo = false;
     _init_attempts = 0;
-    switch (_state) {
-    case DriveState::HOME_CLEAR_ALARM:
-        _state = DriveState::HOME_SET_METHOD;
+
+    switch (_phase) {
+    case Phase::INIT_ENABLE:
+        _phase = Phase::INIT_CLEAR_ALARM;
         break;
-    case DriveState::HOME_SET_METHOD:
-        _state = DriveState::HOME_SET_SPD;
+    case Phase::INIT_CLEAR_ALARM:
+        _phase = Phase::INIT_SUBDIVISION;
         break;
-    case DriveState::HOME_SET_SPD:
-        _state = DriveState::HOME_SET_RUN_SPD;
+    case Phase::INIT_SUBDIVISION:
+        _phase = Phase::INIT_START_SPD;
         break;
-    case DriveState::HOME_SET_RUN_SPD:
-        _state = DriveState::HOME_SET_CRAWL;
+    case Phase::INIT_START_SPD:
+        _phase = Phase::INIT_MAX_SPD;
         break;
-    case DriveState::HOME_SET_CRAWL:
-        _state = DriveState::HOME_SET_ACCEL;
+    case Phase::INIT_MAX_SPD:
+        _phase = Phase::INIT_ACCEL;
         break;
-    case DriveState::HOME_SET_ACCEL:
-        _state = DriveState::HOME_ENABLE;
+    case Phase::INIT_ACCEL:
+        _phase = Phase::INIT_DECEL;
         break;
-    case DriveState::HOME_ENABLE:
-        _state = DriveState::HOME_START;
+    case Phase::INIT_DECEL:
+        _phase = Phase::INIT_ABS_MODE;
         break;
-    case DriveState::HOME_START:
-        _state = DriveState::HOME_WAIT;
-        _home_start_ms = AP_HAL::millis();
-        _last_home_retry_ms = _home_start_ms;
-        _last_home_progress_ms = _home_start_ms;
-        _home_start_pulses = _actual_pulses;
+    case Phase::INIT_ABS_MODE:
+        _phase = Phase::INIT_TRACK_ERR;
+        break;
+    case Phase::INIT_TRACK_ERR:
+        _phase = Phase::IDLE_UNCAL;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: init OK %s", CL57R_FW_TAG);
+        break;
+
+    case Phase::CAL_STOP:
+        _phase = Phase::CAL_CLEAR;
+        break;
+    case Phase::CAL_CLEAR:
+        _phase = Phase::CAL_ENABLE;
+        break;
+    case Phase::CAL_ENABLE:
+        _phase = Phase::CAL_METHOD;
+        break;
+    case Phase::CAL_METHOD:
+        _phase = Phase::CAL_HOME_SPD;
+        break;
+    case Phase::CAL_HOME_SPD:
+        _phase = Phase::CAL_CRAWL;
+        break;
+    case Phase::CAL_CRAWL:
+        _phase = Phase::CAL_HOME_ACCEL;
+        break;
+    case Phase::CAL_HOME_ACCEL:
+        _phase = Phase::CAL_START_HOME;
+        break;
+    case Phase::CAL_START_HOME:
+        _phase = Phase::CAL_WAIT;
+        _leg_start_ms = AP_HAL::millis();
+        _last_progress_ms = _leg_start_ms;
+        _last_progress_enc = _actual_pulses;
         _leg_peak_travel = 0;
-        _leg_dir_sign = 0;
-        _home_read_encoder = false;
+        _saw_home_clear = false;
+        _saw_home_run = false;
+        _saw_limit = false;
         _got_status = false;
         _got_di = false;
-        _di_word = 0;
-        _saw_home_run = false;
-        _saw_home_motion = false;
-        _saw_home_clear = false;
-        _home_leg_settling = false;
-        if (dual_limit_home()) {
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing leg %u (M%d)",
-                          (unsigned)(_home_leg + 1), (int)home_method_reg());
-        } else {
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: homing to limit (M%d)", (int)home_method_reg());
-        }
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: seek %u M%u %urpm",
+                      (unsigned)(_home_leg + 1),
+                      (unsigned)home_method_now(),
+                      (unsigned)home_seek_rpm());
         break;
-    case DriveState::HOME_ZERO_AT_L1:
-        // Clear residual L1 alarm before leg2 MOTION_HOME.
-        _state = DriveState::HOME_CLEAR_ALARM;
+
+    case Phase::MID_STOP:
+        _phase = Phase::MID_CLEAR;
+        break;
+    case Phase::MID_CLEAR:
+        _phase = Phase::MID_ENABLE;
+        break;
+    case Phase::MID_ENABLE:
+        _phase = Phase::MID_MAX_SPD;
+        break;
+    case Phase::MID_MAX_SPD:
+        _phase = Phase::MID_TARGET;
+        break;
+    case Phase::MID_TARGET:
+        _phase = Phase::MID_RUN;
+        break;
+    case Phase::MID_RUN:
+        _phase = Phase::MID_WAIT;
+        _leg_start_ms = AP_HAL::millis();
+        break;
+    case Phase::MID_ZERO:
+        finish_cal();
+        break;
+
+    case Phase::BACK_STOP:
+        _phase = Phase::BACK_CLEAR;
+        break;
+    case Phase::BACK_CLEAR:
+        _phase = Phase::BACK_ENABLE;
+        break;
+    case Phase::BACK_ENABLE:
+        _phase = Phase::BACK_SPD;
+        break;
+    case Phase::BACK_SPD:
+        _phase = Phase::BACK_START;
+        break;
+    case Phase::BACK_START:
+        _phase = Phase::BACK_POLL;
+        _back_start_ms = AP_HAL::millis();
+        _last_progress_enc = _actual_pulses;
+        break;
+
+    case Phase::ABORT_STOP:
+        _phase = Phase::IDLE_UNCAL;
+        _homed = false;
+        _use_estop = false;
+        clear_cal_trig();
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: cal aborted -> idle");
+        break;
+
+    case Phase::RUN_TARGET:
+        _phase = Phase::RUN_MOTION;
+        _queued_motion = MOTION_START_ABS;
+        break;
+    case Phase::RUN_MOTION:
+        _queued_motion = 0;
+        _phase = Phase::IDLE_READY;
+        break;
+    case Phase::RUN_STOP:
+        _phase = Phase::IDLE_READY;
+        break;
+
+    case Phase::IDLE_UNCAL:
+    case Phase::IDLE_READY:
+    case Phase::CAL_WAIT:
+    case Phase::MID_WAIT:
+    case Phase::BACK_POLL:
+        break;
+    }
+}
+
+void AP_ModbusSteering::start_home()
+{
+    if (hal.util->get_soft_armed()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: cal ignored, armed");
+        clear_cal_trig();
+        return;
+    }
+    if (in_cal()) {
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: cal already running");
+        return;
+    }
+    _homed = false;
+    _home_leg = 0;
+    _back_tries = 0;
+    _use_estop = false;
+    _measured_half_travel = 0;
+    _leg1_travel = 0;
+    _cal_start_ms = AP_HAL::millis();
+    _phase = Phase::CAL_STOP;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: cal start M%u %s",
+                  (unsigned)home_first_method(), CL57R_FW_TAG);
+}
+
+void AP_ModbusSteering::begin_leg_prep()
+{
+    _use_estop = false;
+    _phase = Phase::CAL_STOP;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+}
+
+void AP_ModbusSteering::begin_mid()
+{
+    // After native home, Bit0 often ignored until STOP exits home mode.
+    _use_estop = false;
+    _phase = Phase::MID_STOP;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: mid target %d half %d",
+                  (int)_mid_target, (int)_measured_half_travel);
+}
+
+void AP_ModbusSteering::begin_backoff(const char *why)
+{
+    if (_back_tries >= BACK_MAX_TRIES) {
+        abort_home(why, true);
+        return;
+    }
+    _back_tries++;
+    _use_estop = false;
+    _phase = Phase::BACK_STOP;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: backoff %u (%s)",
+                  (unsigned)_back_tries, why);
+}
+
+void AP_ModbusSteering::abort_home(const char *reason, bool estop)
+{
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: %s", reason);
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                  "CL57R: abort di=%04x st=%04x enc=%d",
+                  (unsigned)_di_word,
+                  (unsigned)_status_word,
+                  (int)_actual_pulses);
+    _use_estop = estop;
+    _homed = false;
+    _phase = Phase::ABORT_STOP;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+    clear_cal_trig();
+}
+
+void AP_ModbusSteering::finish_cal()
+{
+    max_steps.set_and_save(_measured_half_travel);
+    _homed = true;
+    _have_run_target = false;
+    _run_link_failsafe = false;
+    _phase = Phase::IDLE_READY;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+    clear_cal_trig();
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "CL57R: calibrated at mid half=%d %s",
+                  (int)_measured_half_travel, CL57R_FW_TAG);
+}
+
+void AP_ModbusSteering::evaluate_cal_wait(uint32_t now)
+{
+    if ((now - _leg_start_ms) > home_timeout_ms()) {
+        abort_home("cal leg timeout", true);
+        return;
+    }
+    if ((_status_word & STATUS_ALARM) != 0) {
+        begin_backoff("alarm on seek");
+        return;
+    }
+
+    if ((_status_word & STATUS_HOME_DONE) == 0) {
+        _saw_home_clear = true;
+    }
+    if ((_status_word & STATUS_RUNNING) != 0) {
+        _saw_home_run = true;
+    }
+    if ((_di_word & home_limit_bit()) != 0) {
+        _saw_limit = true;
+    }
+
+    // Native MOTION_HOME zeros the encoder at the limit; capture peak |enc|
+    // during the seek so lock-to-lock travel survives that zeroing.
+    const int32_t abs_enc = abs(_actual_pulses);
+    if (abs_enc > _leg_peak_travel) {
+        _leg_peak_travel = abs_enc;
+    }
+
+    const int32_t moved = abs(_actual_pulses - _last_progress_enc);
+    if (moved >= STALL_MIN_PULSES) {
+        _last_progress_enc = _actual_pulses;
+        _last_progress_ms = now;
+    } else if ((now - _leg_start_ms) > STALL_GRACE_MS &&
+               (now - _last_progress_ms) > STALL_WINDOW_MS) {
+        begin_backoff("seek stall");
+        return;
+    }
+
+    // Done: home-done rose after clear, and the expected limit is active.
+    if (_saw_home_clear &&
+        (_status_word & STATUS_HOME_DONE) != 0 &&
+        _saw_limit) {
+        if (_home_leg == 0) {
+            _leg1_travel = _leg_peak_travel;
+            _home_leg = 1;
+            _back_tries = 0;
+            begin_leg_prep();
+            return;
+        }
+
+        // Second limit: peak travel from the first zeroed limit to this one.
+        const int32_t full = _leg_peak_travel;
+        if (full < MIN_MEASURED_TRAVEL) {
+            abort_home("travel too small", true);
+            return;
+        }
+        const int32_t expected = expected_full_travel();
+        if (expected >= 20000) {
+            if (full < expected / 4 || full > expected * 5) {
+                abort_home("travel out of range", true);
+                return;
+            }
+        }
+        _measured_half_travel = full / 2;
+        // After leg2 method 18, mid is negative; after method 17, mid is positive.
+        if (home_method_now() == 18) {
+            _mid_target = -_measured_half_travel;
+        } else {
+            _mid_target = _measured_half_travel;
+        }
+        begin_mid();
+    }
+
+    (void)_saw_home_run;
+    (void)_leg1_travel;
+}
+
+void AP_ModbusSteering::evaluate_mid_wait(uint32_t now)
+{
+    if ((now - _leg_start_ms) > home_timeout_ms()) {
+        abort_home("mid timeout", true);
+        return;
+    }
+    if ((_status_word & STATUS_ALARM) != 0) {
+        abort_home("alarm on mid", true);
+        return;
+    }
+    const bool in_pos = (_status_word & 0x0001U) != 0;
+    const int32_t err = abs(_actual_pulses - _mid_target);
+    if (in_pos || err <= MID_POS_TOL) {
+        if ((_status_word & STATUS_RUNNING) == 0 || err <= MID_POS_TOL) {
+            _phase = Phase::MID_ZERO;
+            _awaiting_echo = false;
+            _got_echo = false;
+            _init_attempts = 0;
+        }
+    }
+}
+
+void AP_ModbusSteering::evaluate_back_poll(uint32_t now)
+{
+    const int32_t traveled = abs(_actual_pulses - _last_progress_enc);
+    const bool limit_clear = (_di_word & home_limit_bit()) == 0;
+    if ((limit_clear && traveled >= BACK_RELEASE_PULSES) ||
+        traveled >= BACK_CAP_PULSES ||
+        (now - _back_start_ms) > BACK_MAX_MS) {
+        // Stop and re-enter seek prep for the same leg.
+        _use_estop = false;
+        _phase = Phase::CAL_STOP;
+        _awaiting_echo = false;
         _got_echo = false;
         _init_attempts = 0;
-        _saw_home_motion = false;
-        _saw_home_run = false;
-        _saw_home_clear = false;
-        _got_di = false;
-        _home_start_ms = AP_HAL::millis();
-        _last_home_progress_ms = _home_start_ms;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: backoff done, reseek");
+        return;
+    }
+    if ((_status_word & STATUS_ALARM) != 0) {
+        abort_home("alarm during backoff", true);
+    }
+}
+
+void AP_ModbusSteering::bus_idle_poll(uint32_t now)
+{
+    if (_awaiting_echo) {
+        return;
+    }
+    if (_last_send_ms != 0 && (now - _last_send_ms) < SEND_INTERVAL_MS) {
+        return;
+    }
+
+    switch (_run_poll_phase) {
+    case 0:
+        send_read(REG_ENCODER_POS, 2, RxExpect::ENCODER);
+        _run_poll_phase = 1;
         break;
-    case DriveState::HOME_ZERO:
-        _steer_cmd_offset = 0;
-        finish_home();
+    case 1:
+        send_read(REG_STATUS, 1, RxExpect::STATUS);
+        _run_poll_phase = 2;
         break;
     default:
+        send_read(REG_DI_STATUS, 1, RxExpect::DI_INPUT);
+        _run_poll_phase = 0;
         break;
+    }
+}
+
+void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
+{
+    if (!_homed) {
+        return;
+    }
+    const uint32_t to = link_timeout_ms();
+    if (to == 0U || _last_rx_ms == 0U) {
+        _link_lost_candidate_ms = 0;
+        return;
+    }
+    const uint32_t good_age = now - _last_rx_ms;
+    const uint32_t bus_ms = (_last_bus_ms != 0U) ? _last_bus_ms : _last_rx_ms;
+    const uint32_t bus_age = now - bus_ms;
+    if (good_age <= to || bus_age <= to) {
+        _link_lost_candidate_ms = 0;
+        if (_run_link_failsafe) {
+            _run_link_failsafe = false;
+            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE,
+                          "CL57R: Modbus link restored (crc_err=%u)",
+                          (unsigned)_rx_crc_err);
+        }
+        return;
+    }
+
+    if (_link_lost_candidate_ms == 0U) {
+        _link_lost_candidate_ms = now;
+        return;
+    }
+    if ((now - _link_lost_candidate_ms) < LINK_LOST_CONFIRM_MS) {
+        return;
+    }
+
+    if (!_run_link_failsafe) {
+        _run_link_failsafe = true;
+        _phase = Phase::RUN_STOP;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                      "CL57R: Modbus link lost, STOP (silent %ums crc_err=%u)",
+                      (unsigned)good_age, (unsigned)_rx_crc_err);
+        _last_run_link_warn_ms = now;
+        return;
+    }
+
+    if (_last_run_link_warn_ms == 0U ||
+        (now - _last_run_link_warn_ms) >= LINK_WARN_INTERVAL_MS) {
+        _last_run_link_warn_ms = now;
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                      "CL57R: Modbus link still down (crc_err=%u)",
+                      (unsigned)_rx_crc_err);
+    }
+}
+
+void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
+{
+    handle_run_link_failsafe(now);
+    if (_run_link_failsafe) {
+        if (_phase == Phase::IDLE_READY) {
+            bus_idle_poll(now);
+        }
+        return;
+    }
+    if (alarmed()) {
+        bus_idle_poll(now);
+        return;
+    }
+
+    if (_phase == Phase::RUN_TARGET ||
+        _phase == Phase::RUN_MOTION ||
+        _phase == Phase::RUN_STOP) {
+        return; // write sequence driven by echo path in service()
+    }
+
+    const int32_t limit = travel_limit_pulses();
+    const float stick = constrain_float(steering_out, -1.0f, 1.0f);
+    const int32_t target = (int32_t)(stick * (float)limit);
+    const int32_t db = pos_db.get();
+    const bool need_write = !_have_run_target ||
+                            (db <= 0 ? (target != _last_target)
+                                     : (abs(target - _last_target) >= db));
+    if (need_write) {
+        _last_target = target;
+        _have_run_target = true;
+        _phase = Phase::RUN_TARGET;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        return;
+    }
+
+    bus_idle_poll(now);
+}
+
+void AP_ModbusSteering::service(uint32_t now)
+{
+    if (_phase == Phase::IDLE_UNCAL) {
+        bus_idle_poll(now);
+        return;
+    }
+
+    if (_phase == Phase::CAL_WAIT ||
+        _phase == Phase::MID_WAIT ||
+        _phase == Phase::BACK_POLL) {
+        bus_idle_poll(now);
+        if (_phase == Phase::CAL_WAIT) {
+            evaluate_cal_wait(now);
+        } else if (_phase == Phase::MID_WAIT) {
+            evaluate_mid_wait(now);
+        } else {
+            evaluate_back_poll(now);
+        }
+        return;
+    }
+
+    if (_got_echo) {
+        advance_after_echo();
+        return;
+    }
+
+    if (_awaiting_echo) {
+        if ((now - _last_send_ms) < ECHO_TIMEOUT_MS) {
+            return;
+        }
+        _init_attempts++;
+        _awaiting_echo = false;
+        if (_init_attempts >= INIT_MAX_ATTEMPTS) {
+            if (in_cal()) {
+                abort_home("no Modbus reply", false);
+                return;
+            }
+            if (in_run()) {
+                _phase = Phase::IDLE_READY;
+                _init_attempts = 0;
+                return;
+            }
+            static uint32_t last_fail_ms;
+            if (last_fail_ms == 0 || (now - last_fail_ms) > 5000) {
+                last_fail_ms = now;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "CL57R: init retry phase=%u",
+                              (unsigned)_phase);
+            }
+            _init_attempts = 0;
+        }
+    }
+
+    if (_phase == Phase::IDLE_READY) {
+        return;
+    }
+
+    if (_last_send_ms != 0 && (now - _last_send_ms) < SEND_INTERVAL_MS) {
+        return;
+    }
+    send_current();
+}
+
+bool AP_ModbusSteering::rc_rising_edge(int8_t ch, bool &was_high) const
+{
+    if (ch < 1 || ch > 16) {
+        return false;
+    }
+    uint16_t pwm = 0;
+    if (!rc().get_pwm((uint8_t)ch, pwm)) {
+        was_high = false;
+        return false;
+    }
+    if (pwm > RC_Channel::AUX_SWITCH_PWM_TRIGGER_HIGH) {
+        if (!was_high) {
+            was_high = true;
+            return true;
+        }
+        return false;
+    }
+    was_high = false;
+    return false;
+}
+
+void AP_ModbusSteering::poll_triggers()
+{
+    if (rc_rising_edge(cal_ch.get(), _cal_was_high)) {
+        start_home();
+    }
+
+    // Alarm clear button: only meaningful once init is done.
+    if ((_phase == Phase::IDLE_UNCAL || _phase == Phase::IDLE_READY) &&
+        rc_rising_edge(rst_ch.get(), _rst_was_high)) {
+        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear (RC)");
+    }
+
+    const int8_t trig = cal_trig.get();
+    if (!_cal_trig_inited) {
+        _cal_trig_last = trig;
+        _cal_trig_inited = true;
+        return;
+    }
+    if (trig == _cal_trig_last) {
+        return;
+    }
+    _cal_trig_last = trig;
+    if (trig == 1) {
+        start_home();
+    } else if (trig == 2) {
+        if (hal.util->get_soft_armed()) {
+            GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "CL57R: CAL_TRIG ignored, armed");
+            clear_cal_trig();
+            return;
+        }
+        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+        clear_cal_trig();
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear (TRIG)");
+    } else if (trig != 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: invalid CAL_TRIG %d", (int)trig);
+        clear_cal_trig();
     }
 }
 
 void AP_ModbusSteering::update(float steering_out)
 {
-    if (_uart == nullptr || !_uart->is_initialized()) {
+    if (_uart == nullptr) {
         return;
     }
 
     const uint32_t now = AP_HAL::millis();
     consume_rx();
-    poll_param_trigger();
-    poll_rc_buttons();
-
-    const bool armed = hal.util->get_soft_armed();
-    if (armed && !_was_armed) {
-        _pending_run_spd = true;
+    poll_triggers();
+    if (_homed && in_run()) {
+        handle_run(now, steering_out);
     }
-    _was_armed = armed;
-
-    const int32_t max_pulses = travel_limit_pulses();
-    const int32_t stick_pulses = constrain_int32((int32_t)(steering_out * (float)max_pulses),
-                                                 -max_pulses, max_pulses);
-    if (now - _last_vect_ms >= 200) {
-        _last_vect_ms = now;
-        gcs().send_debug_vect("STEER",
-                              (float)_actual_pulses,
-                              (float)stick_pulses,
-                              (float)_last_target);
-    }
-
-    if (in_home()) {
-        if (!_ever_got_rx) {
-            if (_last_home_norx_ms == 0 || (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS) {
-                _last_home_norx_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                              "CL57R: no Modbus RX from CL57R (check RS485 A/B RX)");
-            }
-        } else if (_last_rx_ms == 0 || (now - _last_rx_ms) > HOME_RX_SILENCE_MS) {
-            if (_home_rx_lost_ms == 0) {
-                _home_rx_lost_ms = now;
-            }
-            // Only abort if we never saw motion — long home legs can go quiet while
-            // the drive is busy seeking a limit. Do not abort mid-travel on silence.
-            if ((now - _home_rx_lost_ms) >= HOME_RX_ABORT_MS &&
-                !_saw_home_motion &&
-                (_state == DriveState::HOME_WAIT || _state == DriveState::HOME_WAIT_CENTER)) {
-                abort_home("Modbus RX lost, abort home");
-            } else if (!_saw_home_motion &&
-                       (now - _home_rx_lost_ms) >= HOME_RX_ABORT_MS &&
-                       (_last_home_norx_ms == 0 ||
-                        (now - _last_home_norx_ms) >= HOME_RX_LOST_WARN_MS)) {
-                // Only nag when we never saw motion and are near abort.
-                _last_home_norx_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: Modbus RX quiet during home");
-            }
-        } else {
-            _home_rx_lost_ms = 0;
-        }
-    } else {
-        _home_rx_lost_ms = 0;
-    }
-
-    if (in_run()) {
-        handle_run_link_failsafe(now);
-    }
-
-    if (_state == DriveState::HOME_WAIT) {
-        const bool home_bit = (_got_status && (_status_word & STATUS_HOME_DONE) != 0);
-        const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
-        const int32_t delta = _actual_pulses - _home_start_pulses;
-        const int32_t moved = (delta >= 0) ? delta : -delta;
-        bool enc_rebase = false;
-        if (moved > _leg_peak_travel) {
-            // Drive may snap encoder on alarm-clear between legs.
-            const int32_t expected_chk = expected_full_travel_pulses();
-            const int32_t jump = moved - _leg_peak_travel;
-            if (expected_chk >= 20000 && jump > expected_chk / 2 &&
-                (now - _home_start_ms) < 2500) {
-                _home_start_pulses = _actual_pulses;
-                _leg_peak_travel = 0;
-                if (!_saw_home_motion) {
-                    _saw_home_run = false;
-                }
-                enc_rebase = true;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: home enc jump, rebase");
-            } else {
-                _leg_peak_travel = moved;
-                _last_home_progress_ms = now;
-                if (delta > 0) {
-                    _leg_dir_sign = 1;
-                } else if (delta < 0) {
-                    _leg_dir_sign = -1;
-                }
-            }
-        }
-        if (_got_status && !home_bit) {
-            _saw_home_clear = true;
-        }
-        if (!enc_rebase && moved >= MIN_HOME_LEG_MOTION) {
-            _saw_home_motion = true;
-        }
-        if (!enc_rebase && running && moved >= 50) {
-            _saw_home_run = true;
-        }
-        if (now - _home_start_ms > home_timeout_ms()) {
-            abort_home("home timeout");
-        } else if (home_bit && !running && !_saw_home_motion &&
-                   (now - _home_start_ms) > 5000) {
-            if (now - _last_home_retry_ms > 3000) {
-                _last_home_retry_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: home done bit set, no motion, retry");
-            }
-        } else if (!_saw_home_motion && (now - _last_home_progress_ms) > 10000) {
-            _last_home_progress_ms = now;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home searching, no motion yet");
-        } else if (home_bit && !running && _saw_home_clear && _saw_home_motion) {
-            if (!_home_leg_settling) {
-                _home_leg_settling = true;
-                _home_leg_settle_ms = now + 200;
-            } else if (now >= _home_leg_settle_ms) {
-                _home_leg_settling = false;
-                home_leg_done(now);
-            }
-        } else if (home_bit && !running && _saw_home_clear &&
-                   !_saw_home_motion && (now - _home_start_ms) > 1500) {
-            // Already on the limit: native home completes with little motion.
-            if (_leg_peak_travel < moved) {
-                _leg_peak_travel = moved;
-            }
-            home_leg_done(now);
-        } else if (_home_leg_settling && running) {
-            _home_leg_settling = false;
-        }
-    } else if (_state == DriveState::HOME_WAIT_CENTER) {
-        const int32_t enc_from_origin = _actual_pulses - _center_encoder_origin;
-        const int32_t step_err = (enc_from_origin > _center_step_target) ?
-                                 (enc_from_origin - _center_step_target) :
-                                 (_center_step_target - enc_from_origin);
-        const int32_t final_err = (enc_from_origin > _center_move_target) ?
-                                  (enc_from_origin - _center_move_target) :
-                                  (_center_move_target - enc_from_origin);
-        int32_t arrive = pos_db.get();
-        if (arrive < 500) {
-            arrive = 500;
-        }
-        const int32_t cap = travel_limit_pulses() / 40;
-        if (cap >= 500 && arrive > cap) {
-            arrive = cap;
-        }
-        const bool running = (_got_status && (_status_word & STATUS_RUNNING) != 0);
-        if (now - _home_start_ms > home_timeout_ms()) {
-            abort_home("center timeout");
-        } else if (_got_status && alarmed()) {
-            abort_home("alarm during center");
-        } else if (step_err <= arrive && !running) {
-            if (!_center_step_settling) {
-                _center_step_settling = true;
-                _center_step_settle_ms = now + 300;
-            } else if (now >= _center_step_settle_ms) {
-                _center_step_settling = false;
-                if (final_err <= arrive) {
-                    _state = DriveState::HOME_ZERO;
-                    _got_echo = false;
-                    _init_attempts = 0;
-                } else {
-                    _center_resend = false;
-                    _state = DriveState::HOME_MOVE_CENTER;
-                    _home_center_prep = 5;
-                    _home_center_run_spd = true;
-                }
-            }
-        } else if (_center_step_settling && (step_err > arrive || running)) {
-            _center_step_settling = false;
-        } else if (!running && step_err > arrive &&
-                   (now - _last_home_retry_ms) > 2000) {
-            // Resend the SAME command — do not advance the target.
-            _last_home_retry_ms = now;
-            _center_resend = true;
-            _state = DriveState::HOME_MOVE_CENTER;
-            _home_center_prep = 5;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center resend %d (enc %d)",
-                          (int)_center_step_target, (int)enc_from_origin);
-        } else if ((now - _last_home_progress_ms) > 3000) {
-            _last_home_progress_ms = now;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: centering enc %d / %d",
-                          (int)enc_from_origin, (int)_center_move_target);
-            // If encoder never leaves the limit, finish with a command offset so
-            // stick-center maps to mid-travel without a physical center move.
-            if ((enc_from_origin > -500 && enc_from_origin < 500) &&
-                (now - _home_start_ms) > 12000) {
-                _steer_cmd_offset = _center_move_target;
-                _speed_follow = true;
-                _follow_prep = 0;
-                _follow_moving = false;
-                _follow_sign = 0;
-                _follow_slot = 0;
-                _follow_alarm_step = 0;
-                _follow_restore = 0;
-                _follow_mid_retried = true;
-                _follow_halted = false;
-                _follow_alarm_count = 0;
-                _follow_peak_toward = 0;
-                _follow_peak_at_alarm = 0;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: center fail, spd-follow %d",
-                              (int)_steer_cmd_offset);
-                finish_home();
-            }
-        }
-    }
-
-    if ((now - _last_send_ms) < SEND_INTERVAL_MS) {
-        return;
-    }
-    if (_uart->txspace() < 22) {
-        return;
-    }
-    _last_send_ms = now;
-
-    // Half-duplex RS485: never send more than one Modbus frame per slot.
-    if (flush_queued_motion()) {
-        return;
-    }
-
-    if (_state < DriveState::RUN_WRITE) {
-        if (_got_echo) {
-            advance_init();
-        } else {
-            if (_init_attempts == 0) {
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: init step %d", (int)_state);
-                _last_echo_wait_ms = now;
-            } else if ((now - _last_echo_wait_ms) >= WAIT_ECHO_WARN_MS) {
-                _last_echo_wait_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: init step %d waiting for echo",
-                              (int)_state);
-            }
-            _init_attempts++;
-        }
-    } else if (in_run()) {
-        if (!_speed_follow && _got_status && alarmed() &&
-            (now - _last_alarm_warn_ms) > 5000) {
-            _last_alarm_warn_ms = now;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: alarm latched, CAL_TRIG=2");
-        }
-    } else if (home_prep_wait_echo()) {
-        if (_got_echo) {
-            advance_home();
-        } else {
-            if (_init_attempts == 0) {
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home prep step %d", (int)_state);
-                _last_echo_wait_ms = now;
-            } else if ((now - _last_echo_wait_ms) >= WAIT_ECHO_WARN_MS) {
-                _last_echo_wait_ms = now;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: home step %d waiting for echo",
-                              (int)_state);
-            }
-            _init_attempts++;
-        }
-    }
-
-    uint8_t tx_packet[16];
-    switch (_state) {
-    case DriveState::INIT_ENABLE:
-        send_u16(REG_MOTOR_ENABLE, 0x0001);
-        break;
-    case DriveState::INIT_CLEAR_ALARM:
-        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-        break;
-    case DriveState::INIT_SUBDIVISION:
-        send_u16(REG_SUBDIVISION, SUBDIVISION_PPR);
-        break;
-    case DriveState::INIT_START_SPD:
-        send_u16(REG_START_SPD, (uint16_t)start_speed.get());
-        break;
-    case DriveState::INIT_MAX_SPD:
-        send_u16(REG_MAX_SPD, run_speed_rpm());
-        break;
-    case DriveState::INIT_ACCEL:
-        send_u16(REG_ACCEL, ACCEL_DEFAULT);
-        break;
-    case DriveState::INIT_DECEL:
-        send_u16(REG_DECEL, DECEL_DEFAULT);
-        break;
-    case DriveState::INIT_ABS_MODE:
-        send_u16(REG_POS_MODE, 0x0001);
-        break;
-    case DriveState::INIT_TRACK_ERR:
-        send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
-        break;
-    case DriveState::RUN_WRITE: {
-        if (_alarm_clear_pending) {
-            send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-            _alarm_clear_pending = false;
-            _state = DriveState::RUN_READ;
-            break;
-        }
-        if (_enable_after_alarm_clear) {
-            send_u16(REG_MOTOR_ENABLE, 0x0001);
-            _enable_after_alarm_clear = false;
-            _state = DriveState::RUN_READ;
-            break;
-        }
-        if (_pending_run_spd) {
-            send_u16(REG_MAX_SPD, run_speed_rpm());
-            _pending_run_spd = false;
-            _state = DriveState::RUN_READ;
-            break;
-        }
-        if (_run_link_failsafe) {
-            // STOP already queued; hold follow until CRC-valid RX clears failsafe.
-            send_u16(REG_MOTOR_ENABLE, 0x0001);
-            _state = DriveState::RUN_READ;
-            break;
-        }
-        if (_speed_follow) {
-            // Speed-mode follow: after native home Bit0 abs starts are ignored.
-            const int32_t target = stick_pulses + _steer_cmd_offset;
-            const int32_t enc = _actual_pulses - _center_encoder_origin;
-            const int32_t err = target - enc;
-            const int32_t abs_err = (err >= 0) ? err : -err;
-            const int32_t arrive_db = MAX(pos_db.get(), 800);
-            // Brake window scales with mid cruise RPM
-            // still reaches near mid (not stop 50k early).
-            const uint16_t mid_rpm = calib_speed_rpm();
-            // Brake distance ~250ms of cruise; larger HOME_SPD needs a wider window.
-            int32_t mid_stop = (int32_t)mid_rpm * CL57R_STEPS_PER_REV / 60 / 4;
-            if (mid_stop < arrive_db) {
-                mid_stop = arrive_db;
-            }
-            if (mid_stop > 20000) {
-                mid_stop = 20000;
-            }
-            _last_target = target;
-
-            // Track peak progress toward mid.
-            if (_steer_cmd_offset != 0) {
-                const int32_t abs_goal_pk = (_steer_cmd_offset >= 0) ?
-                                           _steer_cmd_offset : -_steer_cmd_offset;
-                const int32_t toward = enc * ((_steer_cmd_offset >= 0) ? 1 : -1);
-                if (toward > _follow_peak_toward) {
-                    const int32_t jump = toward - _follow_peak_toward;
-                    // Ignore only a cold start snap to ~full mid (alarm false-ready).
-                    // Once speed-follow is moving, credit every advance.
-                    if (!_follow_moving &&
-                        abs_goal_pk > 10000 &&
-                        jump > abs_goal_pk / 5 &&
-                        _follow_peak_toward < abs_goal_pk / 4) {
-                        // snap — do not credit as travel
-                    } else {
-                        _follow_peak_toward = toward;
-                    }
-                }
-                // Finished leaving the post-cal limit — allow mid cruise RPM.
-                if (_follow_mid_retried &&
-                    _follow_peak_toward > abs_goal_pk / 10) {
-                    _follow_mid_retried = false;
-                }
-            }
-
-            if (_follow_prep < 9) {
-                // Exit native home mode before commanding speed mode.
-                if (_follow_prep == 0) {
-                    send_u16(REG_MOTION, MOTION_STOP);
-                } else if (_follow_prep == 1) {
-                    send_u16(REG_MOTION, 0x0000);
-                } else if (_follow_prep == 2) {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
-                } else if (_follow_prep == 3) {
-                    send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-                } else if (_follow_prep == 4) {
-                    send_u16(REG_START_SPD, (uint16_t)start_speed.get());
-                } else if (_follow_prep == 5) {
-                    send_u16(REG_ACCEL, MID_SEEK_ACCEL_MS);
-                } else if (_follow_prep == 6) {
-                    send_u16(REG_DECEL, MID_SEEK_DECEL_MS);
-                } else if (_follow_prep == 7) {
-                    // Skip TRACK_ERR rewrite; 0xFFFF can raise exception code 3.
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
-                } else {
-                    // Avoid AUX_POS_ZERO on a pressed limit (aggravates faults).
-                    _center_encoder_origin = _actual_pulses;
-                    _follow_last_enc = 0;
-                    _follow_last_spd = 0;
-                    _follow_progress_ms = now;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: spd-follow on, ofs %d",
-                                  (int)_steer_cmd_offset);
-                }
-                _follow_prep++;
-                _state = DriveState::RUN_READ;
-                break;
-            }
-
-            if (_follow_restore > 0) {
-                if (_follow_restore == 1) {
-                    send_u16(REG_ACCEL, ACCEL_DEFAULT);
-                } else if (_follow_restore == 2) {
-                    send_u16(REG_DECEL, DECEL_DEFAULT);
-                } else {
-                    send_u16(REG_MAX_SPD, run_speed_rpm());
-                    _pending_run_spd = false;
-                    _follow_restore = 0;
-                    _state = DriveState::RUN_READ;
-                    break;
-                }
-                _follow_restore++;
-                _state = DriveState::RUN_READ;
-                break;
-            }
-
-            if (_follow_halted) {
-                // Do not keep slamming a limit after wrong-way / repeat alarms.
-                // Stick deflection releases control from the current pose.
-                if (stick_pulses > arrive_db || stick_pulses < -arrive_db) {
-                    _follow_halted = false;
-                    _follow_alarm_count = 0;
-                    _steer_cmd_offset = 0;
-                    _center_encoder_origin = _actual_pulses;
-                    _follow_moving = false;
-                    _follow_sign = 0;
-                    _follow_slot = 0;
-                    _pending_run_spd = true;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: follow stick takeover");
-                } else {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
-                }
-                _state = DriveState::RUN_READ;
-                break;
-            }
-
-            if (_follow_alarm_step > 0) {
-                if (_follow_alarm_step == 1) {
-                    send_u16(REG_MOTION, MOTION_STOP);
-                    _follow_alarm_step = 2;
-                } else if (_follow_alarm_step == 2) {
-                    send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-                    _follow_alarm_step = 3;
-                } else if (_follow_alarm_step == 3) {
-                    send_u16(REG_MOTOR_ENABLE, 0x0001);
-                    _follow_alarm_step = 4;
-                } else if (_follow_alarm_step == 4) {
-                    // Already at/past mid: finish here. Do not re-command a
-                    // full mid distance after encoder reset / overshoot.
-                    const bool mid_return = (_steer_cmd_offset != 0);
-                    const int32_t abs_goal = (_steer_cmd_offset >= 0) ?
-                                            _steer_cmd_offset : -_steer_cmd_offset;
-                    // Use peak captured at alarm time — post-clear enc snaps
-                    // can look like full mid travel (HW: ready after 160 pulses).
-                    const int32_t peak = _follow_peak_at_alarm;
-                    const bool mid_progress =
-                        mid_return && peak > (abs_goal / 3);
-                    const bool near_or_past =
-                        mid_progress &&
-                        (peak > (abs_goal - mid_stop) ||
-                         (abs_err <= mid_stop && peak > (abs_goal / 2)));
-                    if (mid_return && near_or_past) {
-                        send_u16(REG_MOTION, MOTION_STOP);
-                        _center_encoder_origin = _actual_pulses;
-                        _steer_cmd_offset = 0;
-                        _have_target = true;
-                        _last_target = 0;
-                        _follow_moving = false;
-                        _follow_sign = 0;
-                        _follow_slot = 0;
-                        _follow_alarm_step = 0;
-                        _follow_alarm_count = 0;
-                        _follow_halted = false;
-                        _follow_restore = 1;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
-                    } else if (mid_return &&
-                               peak < abs_goal / 8 &&
-                               _follow_alarm_count < 8) {
-                        // Still on the post-cal limit — leave at crawl, keep goal.
-                        _follow_mid_retried = true;
-                        _follow_moving = false;
-                        _follow_sign = 0;
-                        _follow_slot = 0;
-                        _follow_last_spd = 0;
-                        _follow_alarm_step = 0;
-                        // Drop bogus peak from enc snap during clear.
-                        if (_follow_peak_toward > peak + abs_goal / 5) {
-                            _follow_peak_toward = peak;
-                        }
-                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                      "CL57R: mid leave limit, crawl");
-                    } else if (mid_return && !_follow_mid_retried) {
-                        const int32_t remain = target - enc;
-                        // Refuse a near-full-travel rebase after encoder wipe.
-                        const int32_t abs_remain = (remain >= 0) ? remain : -remain;
-                        if (abs_remain > abs_goal / 2 && peak > abs_goal / 3) {
-                            _center_encoder_origin = _actual_pulses;
-                            _steer_cmd_offset = 0;
-                            _follow_moving = false;
-                            _follow_sign = 0;
-                            _follow_slot = 0;
-                            _follow_alarm_step = 0;
-                            _follow_halted = false;
-                            _follow_restore = 1;
-                            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                          "CL57R: mid settle (enc jump)");
-                        } else {
-                            _center_encoder_origin = _actual_pulses;
-                            _steer_cmd_offset = remain;
-                            _center_move_target = remain;
-                            _follow_mid_retried = true;
-                            _follow_moving = false;
-                            _follow_sign = 0;
-                            _follow_slot = 0;
-                            _follow_last_spd = 0;
-                            _follow_alarm_step = 0;
-                            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                          "CL57R: mid rebase remain %d",
-                                          (int)remain);
-                        }
-                    } else if (mid_return) {
-                        _follow_halted = true;
-                        _follow_moving = false;
-                        _follow_sign = 0;
-                        _follow_slot = 0;
-                        _follow_alarm_step = 0;
-                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                                      "CL57R: mid halt after alarm");
-                    } else if (_follow_alarm_count >= 3) {
-                        _follow_halted = true;
-                        _follow_moving = false;
-                        _follow_sign = 0;
-                        _follow_slot = 0;
-                        _follow_alarm_step = 0;
-                        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                                      "CL57R: follow halt after alarms");
-                    } else {
-                        _follow_moving = false;
-                        _follow_sign = 0;
-                        _follow_slot = 0;
-                        _follow_alarm_step = 0;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: follow resume %d->%d",
-                                      (int)enc, (int)target);
-                    }
-                }
-                _state = DriveState::RUN_READ;
-                break;
-            }
-
-            if (_got_status && alarmed()) {
-                _follow_alarm_count++;
-                _follow_peak_at_alarm = _follow_peak_toward;
-                _follow_moving = false;
-                _follow_sign = 0;
-                _follow_slot = 0;
-                _follow_alarm_step = 1;
-                send_u16(REG_MOTION, MOTION_STOP);
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "CL57R: follow alarm enc=%d tgt=%d pk=%d",
-                              (int)enc, (int)target, (int)_follow_peak_at_alarm);
-                _state = DriveState::RUN_READ;
-                break;
-            }
-
-            // Arrived or crossed mid target — stop before the far limit.
-            const bool crossed_mid = _follow_moving && _steer_cmd_offset != 0 &&
-                ((_follow_sign < 0 && enc <= target) ||
-                 (_follow_sign > 0 && enc >= target));
-            const int32_t stop_db = (_steer_cmd_offset != 0) ? mid_stop : arrive_db;
-            const int32_t abs_goal_run = (_steer_cmd_offset >= 0) ?
-                                         _steer_cmd_offset : -_steer_cmd_offset;
-            const bool mid_progressed = _follow_peak_toward > abs_goal_run / 10;
-            if (_steer_cmd_offset != 0 && mid_progressed &&
-                (crossed_mid || abs_err <= stop_db)) {
-                if (_follow_moving) {
-                    send_u16(REG_MOTION, MOTION_STOP);
-                    _follow_moving = false;
-                    _follow_sign = 0;
-                    _follow_slot = 0;
-                }
-                _center_encoder_origin = _actual_pulses;
-                _steer_cmd_offset = 0;
-                _have_target = true;
-                _last_target = 0;
-                _follow_alarm_count = 0;
-                _follow_halted = false;
-                _follow_restore = 1;
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: at mid-travel, ready");
-                _state = DriveState::RUN_READ;
-                break;
-            }
-
-            // With mid locked, stick-center holds physical mid. Do not chase a
-            // near-full-travel encoder jump (drive may spontaneously re-zero).
-            if (_steer_cmd_offset == 0 &&
-                stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
-                const int32_t half = travel_limit_pulses();
-                if (half > 5000 && abs_err > (half * 3) / 4) {
-                    if (_follow_moving) {
-                        send_u16(REG_MOTION, MOTION_STOP);
-                    }
-                    _center_encoder_origin = _actual_pulses;
-                    _last_target = 0;
-                    _follow_moving = false;
-                    _follow_sign = 0;
-                    _follow_slot = 0;
-                    _follow_last_spd = 0;
-                    _follow_alarm_count = 0;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "CL57R: mid enc jump %d, hold", (int)enc);
-                    _state = DriveState::RUN_READ;
-                    break;
-                }
-                if (abs_err <= arrive_db) {
-                    if (_follow_moving) {
-                        send_u16(REG_MOTION, MOTION_STOP);
-                        _follow_moving = false;
-                        _follow_sign = 0;
-                        _follow_slot = 0;
-                        _follow_last_spd = 0;
-                    } else {
-                        send_u16(REG_MOTOR_ENABLE, 0x0001);
-                    }
-                    _state = DriveState::RUN_READ;
-                    break;
-                }
-            }
-
-            // Stick deflected, or stick centered but off mid → speed-mode follow
-            // toward target (stick pulses, or 0 = physical center).
-            {
-                // GCS one-shot: confirm stick reached the driver.
-                if (_steer_cmd_offset == 0 && !_follow_moving) {
-                    if (stick_pulses != _last_stick_log &&
-                        (stick_pulses > arrive_db || stick_pulses < -arrive_db)) {
-                        _last_stick_log = stick_pulses;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: stick cmd %d",
-                                      (int)stick_pulses);
-                    } else if (stick_pulses != _last_stick_log &&
-                               stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
-                               abs_err > arrive_db) {
-                        _last_stick_log = stick_pulses;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: stick center, return mid");
-                    }
-                }
-                const int8_t want_sign = (err > 0) ? 1 : -1;
-                // Mid return: HOME_SPD; stick-center return to mid: gentle.
-                uint16_t max_rpm = (_steer_cmd_offset != 0) ?
-                                   calib_speed_rpm() : run_speed_rpm();
-                if (_steer_cmd_offset != 0 && _follow_mid_retried) {
-                    max_rpm = calib_crawl_rpm();
-                }
-                if (_steer_cmd_offset == 0 &&
-                    stick_pulses <= arrive_db && stick_pulses >= -arrive_db) {
-                    const uint16_t gentle = (uint16_t)MAX((int)calib_crawl_rpm(),
-                                                          (int)run_speed_rpm() / 2);
-                    if (max_rpm > gentle) {
-                        max_rpm = gentle;
-                    }
-                }
-                // Longer brake window for stick-center return; shorter for mid seek.
-                const int32_t brake_div =
-                    (_steer_cmd_offset == 0 &&
-                     stick_pulses <= arrive_db && stick_pulses >= -arrive_db) ? 1 : 2;
-                const int32_t slow_zone = MAX((int32_t)4000,
-                                             (int32_t)max_rpm * CL57R_STEPS_PER_REV / 60 / brake_div);
-                uint16_t rpm = max_rpm;
-                if (slow_zone > 0 && abs_err < slow_zone) {
-                    const uint16_t min_rpm = 60;
-                    rpm = (uint16_t)MAX((int32_t)min_rpm,
-                                        (int32_t)max_rpm * abs_err / slow_zone);
-                }
-                // Already crossed mid while returning — hard stop, do not hunt.
-                if (_steer_cmd_offset == 0 &&
-                    stick_pulses <= arrive_db && stick_pulses >= -arrive_db &&
-                    _follow_moving &&
-                    ((_follow_sign < 0 && enc <= 0) ||
-                     (_follow_sign > 0 && enc >= 0))) {
-                    send_u16(REG_MOTION, MOTION_STOP);
-                    _follow_moving = false;
-                    _follow_sign = 0;
-                    _follow_slot = 0;
-                    _follow_last_spd = 0;
-                    _center_encoder_origin = _actual_pulses;
-                    _last_target = 0;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: mid cross stop");
-                    _state = DriveState::RUN_READ;
-                    break;
-                }
-                const int16_t signed_spd = (int16_t)((int32_t)rpm * (int32_t)want_sign);
-                if (_follow_moving && _follow_sign != want_sign) {
-                    // Soft stop before reversing — avoids harsh direction flip.
-                    send_u16(REG_MOTION, MOTION_STOP);
-                    _follow_moving = false;
-                    _follow_sign = 0;
-                    _follow_slot = 0;
-                    _follow_last_spd = 0;
-                } else if (!_follow_moving || _follow_sign != want_sign) {
-                    if (_follow_slot == 0) {
-                        send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
-                        _follow_sign = want_sign;
-                        _follow_last_spd = signed_spd;
-                        _follow_slot = 1;
-                    } else {
-                        send_u16(REG_MOTION, MOTION_SPEED);
-                        _follow_moving = true;
-                        _follow_slot = 0;
-                        _follow_progress_ms = now;
-                        _follow_last_enc = enc;
-                        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                      "CL57R: follow %drpm %d/%d",
-                                      (int)signed_spd,
-                                      (int)enc, (int)target);
-                    }
-                } else if ((now - _follow_progress_ms) > 2500) {
-                    _follow_progress_ms = now;
-                    const int32_t moved = (enc > _follow_last_enc) ?
-                                          (enc - _follow_last_enc) :
-                                          (_follow_last_enc - enc);
-                    _follow_last_enc = enc;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                                  "CL57R: follow enc %d/%d",
-                                  (int)enc, (int)target);
-                    if (moved < 200) {
-                        // Drive dropped speed mode — reassert without reversing.
-                        send_u16(REG_MOTION, MOTION_SPEED);
-                    } else {
-                        send_u16(REG_MOTOR_ENABLE, 0x0001);
-                    }
-                } else {
-                    // Refresh MAX_SPD only on large rpm change; every-slot
-                    // writes starve encoder RX and look like a stuck encoder.
-                    const int16_t spd_delta = (signed_spd > _follow_last_spd) ?
-                                             (signed_spd - _follow_last_spd) :
-                                             (_follow_last_spd - signed_spd);
-                    if (spd_delta >= 30) {
-                        send_u16(REG_MAX_SPD, (uint16_t)signed_spd);
-                        _follow_last_spd = signed_spd;
-                    } else {
-                        send_u16(REG_MOTOR_ENABLE, 0x0001);
-                    }
-                }
-            }
-            _state = DriveState::RUN_READ;
-            break;
-        }
-        const int32_t target = stick_pulses + _steer_cmd_offset;
-        const int32_t deadband = pos_db.get();
-        const int32_t delta = (target > _last_target) ? (target - _last_target) : (_last_target - target);
-        const bool send_pos = !_have_target || (delta > deadband);
-        if (send_pos) {
-            // Absolute stick target; Bit2 interrupts in-progress moves.
-            send_target_pos(target);
-            queue_motion(MOTION_START_ABS_IRQ);
-        } else {
-            send_u16(REG_MOTOR_ENABLE, 0x0001);
-        }
-        _state = DriveState::RUN_READ;
-        break;
-    }
-    case DriveState::RUN_READ:
-        // Round-robin encoder / status / DI so limit switches are visible
-        // outside of cal (STATUSTEXT on DI change).
-        if (_run_poll_phase == 0) {
-            _rx_expect = RxExpect::ENCODER;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-        } else if (_run_poll_phase == 1) {
-            _rx_expect = RxExpect::STATUS;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
-        } else {
-            _rx_expect = RxExpect::DI_INPUT;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_DI_STATUS, 1, tx_packet);
-        }
-        _run_poll_phase = (uint8_t)((_run_poll_phase + 1) % 3);
-        _uart->write(tx_packet, 8);
-        _state = DriveState::RUN_WRITE;
-        break;
-    case DriveState::HOME_CLEAR_ALARM:
-        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-        break;
-    case DriveState::HOME_SET_METHOD:
-        send_u16(REG_HOME_METHOD, home_method_reg());
-        break;
-    case DriveState::HOME_SET_SPD: {
-        const uint16_t spd = calib_speed_rpm();
-        send_u16(REG_HOME_SPD, spd);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write HOME_SPD=%u", (unsigned)spd);
-        break;
-    }
-    case DriveState::HOME_SET_RUN_SPD: {
-        const uint16_t spd = calib_speed_rpm();
-        send_u16(REG_MAX_SPD, spd);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write MAX_SPD=%u (calib)", (unsigned)spd);
-        break;
-    }
-    case DriveState::HOME_SET_CRAWL: {
-        const uint16_t crawl = calib_crawl_rpm();
-        send_u16(REG_HOME_CRAWL, crawl);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: write HOME_CRAWL=%u", (unsigned)crawl);
-        break;
-    }
-    case DriveState::HOME_SET_ACCEL:
-        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
-        break;
-    case DriveState::HOME_ENABLE:
-        send_u16(REG_MOTOR_ENABLE, 0x0001);
-        break;
-    case DriveState::HOME_START:
-        send_u16(REG_MOTION, MOTION_HOME);
-        break;
-    case DriveState::HOME_WAIT:
-        if (_home_retry_pending) {
-            _home_retry_pending = false;
-            send_u16(REG_MOTION, MOTION_HOME);
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: home retry");
-            break;
-        }
-        if (_home_read_encoder) {
-            _rx_expect = RxExpect::ENCODER;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-            _home_read_encoder = false;
-        } else {
-            _rx_expect = RxExpect::STATUS;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
-            _home_read_encoder = true;
-        }
-        _uart->write(tx_packet, 8);
-        if (!_saw_home_motion && (now - _home_start_ms) > 3000 &&
-            (now - _last_home_retry_ms) > 3000) {
-            _last_home_retry_ms = now;
-            _home_retry_pending = true;
-        }
-        break;
-    case DriveState::HOME_MOVE_CENTER:
-        // Re-arm absolute positioning after native home before stepping.
-        if (_home_center_prep == 0) {
-            send_u16(REG_MOTOR_ENABLE, 0x0001);
-            _home_center_prep = 1;
-            break;
-        }
-        if (_home_center_prep == 1) {
-            send_u16(REG_POS_MODE, 0x0001);
-            _home_center_prep = 2;
-            break;
-        }
-        if (_home_center_prep == 2) {
-            send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
-            _home_center_prep = 3;
-            break;
-        }
-        if (_home_center_prep == 3) {
-            send_u16(REG_MAX_SPD, calib_speed_rpm());
-            _home_center_prep = 4;
-            _home_center_run_spd = true;
-            break;
-        }
-        if (_home_center_prep == 4) {
-            // Sync command origin at the current limit before abs moves.
-            send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
-            _home_center_prep = 5;
-            break;
-        }
-        {
-            const int32_t enc_from_origin = _actual_pulses - _center_encoder_origin;
-            const int32_t err = _center_move_target - enc_from_origin;
-            const int32_t abs_err = (err >= 0) ? err : -err;
-            int32_t arrive = pos_db.get();
-            if (arrive < 500) {
-                arrive = 500;
-            }
-            if (abs_err <= arrive) {
-                _center_step_target = _center_move_target;
-                _center_step_settling = false;
-                _center_resend = false;
-                _state = DriveState::HOME_WAIT_CENTER;
-                break;
-            }
-
-            int32_t cmd;
-            if (_center_resend && _center_step_target != 0) {
-                cmd = _center_step_target;
-            } else {
-                // One absolute command for the remaining distance.
-                cmd = _center_move_target;
-            }
-            _center_resend = false;
-
-            send_target_pos(cmd);
-            queue_motion(MOTION_START_ABS);
-            _center_step_target = cmd;
-            _center_step_settling = false;
-            _got_status = false;
-            _last_home_retry_ms = now;
-            _state = DriveState::HOME_WAIT_CENTER;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: center cmd %d mot=0x%02x enc %d",
-                          (int)cmd, (unsigned)MOTION_START_ABS, (int)enc_from_origin);
-        }
-        break;
-    case DriveState::HOME_WAIT_CENTER:
-        if (_home_read_encoder) {
-            _rx_expect = RxExpect::ENCODER;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_ENCODER_POS, 2, tx_packet);
-        } else {
-            _rx_expect = RxExpect::STATUS;
-            modbus_create_read_packet((uint8_t)slave_id.get(), REG_STATUS, 2, tx_packet);
-        }
-        _home_read_encoder = !_home_read_encoder;
-        _uart->write(tx_packet, 8);
-        break;
-    case DriveState::HOME_ZERO_AT_L1:
-        // Do not AUX_POS_ZERO while on L1 DI: encoder snaps ("seek enc jump")
-        // and CL57R often re-latches alarm so leg2 SEEK never moves. Leg2
-        // travel is measured from HOME_START encoder capture instead.
-        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-        break;
-    case DriveState::HOME_ZERO:
-        send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
-        break;
-    default:
-        // Unexpected state: recover to RUN_READ poll cycle.
-        _state = DriveState::RUN_READ;
-        break;
-    }
+    service(now);
 }

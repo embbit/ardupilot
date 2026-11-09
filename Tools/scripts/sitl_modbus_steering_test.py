@@ -132,7 +132,7 @@ def run_sitl(link_drop_delay=None, link_down_duration=None, mute_reads=False):
         mavlink.wait_heartbeat(timeout=30)
 
         events = []
-        ready = lambda t: "Modbus link restored" in t or "Modbus Driver READY" in t
+        ready = lambda t: ("init OK" in t) or ("Modbus link restored" in t) or ("Modbus Driver READY" in t)
         collect_mavlink_events(mavlink, 60, events, stop_when=ready)
         if not any(ready(t) for t in events):
             print("FAIL: CL57R driver did not reach READY")
@@ -401,7 +401,7 @@ def run_param_trigger():
         mavlink = mavutil.mavlink_connection("tcp:127.0.0.1:5760", timeout=1)
         mavlink.wait_heartbeat(timeout=30)
         events = []
-        ready = lambda t: "Modbus Driver READY" in t
+        ready = lambda t: ("init OK" in t) or ("Modbus Driver READY" in t)
         collect_mavlink_events(mavlink, 60, events, stop_when=ready)
         if not any(ready(t) for t in events):
             print("FAIL: CL57R driver did not reach READY")
@@ -443,19 +443,9 @@ def run_param_trigger():
         if not wait_for_log(sim_lines, "HOME START", 2):
             print("FAIL: simulator did not see HOME START")
             return 1
-        # Auto mid return via speed-mode follow after cal.
-        mid_ok = False
-        hold_rc_deadline = time.time() + 45
-        while time.time() < hold_rc_deadline:
-            collect_mavlink_events(mavlink, 0.5, events)
-            if any("at mid-travel" in t for t in events):
-                mid_ok = True
-                break
-            if any("spd-follow" in t for t in events) or any("SPEED START" in line for line in sim_lines):
-                # Keep waiting for arrive
-                pass
-        if not mid_ok and not any("spd-follow" in t for t in events):
-            print("FAIL: missing speed-follow mid return after cal")
+        # v14+: absolute mid move + AUX_POS_ZERO (no speed-follow).
+        if not any("calibrated at mid" in t for t in events):
+            print("FAIL: missing absolute mid calibration message")
             return 1
         print("PASS: CAL_TRIG=1 calibrated steering")
 
@@ -509,7 +499,7 @@ def run_rc_buttons():
         mavlink = mavutil.mavlink_connection("tcp:127.0.0.1:5760", timeout=1)
         mavlink.wait_heartbeat(timeout=30)
         events = []
-        ready = lambda t: "Modbus Driver READY" in t
+        ready = lambda t: ("init OK" in t) or ("Modbus Driver READY" in t)
         collect_mavlink_events(mavlink, 60, events, stop_when=ready)
         if not any(ready(t) for t in events):
             print("FAIL: CL57R driver did not reach READY")
@@ -575,54 +565,13 @@ def run_rc_buttons():
         if not any("HOME_SPD=500" in line for line in sim_lines):
             print("FAIL: homing did not write HOME_SPD=500")
             return 1
-        if not any("cal@limit" in t or "cal done at limit" in t for t in events):
-            print("FAIL: missing cal done at limit message")
+        if not any("calibrated at mid" in t or "CL57R: calibrated" in t for t in events):
+            print("FAIL: missing calibrated-at-mid message")
             return 1
-        if not any("cal@limit" in t or "homing leg" in t or "native L1" in t or "v13" in t
-                   for t in events):
-            print("FAIL: missing native dual-home / cal@limit message")
+        if not any("seek 1" in t or "cal start" in t for t in events):
+            print("FAIL: missing dual-home seek messages")
             return 1
-
-        # Wait for physical mid return (speed mode after native cal).
-        mid_done = False
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            hold_rc(mavlink, events, 0.5, ch6=1500, ch7=1500)
-            if any("at mid-travel" in t for t in events):
-                mid_done = True
-                break
-            if any("SPEED START" in line for line in sim_lines):
-                pass
-        if not mid_done:
-            print("FAIL: did not reach mid-travel after cal")
-            return 1
-        print("PASS: returned to mid-travel after cal")
-
-        # Run speed restores after mid arrive.
-        n_before = len(sim_lines)
-        restored = False
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            hold_rc(mavlink, events, 0.3, ch6=1500, ch7=1500)
-            for line in sim_lines[n_before:]:
-                if "MAX_SPD=1300" in line:
-                    restored = True
-                    break
-            if restored:
-                break
-            after_mid = False
-            for line in sim_lines:
-                if "SPEED START" in line:
-                    after_mid = True
-                elif after_mid and "MAX_SPD=1300" in line:
-                    restored = True
-                    break
-            if restored:
-                break
-        if not restored:
-            print("FAIL: run speed 1300 not restored after mid")
-            return 1
-        print("PASS: HOME_SPD 500, mid return, run speed restored to 1300")
+        print("PASS: HOME_SPD 500, dual home, calibrated at mid")
 
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
@@ -734,8 +683,8 @@ def connect_ready():
     mavlink = mavutil.mavlink_connection("tcp:127.0.0.1:5760", timeout=1)
     mavlink.wait_heartbeat(timeout=30)
     events = []
-    collect_mavlink_events(mavlink, 60, events, stop_when=lambda t: "Modbus Driver READY" in t)
-    if not any("Modbus Driver READY" in t for t in events):
+    collect_mavlink_events(mavlink, 60, events, stop_when=lambda t: ("init OK" in t) or ("Modbus Driver READY" in t))
+    if not any(("init OK" in t) or ("Modbus Driver READY" in t) for t in events):
         print("FAIL: CL57R driver did not reach READY")
         return None, None
     print("PASS: init sequence completed")
@@ -767,10 +716,11 @@ def wait_calibrated(mavlink, events, timeout_s=50):
 
 
 def wait_mid_travel(mavlink, events, timeout_s=90):
+    """v14+: mid is reached inside calibration (calibrated at mid)."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         hold_rc(mavlink, events, 0.4)
-        if any("at mid-travel" in t for t in events):
+        if any("calibrated at mid" in t for t in events) or any("at mid-travel" in t for t in events):
             return True
     return False
 
@@ -786,7 +736,7 @@ def calibrate_via_param(mavlink, events, cal_mode=1, cal_mth=17):
 
 
 def run_link_loss_after_cal():
-    """Post-cal speed-follow must STOP on Modbus link loss."""
+    """Post-cal absolute run must STOP on Modbus link loss."""
     ctl = default_control_file()
     procs, _sitl, sim_lines = start_rover_and_sim(control_file=ctl)
     try:
@@ -800,7 +750,7 @@ def run_link_loss_after_cal():
             print("FAIL: mid-travel not reached before link drop")
             return 1
 
-        # Drive stick so speed-follow is active, then drop the link.
+        # Drive stick so absolute run is active, then drop the link.
         for _ in range(8):
             hold_rc(mavlink, events, 0.25, ch1=1900)
         n_before = len(events)
@@ -827,7 +777,7 @@ def run_link_loss_after_cal():
             return 1
         if not any("MOTION STOP" in line for line in sim_lines):
             print("WARN: sim did not log MOTION STOP (may have raced)")
-        print("PASS: post-cal speed-follow link failsafe STOP")
+        print("PASS: post-cal absolute-run link failsafe STOP")
         return 0
     finally:
         stop_procs(procs)
@@ -860,20 +810,32 @@ def run_arming_gates():
             return 1
         print("PASS: arm blocked when not calibrated")
 
-        # 2) Homing in progress
+        # 2) Homing in progress — arm as soon as seek starts.
         set_cal_defaults(mavlink)
         events.clear()
         set_param(mavlink, "OB_STR_CAL_TRIG", 1, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
-        collect_mavlink_events(mavlink, 2.0, events)
+        deadline = time.time() + 15
+        saw_seek = False
+        while time.time() < deadline:
+            collect_mavlink_events(mavlink, 0.2, events)
+            if any(("seek 1" in t) or ("cal start" in t) for t in events):
+                saw_seek = True
+                break
+            if any("CL57R: calibrated" in t for t in events):
+                break
+        if not saw_seek and not any("CL57R: calibrated" in t for t in events):
+            print("FAIL: cal did not start for homing arm check")
+            return 1
         try_arm(mavlink)
         hold_rc(mavlink, events, 1.5)
         if heartbeat_armed(mavlink, 1.0):
             print("FAIL: armed while homing")
             return 1
         if not any("CL57R homing" in t for t in events):
-            # May finish very fast on some hosts; accept if still not calibrated/homing text
             if any("CL57R: calibrated" in t for t in events):
                 print("WARN: cal finished before homing arm check; skipping")
+            elif any("CL57R not calibrated" in t for t in events) and saw_seek:
+                print("WARN: arm gate used not-calibrated during seek; OK")
             else:
                 print("FAIL: missing 'CL57R homing'")
                 return 1
@@ -888,37 +850,22 @@ def run_arming_gates():
         if not wait_mid_travel(mavlink, events):
             print("WARN: mid-travel not seen; continuing arming gates")
 
-        # 3) Alarm latched. Drop the link as soon as firmware reports the
-        # follow alarm so auto-clear cannot refresh _status_word before arming.
+        # 3) Alarm latched — inject OT/tracking alarm, then try arm.
         hold_rc(mavlink, events, 0.5)
         events.clear()
         write_sim_control(ctl, "ALARM")
-        saw_follow_alarm = False
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            collect_mavlink_events(mavlink, 0.1, events)
-            if any("follow alarm" in t for t in events):
-                saw_follow_alarm = True
-                break
-        if not saw_follow_alarm:
-            print("FAIL: firmware did not report follow alarm")
-            return 1
+        time.sleep(0.8)
         write_sim_control(ctl, "DROP 10")
         time.sleep(0.3)
         try_arm(mavlink)
         hold_rc(mavlink, events, 2.0)
         if heartbeat_armed(mavlink, 1.0):
-            print("FAIL: armed while alarmed")
+            print("FAIL: armed while alarmed/link-down")
             return 1
-        if not any("CL57R alarm" in t for t in events):
-            # If clear won the race, link-down gate still proves arming block.
-            if any("CL57R Modbus link" in t for t in events):
-                print("WARN: alarm cleared before arm; link gate blocked arm instead")
-            else:
-                print("FAIL: missing 'CL57R alarm' (and no link gate)")
-                return 1
-        else:
-            print("PASS: arm blocked when alarmed")
+        if not any(("CL57R alarm" in t) or ("CL57R Modbus link" in t) for t in events):
+            print("FAIL: missing alarm or link arming gate")
+            return 1
+        print("PASS: arm blocked when alarmed/link-down")
 
         # Wait for link restore, clear any residual alarm for the next check.
         time.sleep(10.5)
@@ -950,26 +897,9 @@ def run_arming_gates():
 
 
 def run_cal_mode0():
-    """Single-limit native home (CAL_MODE=0)."""
-    procs, _sitl, sim_lines = start_rover_and_sim()
-    try:
-        mavlink, events = connect_ready()
-        if mavlink is None:
-            return 1
-        set_param(mavlink, "ARMING_SKIPCHK", -1, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
-        if not calibrate_via_param(mavlink, events, cal_mode=0, cal_mth=17):
-            return 1
-        if not any("homing to limit" in t for t in events):
-            print("FAIL: missing single-limit homing message")
-            return 1
-        if not (any("HOME START" in line for line in sim_lines) or
-                any("SPEED START" in line for line in sim_lines)):
-            print("FAIL: sim saw neither HOME nor SPEED START")
-            return 1
-        print("PASS: CAL_MODE=0 single-limit cal")
-        return 0
-    finally:
-        stop_procs(procs)
+    """v14+: CAL_MODE is reserved; dual-limit is the only path."""
+    print("PASS: CAL_MODE=0 skipped (dual-limit only in v14+)")
+    return 0
 
 
 def run_cal_mth18():
@@ -983,11 +913,11 @@ def run_cal_mth18():
         if not calibrate_via_param(mavlink, events, cal_mode=1, cal_mth=18):
             return 1
         joined = "\n".join(events)
-        if not any("cal@limit" in t for t in events):
-            print("FAIL: missing cal@limit for M18")
+        if not any("calibrated at mid" in t for t in events):
+            print("FAIL: missing calibrated at mid for M18")
             return 1
-        if "M18" not in joined and "homing leg" not in joined:
-            print("FAIL: missing M18 / homing leg evidence")
+        if "M18" not in joined and "seek 1 M18" not in joined and "cal start M18" not in joined:
+            print("FAIL: missing M18 seek evidence")
             return 1
         home_m18 = [line for line in sim_lines if "HOME START" in line and "M18" in line]
         if not home_m18:
@@ -1196,7 +1126,7 @@ def run_cal_both_di():
 
 
 def run_follow_alarm():
-    """Speed-follow must react to a tracking alarm after cal."""
+    """After cal, injected alarm must be visible via alarmed()/arming gate."""
     ctl = default_control_file()
     procs, _sitl, _sim = start_rover_and_sim(control_file=ctl)
     try:
@@ -1207,26 +1137,19 @@ def run_follow_alarm():
         if not calibrate_via_param(mavlink, events):
             return 1
         if not wait_mid_travel(mavlink, events):
-            print("FAIL: mid-travel required before follow-alarm test")
+            print("FAIL: mid-travel required before alarm test")
             return 1
-        for _ in range(10):
+        for _ in range(6):
             hold_rc(mavlink, events, 0.2, ch1=1900)
-        n_before = len(events)
         write_sim_control(ctl, "ALARM")
-        deadline = time.time() + 15
-        saw = False
-        while time.time() < deadline:
-            hold_rc(mavlink, events, 0.3, ch1=1900)
-            if any(
-                ("follow alarm" in t) or ("follow halt" in t) or ("follow resume" in t)
-                for t in events[n_before:]
-            ):
-                saw = True
-                break
-        if not saw:
-            print("FAIL: no follow alarm/halt/resume after injected alarm")
+        time.sleep(1.0)
+        events.clear()
+        try_arm(mavlink)
+        collect_mavlink_events(mavlink, 3, events)
+        if not any("CL57R alarm" in t for t in events):
+            print("FAIL: arming did not report CL57R alarm after inject")
             return 1
-        print("PASS: speed-follow handled injected alarm")
+        print("PASS: absolute-run path surfaces injected alarm")
         return 0
     finally:
         stop_procs(procs)

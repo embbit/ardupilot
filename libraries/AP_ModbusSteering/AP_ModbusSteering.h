@@ -4,6 +4,12 @@
 #include <AP_Param/AP_Param.h>
 #include <AP_SerialManager/AP_SerialManager.h>
 
+/*
+ * CL57R Modbus RTU outboard steering (Rover OB_STR_*).
+ *
+ * Phases: Init → IdleUncal → Cal (dual MOTION_HOME + mid zero) →
+ * IdleReady / absolute Run (stick or autopilot) with link failsafe.
+ */
 class AP_ModbusSteering {
 public:
     AP_ModbusSteering();
@@ -13,15 +19,14 @@ public:
 
     bool enabled() const { return _uart != nullptr; }
     bool homed() const { return _homed; }
-    bool homing() const { return in_home(); }
+    bool homing() const;
     bool alarmed() const { return (_status_word & (1U << 3)) != 0; }
-    // CRC-valid Modbus RX seen within LINK_TO (or LINK_OK_DEFAULT_MS if 0).
     bool link_ok() const;
 
     static const struct AP_Param::GroupInfo var_info[];
 
 private:
-    enum class DriveState : uint8_t {
+    enum class Phase : uint8_t {
         INIT_ENABLE = 0,
         INIT_CLEAR_ALARM,
         INIT_SUBDIVISION,
@@ -31,21 +36,40 @@ private:
         INIT_DECEL,
         INIT_ABS_MODE,
         INIT_TRACK_ERR,
-        RUN_WRITE,
-        RUN_READ,
-        HOME_CLEAR_ALARM,
-        HOME_SET_METHOD,
-        HOME_SET_SPD,
-        HOME_SET_RUN_SPD,
-        HOME_SET_CRAWL,
-        HOME_SET_ACCEL,
-        HOME_ENABLE,
-        HOME_START,
-        HOME_WAIT,
-        HOME_ZERO_AT_L1,
-        HOME_MOVE_CENTER,
-        HOME_WAIT_CENTER,
-        HOME_ZERO,
+        IDLE_UNCAL,
+
+        CAL_STOP,
+        CAL_CLEAR,
+        CAL_ENABLE,
+        CAL_METHOD,
+        CAL_HOME_SPD,
+        CAL_CRAWL,
+        CAL_HOME_ACCEL,
+        CAL_START_HOME,
+        CAL_WAIT,
+
+        MID_STOP,
+        MID_CLEAR,
+        MID_ENABLE,
+        MID_MAX_SPD,
+        MID_TARGET,
+        MID_RUN,
+        MID_WAIT,
+        MID_ZERO,
+
+        BACK_STOP,
+        BACK_CLEAR,
+        BACK_ENABLE,
+        BACK_SPD,
+        BACK_START,
+        BACK_POLL,
+
+        ABORT_STOP,
+
+        IDLE_READY,
+        RUN_TARGET,
+        RUN_MOTION,
+        RUN_STOP,
     };
 
     enum class RxExpect : uint8_t {
@@ -55,116 +79,99 @@ private:
         DI_INPUT,
     };
 
-    int32_t travel_limit_pulses() const;
-    int32_t expected_full_travel_pulses() const;
+    bool in_init() const { return _phase <= Phase::INIT_TRACK_ERR; }
+    bool in_cal() const {
+        return _phase >= Phase::CAL_STOP && _phase <= Phase::ABORT_STOP;
+    }
+    bool in_run() const {
+        return _phase == Phase::IDLE_READY ||
+               _phase == Phase::RUN_TARGET ||
+               _phase == Phase::RUN_MOTION ||
+               _phase == Phase::RUN_STOP;
+    }
+
     uint8_t rtu_frame_len(const uint8_t *buf, uint8_t avail) const;
     void consume_rx();
-    void advance_init();
-    void advance_home();
-    void poll_rc_buttons();
-    void poll_param_trigger();
-    bool rc_rising_edge(int8_t ch, bool &was_high) const;
-    void request_alarm_clear();
-    void start_home();
-    bool in_run() const;
-    bool in_home() const;
-    bool home_prep_wait_echo() const;
-    uint16_t home_first_method() const;
-    uint16_t home_method_reg() const;
-    bool dual_limit_home() const;
-    void home_leg_done(uint32_t now);
     uint32_t link_timeout_ms() const;
     uint32_t home_timeout_ms() const;
-    void handle_run_link_failsafe(uint32_t now);
     uint16_t run_speed_rpm() const;
-    uint16_t calib_speed_rpm() const;
-    uint16_t calib_crawl_rpm() const;
-    int32_t center_target_pulses() const;
+    uint16_t home_seek_rpm() const;
+    uint16_t home_crawl_rpm() const;
+    uint16_t home_first_method() const;
+    uint16_t home_method_now() const;
+    uint16_t home_limit_bit() const;
+    int32_t expected_full_travel() const;
+    int32_t travel_limit_pulses() const;
+    int16_t backoff_signed_rpm() const;
+
     void send_u16(uint16_t reg, uint16_t value);
     void send_target_pos(int32_t target);
-    void queue_motion(uint16_t motion);
-    bool flush_queued_motion();
-    void finish_home();
-    void abort_home(const char *reason);
+    void send_read(uint16_t reg, uint16_t count, RxExpect expect);
+    void send_current();
+
+    void advance_after_echo();
+    void service(uint32_t now);
+    void bus_idle_poll(uint32_t now);
+    void evaluate_cal_wait(uint32_t now);
+    void evaluate_mid_wait(uint32_t now);
+    void evaluate_back_poll(uint32_t now);
+    void handle_run(uint32_t now, float steering_out);
+    void handle_run_link_failsafe(uint32_t now);
+
+    void start_home();
+    void begin_leg_prep();
+    void begin_mid();
+    void begin_backoff(const char *why);
+    void abort_home(const char *reason, bool estop);
+    void finish_cal();
+    void clear_cal_trig();
+
+    void poll_triggers();
+    bool rc_rising_edge(int8_t ch, bool &was_high) const;
 
     AP_HAL::UARTDriver *_uart = nullptr;
     uint32_t _last_send_ms = 0;
-    uint32_t _last_vect_ms = 0;
     uint32_t _last_rx_ms = 0;
     uint32_t _last_bus_ms = 0;
-    uint32_t _link_lost_candidate_ms = 0;
     uint32_t _rx_crc_err = 0;
-    uint32_t _home_start_ms = 0;
-    uint32_t _last_home_retry_ms = 0;
-    uint32_t _last_home_norx_ms = 0;
-    uint32_t _home_rx_lost_ms = 0;
-    uint32_t _last_home_progress_ms = 0;
-    uint32_t _last_button_ms = 0;
-    DriveState _state = DriveState::INIT_ENABLE;
+    uint32_t _cal_start_ms = 0;
+    uint32_t _leg_start_ms = 0;
+    uint32_t _last_progress_ms = 0;
+    uint32_t _back_start_ms = 0;
+
+    Phase _phase = Phase::INIT_ENABLE;
     RxExpect _rx_expect = RxExpect::NONE;
     uint8_t _init_attempts = 0;
+    bool _awaiting_echo = false;
     bool _got_echo = false;
-    bool _ever_got_rx = false;
-    uint32_t _last_echo_wait_ms = 0;
-    bool _have_target = false;
-    bool _alarm_clear_pending = false;
-    bool _enable_after_alarm_clear = false;
-    bool _pending_run_spd = false;
-    uint32_t _last_alarm_warn_ms = 0;
-    bool _home_pending = false;
     bool _homed = false;
-    bool _was_armed = false;
-    bool _rst_was_high = false;
-    bool _home_was_high = false;
     bool _got_status = false;
-    bool _saw_home_run = false;
-    bool _saw_home_motion = false;
-    bool _saw_home_clear = false;
-    bool _home_read_encoder = false;
     bool _got_di = false;
+    bool _saw_home_clear = false;
+    bool _saw_home_run = false;
+    bool _saw_limit = false;
+    bool _use_estop = false;
+    uint8_t _home_leg = 0;       // 0=first, 1=second
+    uint8_t _back_tries = 0;
+    uint8_t _run_poll_phase = 0;
     uint16_t _di_word = 0;
-    bool _di_log_inited = false;
-    uint16_t _di_log_word = 0;
-    uint16_t _di_raw_log = 0;
-    bool _home_center_run_spd = false;
-    uint8_t _home_center_prep = 0;
-    bool _center_resend = false;
-    int32_t _steer_cmd_offset = 0;
-    bool _speed_follow = false;
-    uint8_t _follow_prep = 0;
-    bool _follow_moving = false;
-    int8_t _follow_sign = 0;
-    uint8_t _follow_slot = 0;
-    uint8_t _follow_alarm_step = 0;
-    uint8_t _follow_restore = 0;
-    int32_t _follow_last_enc = 0;
-    int16_t _follow_last_spd = 0;
-    uint32_t _follow_progress_ms = 0;
-    uint16_t _queued_motion = 0;
-    bool _home_retry_pending = false;
-    bool _home_leg_settling = false;
-    uint32_t _home_leg_settle_ms = 0;
-    bool _center_step_settling = false;
-    uint32_t _center_step_settle_ms = 0;
-    int32_t _home_start_pulses = 0;
-    int32_t _leg_peak_travel = 0;
-    int8_t _leg_dir_sign = 0;
-    int32_t _center_move_target = 0;
-    int32_t _center_step_target = 0;
-    int32_t _center_encoder_origin = 0;
-    int32_t _measured_half_travel = 0;
-    uint8_t _home_leg = 0;
-    int32_t _leg1_travel = 0;
-    bool _follow_mid_retried = false;
-    bool _follow_halted = false;
-    uint8_t _follow_alarm_count = 0;
-    int32_t _follow_peak_toward = 0;
-    int32_t _follow_peak_at_alarm = 0;
-    int32_t _last_stick_log = 0;
-    uint8_t _run_poll_phase = 0; // 0=encoder, 1=status, 2=DI
+    uint16_t _status_word = 0;
     int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
-    uint16_t _status_word = 0;
+    int32_t _last_progress_enc = 0;
+    int32_t _leg1_travel = 0;
+    int32_t _leg_peak_travel = 0;
+    int32_t _measured_half_travel = 0;
+    int32_t _mid_target = 0;
+    int8_t _cal_trig_last = 0;
+    bool _cal_trig_inited = false;
+    bool _rst_was_high = false;
+    bool _cal_was_high = false;
+    bool _have_run_target = false;
+    bool _run_link_failsafe = false;
+    uint32_t _link_lost_candidate_ms = 0;
+    uint32_t _last_run_link_warn_ms = 0;
+    uint16_t _queued_motion = 0;
     uint8_t _rx_buf[64] {};
     uint8_t _rx_len = 0;
 
@@ -180,15 +187,11 @@ private:
     AP_Int8  rst_ch;
     AP_Int8  cal_ch;
     AP_Int8  cal_mth;
-    AP_Int16 home_speed;   // CL57R 0x0041 HOME_SPD (+ mid-return cruise)
+    AP_Int16 home_speed;
     AP_Int8  cal_trig;
     AP_Int8  cal_mode;
-    AP_Int16 crawl_speed;  // CL57R 0x0042 HOME_CRAWL (+ leave-limit crawl)
+    AP_Int16 crawl_speed;
     AP_Int16 link_timeout;
     AP_Int16 cal_timeout_s;
     AP_Int8  di_inv;
-    int8_t   _cal_trig_last = 0;
-    bool     _cal_trig_inited = false;
-    bool     _run_link_failsafe = false;
-    uint32_t _last_run_link_warn_ms = 0;
 };
