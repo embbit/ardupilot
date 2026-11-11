@@ -65,8 +65,8 @@ class Nema23Motor:
         return self.position + self.mech_offset
 
     def di_word(self):
-        # 0x0005: Bit1=X1 P-OT, Bit2=X2 N-OT.
-        # Match firmware: M17 seeks + toward X2 (N-OT); M18 seeks - toward X1 (P-OT).
+        # 0x0005: Bit1=X1 P-OT (positive end), Bit2=X2 N-OT (negative end),
+        # per vendor doc. M17 homes negative toward X2; M18 positive toward X1.
         if self.di_disabled:
             return 0
         if self.force_both_di:
@@ -75,17 +75,17 @@ class Nema23Motor:
         margin = max(int(SPEED_HARD_STOP * 0.05), 200)
         mech = self.mech_pos()
         if mech >= SPEED_HARD_STOP - margin:
-            word |= (1 << 2)  # X2 at positive hard stop (M17 target)
+            word |= (1 << 1)  # X1 at positive hard stop (M18 target)
         if mech <= -SPEED_HARD_STOP + margin:
-            word |= (1 << 1)  # X1 at negative hard stop (M18 target)
+            word |= (1 << 2)  # X2 at negative hard stop (M17 target)
         return word
 
     def home_limit_encoder_target(self):
         """Encoder-space target for native MOTION_HOME given current mech_offset."""
         if self.home_method == 18:
-            world = float(-SPEED_HARD_STOP)
-        else:
             world = float(SPEED_HARD_STOP)
+        else:
+            world = float(-SPEED_HARD_STOP)
         return int(round(world - self.mech_offset))
 
     def apply_native_home_zero(self):
@@ -205,11 +205,11 @@ class Nema23Motor:
             direction = 1.0 if self.max_rpm_signed >= 0 else -1.0
             target_vel = self.max_vel * direction
             # Limit switches block further travel into the stop, not leave.
-            # X1 at negative end → block more -vel; X2 at positive end → block +vel.
+            # X1=P-OT at positive end blocks +vel; X2=N-OT at negative end blocks -vel.
             di = self.di_word()
-            if (di & (1 << 1)) and target_vel < 0:
+            if (di & (1 << 1)) and target_vel > 0:
                 target_vel = 0.0
-            if (di & (1 << 2)) and target_vel > 0:
+            if (di & (1 << 2)) and target_vel < 0:
                 target_vel = 0.0
             if abs(self.velocity - target_vel) < 1.0:
                 self.velocity = target_vel
@@ -248,6 +248,22 @@ class Nema23Motor:
                 self.velocity = 0.0
             else:
                 self.position = new_pos
+            # Absolute-mode mechanical stop: clamp travel, and if still
+            # commanded beyond the stop the drive stalls and alarms
+            # (tracking error / OT), like the real CL57R.
+            mech = self.mech_pos()
+            if mech > SPEED_HARD_STOP:
+                self.position = float(SPEED_HARD_STOP - self.mech_offset)
+                self.velocity = 0.0
+                if self.driver_target > int(round(self.position)):
+                    self.raise_alarm()
+                    print(f"[CL57R Modbus Sim] ALARM raised (jammed at +stop) pos={int(self.position)} off={int(self.mech_offset)}")
+            elif mech < -SPEED_HARD_STOP:
+                self.position = float(-SPEED_HARD_STOP - self.mech_offset)
+                self.velocity = 0.0
+                if self.driver_target < int(round(self.position)):
+                    self.raise_alarm()
+                    print(f"[CL57R Modbus Sim] ALARM raised (jammed at -stop) pos={int(self.position)} off={int(self.mech_offset)}")
         else:
             self._coast(dt_s)
             new_pos = self.position + self.velocity * dt_s
@@ -293,8 +309,9 @@ class Nema23Motor:
         stop_dist = 0.5 * self.velocity * self.velocity / self.max_decel
 
         if direction * self.velocity < 0:
-            # Reversing: decelerate first
-            desired_accel = -direction * self.max_decel * self.inertia_factor
+            # Reversing: brake the current motion first (reflected inertia
+            # demands harder braking), then accelerate toward the target.
+            desired_accel = direction * self.max_decel * self.inertia_factor
         elif abs(error) <= abs(stop_dist) + abs(self.velocity) * dt_s:
             # Brake for target
             desired_accel = -direction * self.max_decel
@@ -439,7 +456,8 @@ def check_link_schedule(now):
 
 
 def poll_control_file(now):
-    """Apply one-shot commands from --control-file (DROP/ALARM/MUTE/UNMUTE/STALL/NODI)."""
+    """Apply one-shot commands from --control-file (see parse_args help)."""
+    global SPEED_HARD_STOP
     path = sim_state.get("control_file")
     if not path:
         return
@@ -499,6 +517,11 @@ def poll_control_file(now):
         elif cmd == "NOBOTHDI":
             motor.force_both_di = False
             print("[CL57R Modbus Sim] Control NOBOTHDI")
+        elif cmd == "SETSTOP" and len(parts) >= 2:
+            # Shrink the mechanical travel (e.g. linkage drift): the firmware
+            # still commands the calibrated range, so it now jams on the stop.
+            SPEED_HARD_STOP = int(float(parts[1]))
+            print(f"[CL57R Modbus Sim] Control SETSTOP {SPEED_HARD_STOP}")
         else:
             print(f"[CL57R Modbus Sim] Unknown control cmd: {line}")
 
@@ -544,7 +567,7 @@ def handle_write_single(reg_addr, val):
         motor.pending_cmd = 0
         motor.velocity = 0.0
         motor.home_done = False
-        print("[CL57R Modbus Sim] POSITION ZEROED")
+        print(f"[CL57R Modbus Sim] POSITION ZEROED off={int(motor.mech_offset)}")
     elif reg_addr == 0x0052:
         motor.track_err_limit = val
     elif reg_addr == 0x0036 and (val & 0x0010):
@@ -618,7 +641,6 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
     raw_buffer = bytearray()
     last_log_time = time.time()
     last_physics_time = time.time()
-    saw_enable = False
     enable_writes = 0
 
     while True:
@@ -680,9 +702,8 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                             enable_writes += 1
                             sim_state["init_count"] = enable_writes
                             print(f"[CL57R Modbus Sim] INIT #{enable_writes} motor enable")
-                            saw_enable = True
                         elif reg_addr == 0x0038 and val == 0x0000:
-                            saw_enable = False
+                            pass
                         response.extend(req[:6])
 
                     elif func_code == 0x10:
@@ -770,7 +791,8 @@ def parse_args():
     parser.add_argument("--mute-reads", action="store_true",
                         help="Ack writes but never reply to 0x03 (encoder/status)")
     parser.add_argument("--control-file", type=str, default=None,
-                        help="Path polled for runtime cmds: DROP <s>, ALARM [pos], MUTE, UNMUTE")
+                        help="Path polled for runtime cmds: DROP <s>, ALARM [pos], MUTE, UNMUTE, "
+                             "STALL/UNSTALL, NODI/DI, BOTHDI/NOBOTHDI, SETSTOP <pulses>")
     return parser.parse_args()
 
 
