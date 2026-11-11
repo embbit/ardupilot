@@ -43,7 +43,7 @@ constexpr uint16_t DI_LIMIT_MASK = (DI_X1 | DI_X2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
 constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
-constexpr uint16_t TRACK_ERR_LIMIT = 65535;
+constexpr int32_t TRACK_ERR_DEFAULT = 4000;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t ECHO_TIMEOUT_MS = 300;
 constexpr uint8_t INIT_MAX_ATTEMPTS = 8;
@@ -54,6 +54,9 @@ constexpr uint32_t STALL_WINDOW_MS = 800;
 constexpr int32_t STALL_MIN_PULSES = 80;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
 constexpr int32_t MID_POS_TOL = 800;
+// Ignore mid-run completion for a while: the status word can be stale from
+// the home leg (in_pos/home_done set at leg completion) right after MID_RUN.
+constexpr uint32_t MID_SETTLE_MS = 1000;
 constexpr uint32_t BACK_MAX_MS = 4000;
 constexpr int32_t BACK_RELEASE_PULSES = 1500;
 constexpr int32_t BACK_CAP_PULSES = 12000;
@@ -182,7 +185,7 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
 
     // @Param: LINK_TO
     // @DisplayName: Modbus link timeout
-    // @Description: No Modbus bus activity for this many ms fails link_ok(). 0 uses 2000 ms for link_ok only.
+    // @Description: No valid Modbus reply for this many ms fails link_ok() (CRC-corrupt traffic does not count). 0 uses 2000 ms for link_ok only.
     // @Units: ms
     // @Range: 0 30000
     // @User: Standard
@@ -202,6 +205,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @Values: 0:Normal,1:InvertX1X2
     // @User: Standard
     AP_GROUPINFO("DI_INV", 19, AP_ModbusSteering, di_inv, 0),
+
+    // @Param: TRK_ERR
+    // @DisplayName: Drive tracking-error limit
+    // @Description: Written to CL57R 0x0052. Following error beyond this many pulses raises a drive alarm (e.g. rudder jammed on the mechanical stop). Smaller trips faster.
+    // @Units: pulses
+    // @Range: 100 65535
+    // @User: Standard
+    AP_GROUPINFO("TRK_ERR", 20, AP_ModbusSteering, track_err_limit, TRACK_ERR_DEFAULT),
 
     AP_GROUPEND
 };
@@ -242,13 +253,8 @@ bool AP_ModbusSteering::link_ok() const
     const uint32_t to = link_timeout_ms();
     const uint32_t limit = (to > 0U) ? to : LINK_OK_DEFAULT_MS;
     const uint32_t now = AP_HAL::millis();
-    if ((now - _last_rx_ms) <= limit) {
-        return true;
-    }
-    if (_last_bus_ms != 0U && (now - _last_bus_ms) <= limit) {
-        return true;
-    }
-    return false;
+    // Only a valid frame proves the link; CRC-garbage bus noise does not.
+    return (now - _last_rx_ms) <= limit;
 }
 
 uint16_t AP_ModbusSteering::run_speed_rpm() const
@@ -436,20 +442,15 @@ void AP_ModbusSteering::consume_rx()
         const uint16_t received_crc = (_rx_buf[offset + frame_len - 1] << 8) | _rx_buf[offset + frame_len - 2];
         if (modbus_crc16(&_rx_buf[offset], frame_len - 2) != received_crc) {
             _rx_crc_err++;
-            _last_bus_ms = AP_HAL::millis();
             offset++;
             continue;
         }
 
         _last_rx_ms = AP_HAL::millis();
-        _last_bus_ms = _last_rx_ms;
 
         const uint8_t fn = _rx_buf[offset + 1];
-        if (fn == 0x06 || fn == 0x10 || (fn & 0x80) != 0) {
-            // Keep _awaiting_echo set until advance_after_echo() consumes it;
-            // clearing here skipped the advance path and spun forever on INIT.
-            _got_echo = true;
-            if ((fn & 0x80) != 0 && frame_len >= 3) {
+        if ((fn & 0x80) != 0) {
+            if (frame_len >= 3) {
                 static uint32_t last_ex_ms;
                 const uint32_t tnow = AP_HAL::millis();
                 if (last_ex_ms == 0 || (tnow - last_ex_ms) > 2000) {
@@ -458,6 +459,18 @@ void AP_ModbusSteering::consume_rx()
                                   "CL57R: Modbus ex fn=0x%02x code=%u",
                                   (unsigned)fn, (unsigned)_rx_buf[offset + 2]);
                 }
+            }
+            // Slave rejected the write: the phase must not advance on it.
+            if (_awaiting_echo) {
+                _got_exception = true;
+            }
+        } else if (fn == 0x06 || fn == 0x10) {
+            // Keep _awaiting_echo set until advance_after_echo() consumes it;
+            // clearing here skipped the advance path and spun forever on INIT.
+            // Only accept while a write is outstanding, so a late duplicate
+            // echo cannot advance the phase a second time.
+            if (_awaiting_echo) {
+                _got_echo = true;
             }
         } else if (fn == 0x03 && frame_len >= 7) {
             const uint8_t byte_count = _rx_buf[offset + 2];
@@ -527,7 +540,7 @@ void AP_ModbusSteering::send_current()
         send_u16(REG_POS_MODE, 0x0001);
         break;
     case Phase::INIT_TRACK_ERR:
-        send_u16(REG_TRACK_ERR, TRACK_ERR_LIMIT);
+        send_u16(REG_TRACK_ERR, (uint16_t)constrain_int32(track_err_limit.get(), 100, 65535));
         break;
 
     case Phase::CAL_STOP:
@@ -590,6 +603,9 @@ void AP_ModbusSteering::send_current()
     case Phase::RUN_STOP:
         send_u16(REG_MOTION, MOTION_STOP);
         break;
+    case Phase::IDLE_SET_SPD:
+        send_u16(REG_MAX_SPD, run_speed_rpm());
+        break;
 
     case Phase::IDLE_UNCAL:
     case Phase::IDLE_READY:
@@ -603,6 +619,7 @@ void AP_ModbusSteering::send_current()
 void AP_ModbusSteering::advance_after_echo()
 {
     _got_echo = false;
+    _got_exception = false;
     _awaiting_echo = false;
     _init_attempts = 0;
 
@@ -694,7 +711,8 @@ void AP_ModbusSteering::advance_after_echo()
         _leg_start_ms = AP_HAL::millis();
         break;
     case Phase::MID_ZERO:
-        finish_cal();
+        // Mid zero done; restore armed run speed before declaring ready.
+        _phase = Phase::IDLE_SET_SPD;
         break;
 
     case Phase::BACK_STOP:
@@ -733,6 +751,9 @@ void AP_ModbusSteering::advance_after_echo()
         break;
     case Phase::RUN_STOP:
         _phase = Phase::IDLE_READY;
+        break;
+    case Phase::IDLE_SET_SPD:
+        finish_cal();
         break;
 
     case Phase::IDLE_UNCAL:
@@ -830,6 +851,7 @@ void AP_ModbusSteering::finish_cal()
     _homed = true;
     _have_run_target = false;
     _run_link_failsafe = false;
+    _run_limit_hold = false;
     _phase = Phase::IDLE_READY;
     _awaiting_echo = false;
     _got_echo = false;
@@ -927,6 +949,10 @@ void AP_ModbusSteering::evaluate_mid_wait(uint32_t now)
         abort_home("alarm on mid", true);
         return;
     }
+    if ((now - _leg_start_ms) < MID_SETTLE_MS) {
+        // Status word may still reflect the completed home leg here.
+        return;
+    }
     const bool in_pos = (_status_word & 0x0001U) != 0;
     const int32_t err = abs(_actual_pulses - _mid_target);
     if (in_pos || err <= MID_POS_TOL) {
@@ -996,9 +1022,7 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
         return;
     }
     const uint32_t good_age = now - _last_rx_ms;
-    const uint32_t bus_ms = (_last_bus_ms != 0U) ? _last_bus_ms : _last_rx_ms;
-    const uint32_t bus_age = now - bus_ms;
-    if (good_age <= to || bus_age <= to) {
+    if (good_age <= to) {
         _link_lost_candidate_ms = 0;
         if (_run_link_failsafe) {
             _run_link_failsafe = false;
@@ -1062,6 +1086,26 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     const int32_t limit = travel_limit_pulses();
     const float stick = constrain_float(steering_out, -1.0f, 1.0f);
     const int32_t target = (int32_t)(stick * (float)limit);
+
+    // Hard backstop: never command motion further into an active limit
+    // input. X1 (P-OT) guards the positive end, X2 (N-OT) the negative end.
+    const bool into_pos_stop = (_di_word & DI_X1) != 0 && target > _actual_pulses;
+    const bool into_neg_stop = (_di_word & DI_X2) != 0 && target < _actual_pulses;
+    if (into_pos_stop || into_neg_stop) {
+        if (!_run_limit_hold) {
+            _run_limit_hold = true;
+            _phase = Phase::RUN_STOP;
+            _awaiting_echo = false;
+            _got_echo = false;
+            _init_attempts = 0;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "CL57R: limit DI hit in run, hold (di=%04x enc=%d)",
+                          (unsigned)_di_word, (int)_actual_pulses);
+        }
+        return;
+    }
+    _run_limit_hold = false;
+
     const int32_t db = pos_db.get();
     const bool need_write = !_have_run_target ||
                             (db <= 0 ? (target != _last_target)
@@ -1102,6 +1146,19 @@ void AP_ModbusSteering::service(uint32_t now)
 
     if (_got_echo) {
         advance_after_echo();
+        return;
+    }
+
+    if (_got_exception) {
+        // The slave rejected the last write. In cal this is fatal for the
+        // leg; elsewhere the phase is simply resent on the next tick.
+        _got_exception = false;
+        _awaiting_echo = false;
+        _init_attempts = 0;
+        if (in_cal()) {
+            abort_home("Modbus exception", false);
+            return;
+        }
         return;
     }
 

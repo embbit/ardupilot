@@ -70,6 +70,9 @@ private:
         RUN_TARGET,
         RUN_MOTION,
         RUN_STOP,
+
+        // Post-cal: restore armed run speed in REG_MAX_SPD before IDLE_READY.
+        IDLE_SET_SPD,
     };
 
     enum class RxExpect : uint8_t {
@@ -132,7 +135,6 @@ private:
     AP_HAL::UARTDriver *_uart = nullptr;
     uint32_t _last_send_ms = 0;
     uint32_t _last_rx_ms = 0;
-    uint32_t _last_bus_ms = 0;
     uint32_t _rx_crc_err = 0;
     uint32_t _cal_start_ms = 0;
     uint32_t _leg_start_ms = 0;
@@ -144,6 +146,7 @@ private:
     uint8_t _init_attempts = 0;
     bool _awaiting_echo = false;
     bool _got_echo = false;
+    bool _got_exception = false;
     bool _homed = false;
     bool _got_status = false;
     bool _got_di = false;
@@ -169,6 +172,7 @@ private:
     bool _cal_was_high = false;
     bool _have_run_target = false;
     bool _run_link_failsafe = false;
+    bool _run_limit_hold = false;
     uint32_t _link_lost_candidate_ms = 0;
     uint32_t _last_run_link_warn_ms = 0;
     uint16_t _queued_motion = 0;
@@ -194,4 +198,5 @@ private:
     AP_Int16 link_timeout;
     AP_Int16 cal_timeout_s;
     AP_Int8  di_inv;
+    AP_Int32 track_err_limit;
 };
