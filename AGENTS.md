@@ -1,3 +1,31 @@
+# Quota & Context Optimization Rules (`ardupilot` — Rover / Custom Drivers)
+
+## Primary Working Area (Focus Here First)
+1. **Target Custom Drivers (Highest Priority):**
+   - `libraries/AP_ModbusSteering/`
+   - `libraries/AP_FarDriverThrottle/`
+   Always start code searches, analysis, and edits inside these two folders first.
+2. **Target Vehicle:**
+   - `Rover/` — the **only** active vehicle firmware for this project. Ignore all other vehicle folders.
+3. **Helper & Test Scripts (Root):**
+   - `MB_RTU_Slave.py`, `fardriver_udp_listener.py`, `outb_steer_sim.py`, `outb_throttle_sim.py`, `throttle_steering_check.py`, `ports.parm`, `mav_0_1.parm`.
+
+## Secondary Shared Libraries (Read Only When Referenced)
+- `libraries/` (e.g., `AP_HAL`, `AP_Motors`, `AP_SerialManager`, `SRV_Channel`) — inspect only specific header/source files directly included or called by `AP_ModbusSteering`, `AP_FarDriverThrottle`, or `Rover/`.
+
+## Strict Rules (Save Quota)
+1. **Excluded Paths (Never Read or Search):**
+   - Other vehicles: `ArduCopter/`, `ArduPlane/`, `ArduSub/`, `Blimp/`, `AntennaTracker/`
+   - Build & submodules: `build/`, `modules/`, `logs/`, `tests/`, `benchmarks/`, `docs/`
+   - System/binary artifacts: `.git/`, `__pycache__/`, `*.bin`, `eeprom.bin`
+2. **Targeted Reading:** Never read entire files over 250 lines. Use `grep` inside `libraries/AP_ModbusSteering/`, `libraries/AP_FarDriverThrottle/`, or `Rover/` first, then read only 50–100 lines around the target.
+3. **Minimal Output:** Show only targeted code diffs/patches instead of rewriting entire `.cpp` or `.h` files. Keep explanations brief (1–2 sentences).
+4. **No Recursive Repo Scans:** Never run `find`, `tree`, or recursive `ls` across `ardupilot/` or the whole `libraries/` directory.
+5. **Confirm Heavy Commands:** Ask before running `./waf rover`, `./waf configure`, or `sim_vehicle.py -v Rover`, as build/SITL logs consume huge context.
+
+
+
+
 # AI Contribution Guidelines for ArduPilot
 
 This document provides guidelines for AI assistants (ChatGPT, Claude, Copilot, Gemini, or any LLM-based tool) contributing code to the ArduPilot project. These rules supplement the existing [CONTRIBUTING.md](.github/CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — both of which apply fully to AI-assisted contributions.
