@@ -1102,6 +1102,8 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
                           "CL57R: limit DI hit in run, hold (di=%04x enc=%d)",
                           (unsigned)_di_word, (int)_actual_pulses);
         }
+        // Keep polling: a silent link here would flap the run-link failsafe.
+        bus_idle_poll(now);
         return;
     }
     _run_limit_hold = false;

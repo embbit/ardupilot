@@ -1313,6 +1313,9 @@ def run_limit_hit():
         if not any("limit DI hit in run" in t for t in events):
             print("FAIL: no DI backstop warning at full stick into the stop")
             return 1
+        if any("Modbus link lost" in t or "Modbus link still down" in t for t in events):
+            print("FAIL: link failsafe flapped while the backstop held")
+            return 1
         if any("ALARM raised" in line for line in sim_lines[n_full:]):
             print("FAIL: drive jammed despite DI backstop")
             return 1
