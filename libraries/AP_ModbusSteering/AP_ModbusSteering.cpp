@@ -40,8 +40,7 @@ constexpr uint16_t DI_X1 = (1U << 1);
 constexpr uint16_t DI_X2 = (1U << 2);
 constexpr uint16_t DI_LIMIT_MASK = (DI_X1 | DI_X2);
 constexpr uint16_t SUBDIVISION_PPR = 4000;
-constexpr uint16_t ACCEL_DEFAULT = 200;
-constexpr uint16_t DECEL_DEFAULT = 200;
+constexpr uint16_t ACCEL_MS_DEFAULT = 1000;
 constexpr int32_t TRACK_ERR_DEFAULT = 4000;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
 constexpr uint32_t READ_TIMEOUT_MS = 150;
@@ -214,6 +213,14 @@ const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
     // @Range: 100 65535
     // @User: Standard
     AP_GROUPINFO("TRK_ERR", 20, AP_ModbusSteering, track_err_limit, TRACK_ERR_DEFAULT),
+
+    // @Param: ACC_MS
+    // @DisplayName: Drive accel/decel time
+    // @Description: Written to CL57R 0x0031/0x0032. Short ramps at full run speed over-current the motor on a heavy rudder and the drive faults (resetting its position register).
+    // @Units: ms
+    // @Range: 100 2000
+    // @User: Standard
+    AP_GROUPINFO("ACC_MS", 23, AP_ModbusSteering, acc_ms, ACCEL_MS_DEFAULT),
 
     AP_GROUPEND
 };
@@ -448,6 +455,20 @@ void AP_ModbusSteering::write_all(const uint8_t *buf, uint16_t len)
     }
 }
 
+void AP_ModbusSteering::send_ff(uint16_t reg, uint16_t value)
+{
+    if (_uart == nullptr) {
+        return;
+    }
+    // Fire-and-forget write: used for the run follow, where waiting for an
+    // echo per speed update halves the control bandwidth and the loop goes
+    // unstable at full run speed. The reply still refreshes _last_rx_ms.
+    uint8_t tx_packet[8];
+    modbus_create_write_packet((uint8_t)slave_id.get(), reg, value, tx_packet);
+    write_all(tx_packet, 8);
+    _last_send_ms = AP_HAL::millis();
+}
+
 void AP_ModbusSteering::consume_rx()
 {
     if (_uart == nullptr) {
@@ -517,6 +538,10 @@ void AP_ModbusSteering::consume_rx()
             const uint8_t byte_count = _rx_buf[offset + 2];
             if (_rx_expect == RxExpect::STATUS && byte_count >= 2) {
                 _status_word = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
+                if (byte_count >= 4) {
+                    // Second register is the drive error code (0x0004).
+                    _err_code = (uint16_t)((_rx_buf[offset + 5] << 8) | _rx_buf[offset + 6]);
+                }
                 _got_status = true;
             } else if (_rx_expect == RxExpect::DI_INPUT && byte_count >= 2) {
                 const uint16_t raw = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
@@ -572,10 +597,10 @@ void AP_ModbusSteering::send_current()
         send_u16(REG_MAX_SPD, run_speed_rpm());
         break;
     case Phase::INIT_ACCEL:
-        send_u16(REG_ACCEL, ACCEL_DEFAULT);
+        send_u16(REG_ACCEL, (uint16_t)constrain_int16(acc_ms.get(), 100, 2000));
         break;
     case Phase::INIT_DECEL:
-        send_u16(REG_DECEL, DECEL_DEFAULT);
+        send_u16(REG_DECEL, (uint16_t)constrain_int16(acc_ms.get(), 100, 2000));
         break;
     case Phase::INIT_ABS_MODE:
         send_u16(REG_POS_MODE, 0x0001);
@@ -613,7 +638,7 @@ void AP_ModbusSteering::send_current()
         send_u16(REG_HOME_CRAWL, home_crawl_rpm());
         break;
     case Phase::CAL_HOME_ACCEL:
-        send_u16(REG_HOME_ACCEL, ACCEL_DEFAULT);
+        send_u16(REG_HOME_ACCEL, (uint16_t)constrain_int16(acc_ms.get(), 100, 2000));
         break;
     case Phase::CAL_START_HOME:
         send_u16(REG_MOTION, MOTION_HOME);
@@ -635,12 +660,6 @@ void AP_ModbusSteering::send_current()
         send_u16(REG_MAX_SPD, (uint16_t)backoff_signed_rpm());
         break;
     case Phase::BACK_START:
-        send_u16(REG_MOTION, MOTION_SPEED);
-        break;
-    case Phase::RUN_FOLLOW_SPD:
-        send_u16(REG_MAX_SPD, (uint16_t)_follow_rpm_pending);
-        break;
-    case Phase::RUN_FOLLOW_GO:
         send_u16(REG_MOTION, MOTION_SPEED);
         break;
     case Phase::RUN_STOP:
@@ -796,18 +815,6 @@ void AP_ModbusSteering::advance_after_echo()
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: cal aborted -> idle");
         break;
 
-    case Phase::RUN_FOLLOW_SPD:
-        if (_follow_need_go) {
-            _phase = Phase::RUN_FOLLOW_GO;
-        } else {
-            _phase = Phase::IDLE_READY;
-        }
-        break;
-    case Phase::RUN_FOLLOW_GO:
-        _follow_moving = true;
-        _follow_need_go = false;
-        _phase = Phase::IDLE_READY;
-        break;
     case Phase::RUN_STOP:
         _phase = Phase::IDLE_READY;
         break;
@@ -865,6 +872,19 @@ void AP_ModbusSteering::begin_mid()
     // This CL57R ignores absolute positioning starts after native home, so
     // the mid run is speed-mode follow (see evaluate_mid_follow).
     _use_estop = false;
+    // Record which limit input guards which encoder end, proven by the leg
+    // that just completed: leg2 ended in the _leg_dir direction at the
+    // switch selected by its home method. The run backstop uses this map
+    // instead of assuming the wiring matches the register documentation.
+    const uint16_t near_bit = limit_bit_for_method(home_method_now());
+    const uint16_t other_bit = (near_bit == DI_X1) ? DI_X2 : DI_X1;
+    if (_leg_dir < 0) {
+        _neg_end_bit = near_bit;
+        _pos_end_bit = other_bit;
+    } else {
+        _pos_end_bit = near_bit;
+        _neg_end_bit = other_bit;
+    }
     _phase = Phase::MID_STOP;
     _awaiting_echo = false;
     _got_echo = false;
@@ -916,7 +936,6 @@ void AP_ModbusSteering::finish_cal()
     // here would kick the follow into a spurious correction run).
     _actual_pulses = 0;
     _follow_moving = false;
-    _follow_need_go = false;
     _follow_sign = 0;
     _run_link_failsafe = false;
     _run_limit_hold = false;
@@ -1120,7 +1139,7 @@ void AP_ModbusSteering::bus_idle_poll(uint32_t now)
         _run_poll_phase = 1;
         break;
     case 1:
-        send_read(REG_STATUS, 1, RxExpect::STATUS);
+        send_read(REG_STATUS, 2, RxExpect::STATUS);
         _run_poll_phase = 2;
         break;
     default:
@@ -1163,7 +1182,6 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
     if (!_run_link_failsafe) {
         _run_link_failsafe = true;
         _follow_moving = false;
-        _follow_need_go = false;
         _follow_sign = 0;
         _phase = Phase::RUN_STOP;
         _awaiting_echo = false;
@@ -1199,9 +1217,7 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         return;
     }
 
-    if (_phase == Phase::RUN_FOLLOW_SPD ||
-        _phase == Phase::RUN_FOLLOW_GO ||
-        _phase == Phase::RUN_STOP) {
+    if (_phase == Phase::RUN_STOP) {
         // Write sequence driven by the echo path in service(). Do not poll
         // here: a read would win the 50 ms send slot every tick and starve
         // the pending write forever.
@@ -1213,14 +1229,15 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     const int32_t target = (int32_t)(stick * (float)limit);
 
     // Hard backstop: never command motion further into an active limit
-    // input. X1 (P-OT) guards the positive end, X2 (N-OT) the negative end.
-    const bool into_pos_stop = (_di_word & DI_X1) != 0 && target > _actual_pulses;
-    const bool into_neg_stop = (_di_word & DI_X2) != 0 && target < _actual_pulses;
+    // input. Which input guards which end is learned from calibration
+    // (_pos_end_bit/_neg_end_bit) — the wiring may not match the register
+    // documentation.
+    const bool into_pos_stop = (_di_word & _pos_end_bit) != 0 && target > _actual_pulses;
+    const bool into_neg_stop = (_di_word & _neg_end_bit) != 0 && target < _actual_pulses;
     if (into_pos_stop || into_neg_stop) {
         if (!_run_limit_hold) {
             _run_limit_hold = true;
             _follow_moving = false;
-            _follow_need_go = false;
             _follow_sign = 0;
             _phase = Phase::RUN_STOP;
             _awaiting_echo = false;
@@ -1236,47 +1253,44 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     }
     _run_limit_hold = false;
 
-    // Speed-mode follow: this CL57R ignores absolute positioning starts, so
-    // the shaft is servoed through signed MAX_SPD + MOTION_SPEED (as v13).
-    // Control loops are slow (encoder polls plus echo-paced writes, ~0.5 s
-    // worst case), so full speed is only used outside a brake window; inside
-    // it the speed is ~0.6*err/s, which converges with margin.
+    // Speed-mode follow: this CL57R ignores absolute positioning starts and
+    // also pays no attention to MAX_SPD changes while speed mode is running,
+    // so the move is chunked: a fast leg that ends with an explicit STOP
+    // while still far enough to coast in, then a creep leg that stops in the
+    // arrive window. Every speed takes effect because it is written at a
+    // start (or re-start), never mid-run.
     const int32_t err = target - _actual_pulses;
     const int32_t abs_err = abs(err);
     const int32_t arrive = MAX(pos_db.get(), (int32_t)800);
     const int32_t fast_v = (int32_t)run_speed_rpm() * CL57R_STEPS_PER_REV / 60;
-    // Full speed only well outside this window: it must cover at least 2-3
-    // poll+write cycles (~1 s of travel at run speed), otherwise the shaft
-    // reaches the target before the first downshift write lands.
-    const int32_t brake_window = MAX((int32_t)20000, fast_v * 3 / 4);
-    int16_t rpm;
-    if (abs_err > brake_window) {
-        rpm = (int16_t)run_speed_rpm();
-    } else {
-        rpm = (int16_t)MAX((int16_t)FOLLOW_MIN_RPM, (int16_t)(abs_err * 60 / 4000));
-        rpm = (int16_t)MIN((int16_t)run_speed_rpm(), rpm);
-    }
+    // Coast after a STOP: decel time (200 ms) plus worst-case loop latency.
+    const int32_t fast_coast = fast_v / 10 + fast_v * 2 / 5;
+    const int16_t creep_rpm_cap = (int16_t)MAX((int16_t)FOLLOW_MIN_RPM, (int16_t)(abs_err * 60 / 6000));
+    const int32_t crawl_v = (int32_t)MIN((int16_t)run_speed_rpm(), creep_rpm_cap) * CL57R_STEPS_PER_REV / 60;
+    const int32_t crawl_coast = MAX((int32_t)arrive, crawl_v / 10 + crawl_v * 2 / 5);
 
     if (_follow_moving) {
-        if (abs_err <= arrive) {
-            _follow_moving = false;
-            _follow_sign = 0;
-            _phase = Phase::RUN_STOP;
-            _awaiting_echo = false;
-            _got_echo = false;
-            _init_attempts = 0;
-            return;
-        }
         const int8_t want_sign = (err > 0) ? 1 : -1;
         if (want_sign != _follow_sign) {
-            // Soft stop before reversing — avoids a harsh direction flip.
+            // Soft stop before reversing.
+            send_ff(REG_MOTION, MOTION_STOP);
             _follow_moving = false;
             _follow_sign = 0;
-            _phase = Phase::RUN_STOP;
-            _awaiting_echo = false;
-            _got_echo = false;
-            _init_attempts = 0;
+            _follow_fast = false;
             return;
+        }
+        if (_follow_fast) {
+            if (abs_err <= fast_coast) {
+                // End the fast leg now and let it coast into the creep zone.
+                send_ff(REG_MOTION, MOTION_STOP);
+                _follow_moving = false;
+                _follow_fast = false;
+                _follow_sign = 0;
+            }
+        } else if (abs_err <= crawl_coast) {
+            send_ff(REG_MOTION, MOTION_STOP);
+            _follow_moving = false;
+            _follow_sign = 0;
         }
         if ((now - _follow_progress_ms) > FOLLOW_REASSERT_MS) {
             _follow_progress_ms = now;
@@ -1284,23 +1298,8 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
             _follow_last_enc = _actual_pulses;
             if (moved < FOLLOW_MIN_MOVE_PULSES) {
                 // Drive dropped speed mode — reassert without reversing.
-                _follow_need_go = true;
-                _phase = Phase::RUN_FOLLOW_GO;
-                _awaiting_echo = false;
-                _got_echo = false;
-                _init_attempts = 0;
-                return;
+                send_ff(REG_MOTION, MOTION_SPEED);
             }
-        }
-        const int16_t signed_rpm = (int16_t)(rpm * _follow_sign);
-        if (abs(signed_rpm - _follow_last_rpm) >= FOLLOW_RPM_UPDATE) {
-            _follow_rpm_pending = signed_rpm;
-            _follow_last_rpm = signed_rpm;
-            _phase = Phase::RUN_FOLLOW_SPD;
-            _awaiting_echo = false;
-            _got_echo = false;
-            _init_attempts = 0;
-            return;
         }
         bus_idle_poll(now);
         return;
@@ -1311,20 +1310,25 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         return;
     }
 
-    // Start the follow toward the target.
+    // Start a leg: full speed only while far enough to coast in safely,
+    // otherwise creep at ~0.4*err/s (capped by MAX_SPD).
     const int8_t want_sign = (err > 0) ? 1 : -1;
-    _follow_rpm_pending = (int16_t)(rpm * want_sign);
-    _follow_last_rpm = _follow_rpm_pending;
+    int16_t rpm;
+    if (abs_err > fast_coast * 2) {
+        rpm = (int16_t)run_speed_rpm();
+        _follow_fast = true;
+    } else {
+        rpm = creep_rpm_cap;
+        rpm = (int16_t)MIN((int16_t)run_speed_rpm(), rpm);
+        _follow_fast = false;
+    }
+    send_ff(REG_MAX_SPD, (uint16_t)((int16_t)(rpm * want_sign)));
+    send_ff(REG_MOTION, MOTION_SPEED);
+    _follow_last_rpm = (int16_t)(rpm * want_sign);
     _follow_sign = want_sign;
     _follow_progress_ms = now;
     _follow_last_enc = _actual_pulses;
-    _follow_need_go = true;
-    _phase = Phase::RUN_FOLLOW_SPD;
-    _awaiting_echo = false;
-    _got_echo = false;
-    _init_attempts = 0;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: follow start rpm=%d tgt=%d enc=%d",
-                  (int)_follow_rpm_pending, (int)target, (int)_actual_pulses);
+    _follow_moving = true;
 }
 
 void AP_ModbusSteering::service(uint32_t now)

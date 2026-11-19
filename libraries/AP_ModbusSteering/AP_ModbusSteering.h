@@ -23,17 +23,16 @@ public:
     bool alarmed() const { return (_status_word & (1U << 3)) != 0; }
     bool link_ok() const;
     int32_t debug_enc() const { return _actual_pulses; }
-    uint16_t debug_status() const { return (uint16_t)(_status_word | ((uint16_t)_phase << 8)); }
+    uint32_t debug_status() const { return (uint32_t)(_status_word | (_err_code << 8)); }
     uint32_t debug_txstate(uint32_t now) const
     {
-        const uint32_t age = (now - _last_send_ms) / 10;
-        const uint32_t age_capped = (age > 255) ? 255 : age;
+        (void)now;
         return (uint32_t)(_awaiting_echo ? 1 : 0) |
                (_got_echo ? 2 : 0) |
                (_got_exception ? 4 : 0) |
                ((uint32_t)_rx_expect << 3) |
                ((uint32_t)_init_attempts << 8) |
-               (age_capped << 16);
+               ((uint32_t)_phase << 16);
     }
 
     static const struct AP_Param::GroupInfo var_info[];
@@ -81,8 +80,6 @@ private:
         ABORT_STOP,
 
         IDLE_READY,
-        RUN_FOLLOW_SPD,
-        RUN_FOLLOW_GO,
         RUN_STOP,
 
         // Post-cal: restore armed run speed in REG_MAX_SPD before IDLE_READY.
@@ -102,8 +99,6 @@ private:
     }
     bool in_run() const {
         return _phase == Phase::IDLE_READY ||
-               _phase == Phase::RUN_FOLLOW_SPD ||
-               _phase == Phase::RUN_FOLLOW_GO ||
                _phase == Phase::RUN_STOP;
     }
 
@@ -127,6 +122,7 @@ private:
 
     void send_u16(uint16_t reg, uint16_t value);
     void write_all(const uint8_t *buf, uint16_t len);
+    void send_ff(uint16_t reg, uint16_t value);
     void send_read(uint16_t reg, uint16_t count, RxExpect expect);
     void send_current();
 
@@ -178,6 +174,7 @@ private:
     uint8_t _run_poll_phase = 0;
     uint16_t _di_word = 0;
     uint16_t _status_word = 0;
+    uint16_t _err_code = 0;
     int32_t _actual_pulses = 0;
     int32_t _last_progress_enc = 0;
     int32_t _leg1_travel = 0;
@@ -190,6 +187,8 @@ private:
     int32_t _mid_traveled = 0;
     int8_t _mid_dir = 0;
     bool _mid_slow = false;
+    uint8_t _pos_end_bit = 0x02;  // limit input at the encoder-positive end (set by cal)
+    uint8_t _neg_end_bit = 0x04;  // limit input at the encoder-negative end (set by cal)
     int8_t _cal_trig_last = 0;
     bool _cal_trig_inited = false;
     bool _rst_was_high = false;
@@ -197,9 +196,8 @@ private:
     bool _run_link_failsafe = false;
     bool _run_limit_hold = false;
     bool _follow_moving = false;
-    bool _follow_need_go = false;
+    bool _follow_fast = false;
     int8_t _follow_sign = 0;
-    int16_t _follow_rpm_pending = 0;
     int16_t _follow_last_rpm = 0;
     uint32_t _follow_progress_ms = 0;
     int32_t _follow_last_enc = 0;
@@ -228,4 +226,5 @@ private:
     AP_Int16 cal_timeout_s;
     AP_Int8  di_inv;
     AP_Int32 track_err_limit;
+    AP_Int16 acc_ms;
 };
