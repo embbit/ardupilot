@@ -603,6 +603,8 @@ void Rover::modbus_steering_update()
         gcs().send_named_float("MB_ENC", (float)modbus_steering.debug_enc());
         gcs().send_named_float("MB_ST", (float)modbus_steering.debug_status());
         gcs().send_named_float("MB_DBG", (float)modbus_steering.debug_txstate(now_ms));
+        gcs().send_named_float("MB_DI", (float)modbus_steering.debug_di());
+        gcs().send_named_float("MB_TGT", (float)modbus_steering.debug_follow_target());
     }
 }
 
