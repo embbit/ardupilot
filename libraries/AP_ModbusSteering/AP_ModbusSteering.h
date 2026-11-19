@@ -156,6 +156,7 @@ private:
 
     void poll_triggers();
     bool rc_rising_edge(int8_t ch, bool &was_high) const;
+    bool rc_override_active() const;
 
     AP_HAL::UARTDriver *_uart = nullptr;
     uint32_t _last_send_ms = 0;
@@ -199,10 +200,12 @@ private:
     int8_t _mid_dir = 0;
     bool _mid_slow = false;
     bool _mid_zero_sent = false;
+    bool _cal_alarm_stop_next = false;
     uint8_t _pos_end_bit = 0x02;  // limit input at the encoder-positive end (set by cal)
     uint8_t _neg_end_bit = 0x04;  // limit input at the encoder-negative end (set by cal)
     int8_t _cal_trig_last = 0;
     bool _cal_trig_inited = false;
+    bool _rc_override_seen = false;
     bool _rst_was_high = false;
     bool _cal_was_high = false;
     bool _run_link_failsafe = false;

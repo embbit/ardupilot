@@ -1126,8 +1126,15 @@ void AP_ModbusSteering::evaluate_cal_alarm_wait(uint32_t now)
         return;
     }
     if ((now - _last_send_ms) > 1000) {
-        // The clear may have been lost while the drive was latched; retry.
-        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+        // The clear may have been lost while the drive was latched, and a
+        // drive that is still executing motion may need a stop before it
+        // accepts the clear — alternate the two writes.
+        if (_cal_alarm_stop_next) {
+            send_u16(REG_MOTION, MOTION_STOP);
+        } else {
+            send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+        }
+        _cal_alarm_stop_next = !_cal_alarm_stop_next;
     }
     bus_idle_poll(now);
     if ((now - _cal_start_ms) > 10000) {
@@ -1278,6 +1285,14 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         return;
     }
     if (alarmed()) {
+        if (_follow_moving) {
+            // A faulted drive may still be executing its last speed leg;
+            // drop it out of speed mode so the alarm can actually clear.
+            send_ff(REG_MOTION, MOTION_STOP);
+            _follow_moving = false;
+            _follow_speed_pending = false;
+            _follow_sign = 0;
+        }
         bus_idle_poll(now);
         return;
     }
@@ -1527,6 +1542,17 @@ void AP_ModbusSteering::service(uint32_t now)
     send_current();
 }
 
+bool AP_ModbusSteering::rc_override_active() const
+{
+    for (uint8_t i = 0; i < 16; i++) {
+        const RC_Channel *chan = rc().channel(i);
+        if (chan != nullptr && chan->has_override()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool AP_ModbusSteering::rc_rising_edge(int8_t ch, bool &was_high) const
 {
     if (ch < 1 || ch > 16) {
@@ -1550,15 +1576,25 @@ bool AP_ModbusSteering::rc_rising_edge(int8_t ch, bool &was_high) const
 
 void AP_ModbusSteering::poll_triggers()
 {
-    if (rc_rising_edge(cal_ch.get(), _cal_was_high)) {
-        start_home();
+    // RC override path is used by GCS joystick and bench scripts; it must
+    // work whenever the library is live, not only in MANUAL mode.
+    if (rc_override_active()) {
+        _rc_override_seen = true;
     }
+    if (_rc_override_seen) {
+        rc_rising_edge(cal_ch.get(), _cal_was_high);
+        rc_rising_edge(rst_ch.get(), _rst_was_high);
+    } else {
+        if (rc_rising_edge(cal_ch.get(), _cal_was_high)) {
+            start_home();
+        }
 
-    // Alarm clear button: only meaningful once init is done.
-    if ((_phase == Phase::IDLE_UNCAL || _phase == Phase::IDLE_READY) &&
-        rc_rising_edge(rst_ch.get(), _rst_was_high)) {
-        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear (RC)");
+        // Alarm clear button: only meaningful once init is done.
+        if ((_phase == Phase::IDLE_UNCAL || _phase == Phase::IDLE_READY) &&
+            rc_rising_edge(rst_ch.get(), _rst_was_high)) {
+            send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm clear (RC)");
+        }
     }
 
     const int8_t trig = cal_trig.get();
