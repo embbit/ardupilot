@@ -24,6 +24,8 @@ public:
     bool link_ok() const;
     int32_t debug_enc() const { return _actual_pulses; }
     uint32_t debug_status() const { return (uint32_t)(_status_word | (_err_code << 8)); }
+    uint32_t debug_di() const { return (uint32_t)_di_word; }
+    int32_t debug_follow_target() const { return _debug_target; }
     uint32_t debug_txstate(uint32_t now) const
     {
         (void)now;
@@ -32,7 +34,11 @@ public:
                (_got_exception ? 4 : 0) |
                ((uint32_t)_rx_expect << 3) |
                ((uint32_t)_init_attempts << 8) |
-               ((uint32_t)_phase << 16);
+               ((uint32_t)_phase << 16) |
+               ((uint32_t)(_follow_moving ? 1 : 0) << 24) |
+               ((uint32_t)(_follow_sign & 0x3) << 25) |
+               ((uint32_t)(_run_limit_hold ? 1 : 0) << 27) |
+               ((uint32_t)(_follow_fast ? 1 : 0) << 28);
     }
 
     static const struct AP_Param::GroupInfo var_info[];
@@ -50,6 +56,9 @@ private:
         INIT_TRACK_ERR,
         IDLE_UNCAL,
 
+        // Recover from a latched drive alarm before touching any motion
+        // register: this unit ignores starts while the alarm bit is set.
+        CAL_ALARM_WAIT,
         CAL_STOP,
         CAL_CLEAR,
         CAL_ENABLE,
@@ -95,7 +104,7 @@ private:
 
     bool in_init() const { return _phase <= Phase::INIT_TRACK_ERR; }
     bool in_cal() const {
-        return _phase >= Phase::CAL_STOP && _phase <= Phase::ABORT_STOP;
+        return _phase >= Phase::CAL_ALARM_WAIT && _phase <= Phase::ABORT_STOP;
     }
     bool in_run() const {
         return _phase == Phase::IDLE_READY ||
@@ -130,7 +139,9 @@ private:
     void service(uint32_t now);
     void bus_idle_poll(uint32_t now);
     void evaluate_cal_wait(uint32_t now);
+    void evaluate_cal_alarm_wait(uint32_t now);
     void evaluate_mid_follow(uint32_t now);
+    void evaluate_mid_zero(uint32_t now);
     void evaluate_back_poll(uint32_t now);
     void handle_run(uint32_t now, float steering_out);
     void handle_run_link_failsafe(uint32_t now);
@@ -187,6 +198,7 @@ private:
     int32_t _mid_traveled = 0;
     int8_t _mid_dir = 0;
     bool _mid_slow = false;
+    bool _mid_zero_sent = false;
     uint8_t _pos_end_bit = 0x02;  // limit input at the encoder-positive end (set by cal)
     uint8_t _neg_end_bit = 0x04;  // limit input at the encoder-negative end (set by cal)
     int8_t _cal_trig_last = 0;
@@ -197,10 +209,12 @@ private:
     bool _run_limit_hold = false;
     bool _follow_moving = false;
     bool _follow_fast = false;
+    bool _follow_speed_pending = false;
     int8_t _follow_sign = 0;
     int16_t _follow_last_rpm = 0;
     uint32_t _follow_progress_ms = 0;
     int32_t _follow_last_enc = 0;
+    int32_t _debug_target = 0;
     uint32_t _link_lost_candidate_ms = 0;
     uint32_t _last_run_link_warn_ms = 0;
     uint8_t _rx_buf[64] {};

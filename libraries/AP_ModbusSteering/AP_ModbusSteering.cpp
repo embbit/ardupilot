@@ -653,9 +653,6 @@ void AP_ModbusSteering::send_current()
     case Phase::MID_GO:
         send_u16(REG_MOTION, MOTION_SPEED);
         break;
-    case Phase::MID_ZERO:
-        send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
-        break;
     case Phase::BACK_SPD:
         send_u16(REG_MAX_SPD, (uint16_t)backoff_signed_rpm());
         break;
@@ -671,8 +668,10 @@ void AP_ModbusSteering::send_current()
 
     case Phase::IDLE_UNCAL:
     case Phase::IDLE_READY:
+    case Phase::CAL_ALARM_WAIT:
     case Phase::CAL_WAIT:
     case Phase::MID_FOLLOW:
+    case Phase::MID_ZERO:
     case Phase::BACK_POLL:
         break;
     }
@@ -772,6 +771,7 @@ void AP_ModbusSteering::advance_after_echo()
         _mid_traveled = 0;
         _mid_dir = (_leg_dir >= 0) ? -1 : 1;
         _mid_slow = false;
+        _mid_zero_sent = false;
         _leg_start_ms = AP_HAL::millis();
         _last_progress_ms = _leg_start_ms;
         break;
@@ -824,6 +824,7 @@ void AP_ModbusSteering::advance_after_echo()
 
     case Phase::IDLE_UNCAL:
     case Phase::IDLE_READY:
+    case Phase::CAL_ALARM_WAIT:
     case Phase::CAL_WAIT:
     case Phase::MID_FOLLOW:
     case Phase::BACK_POLL:
@@ -850,10 +851,21 @@ void AP_ModbusSteering::start_home()
     _leg1_travel = 0;
     _leg_dir = 0;
     _cal_start_ms = AP_HAL::millis();
-    _phase = Phase::CAL_STOP;
-    _awaiting_echo = false;
-    _got_echo = false;
-    _init_attempts = 0;
+    if (alarmed()) {
+        // Recover from a latched drive alarm without needing CAL_TRIG=2
+        // first; the wait phase polls the status word until the bit drops.
+        _phase = Phase::CAL_ALARM_WAIT;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: cal start, clearing alarm");
+    } else {
+        _phase = Phase::CAL_STOP;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+    }
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: cal start M%u %s",
                   (unsigned)home_first_method(), CL57R_FW_TAG);
 }
@@ -936,6 +948,7 @@ void AP_ModbusSteering::finish_cal()
     // here would kick the follow into a spurious correction run).
     _actual_pulses = 0;
     _follow_moving = false;
+    _follow_speed_pending = false;
     _follow_sign = 0;
     _run_link_failsafe = false;
     _run_limit_hold = false;
@@ -1095,6 +1108,57 @@ void AP_ModbusSteering::evaluate_mid_follow(uint32_t now)
     }
 }
 
+void AP_ModbusSteering::evaluate_cal_alarm_wait(uint32_t now)
+{
+    if (_got_echo) {
+        // The AUX clear write is fire-and-forget here: an echo only confirms
+        // the register write, so just unblock the poll cycle with it.
+        _got_echo = false;
+        _awaiting_echo = false;
+        _init_attempts = 0;
+    }
+    if ((_status_word & STATUS_ALARM) == 0) {
+        _phase = Phase::CAL_STOP;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: alarm cleared, cal begin");
+        return;
+    }
+    if ((now - _last_send_ms) > 1000) {
+        // The clear may have been lost while the drive was latched; retry.
+        send_u16(REG_AUX_CONTROL, AUX_ALARM_CLEAR);
+    }
+    bus_idle_poll(now);
+    if ((now - _cal_start_ms) > 10000) {
+        abort_home("alarm clear timeout", false);
+    }
+}
+
+void AP_ModbusSteering::evaluate_mid_zero(uint32_t now)
+{
+    if ((_status_word & STATUS_ALARM) != 0) {
+        abort_home("alarm before mid zero", true);
+        return;
+    }
+    if (!_mid_zero_sent) {
+        if ((_status_word & STATUS_RUNNING) != 0) {
+            // The shaft is still decelerating from the halt. This unit
+            // latches a fault if the AUX pos-zero lands while the running
+            // bit is still set, so hold STOP and poll status until it drops.
+            if ((now - _last_send_ms) > 100) {
+                send_u16(REG_MOTION, MOTION_STOP);
+            }
+            bus_idle_poll(now);
+            return;
+        }
+        _mid_zero_sent = true;
+        send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
+        return;
+    }
+    bus_idle_poll(now);
+}
+
 void AP_ModbusSteering::evaluate_back_poll(uint32_t now)
 {
     const int32_t traveled = abs(_actual_pulses - _last_progress_enc);
@@ -1182,6 +1246,7 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
     if (!_run_link_failsafe) {
         _run_link_failsafe = true;
         _follow_moving = false;
+        _follow_speed_pending = false;
         _follow_sign = 0;
         _phase = Phase::RUN_STOP;
         _awaiting_echo = false;
@@ -1227,6 +1292,7 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     const int32_t limit = travel_limit_pulses();
     const float stick = constrain_float(steering_out, -1.0f, 1.0f);
     const int32_t target = (int32_t)(stick * (float)limit);
+    _debug_target = target;
 
     // Hard backstop: never command motion further into an active limit
     // input. Which input guards which end is learned from calibration
@@ -1238,6 +1304,7 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         if (!_run_limit_hold) {
             _run_limit_hold = true;
             _follow_moving = false;
+            _follow_speed_pending = false;
             _follow_sign = 0;
             _phase = Phase::RUN_STOP;
             _awaiting_echo = false;
@@ -1252,6 +1319,27 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         return;
     }
     _run_limit_hold = false;
+
+    // Two-phase leg arming: MAX_SPD goes out as an awaited write (the run
+    // loop must know the drive really accepted it — a lost MAX_SPD leaves
+    // the old speed in effect, and this drive ignores changes mid-run), and
+    // only after its echo does the SPEED trigger follow.
+    if (_follow_speed_pending) {
+        if (_got_echo) {
+            // MAX_SPD confirmed by the drive.
+            _got_echo = false;
+            _awaiting_echo = false;
+            _init_attempts = 0;
+        }
+        if (!_awaiting_echo) {
+            // Either the echo just landed or the service layer already
+            // consumed it; either way the register is set, so fire SPEED.
+            _follow_speed_pending = false;
+            send_ff(REG_MOTION, MOTION_SPEED);
+            _follow_moving = true;
+        }
+        return;
+    }
 
     // Speed-mode follow: this CL57R ignores absolute positioning starts and
     // also pays no attention to MAX_SPD changes while speed mode is running,
@@ -1275,6 +1363,7 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
             // Soft stop before reversing.
             send_ff(REG_MOTION, MOTION_STOP);
             _follow_moving = false;
+            _follow_speed_pending = false;
             _follow_sign = 0;
             _follow_fast = false;
             return;
@@ -1284,12 +1373,14 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
                 // End the fast leg now and let it coast into the creep zone.
                 send_ff(REG_MOTION, MOTION_STOP);
                 _follow_moving = false;
+                _follow_speed_pending = false;
                 _follow_fast = false;
                 _follow_sign = 0;
             }
         } else if (abs_err <= crawl_coast) {
             send_ff(REG_MOTION, MOTION_STOP);
             _follow_moving = false;
+            _follow_speed_pending = false;
             _follow_sign = 0;
         }
         if ((now - _follow_progress_ms) > FOLLOW_REASSERT_MS) {
@@ -1311,7 +1402,11 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     }
 
     // Start a leg: full speed only while far enough to coast in safely,
-    // otherwise creep at ~0.4*err/s (capped by MAX_SPD).
+    // otherwise creep at ~0.4*err/s (capped by MAX_SPD). The speed goes out
+    // as an awaited write — a silently lost MAX_SPD would leave the previous
+    // (possibly much higher) speed in effect, and this drive ignores speed
+    // changes once speed mode runs. The SPEED trigger fires only after the
+    // drive has confirmed the register (see _follow_speed_pending above).
     const int8_t want_sign = (err > 0) ? 1 : -1;
     int16_t rpm;
     if (abs_err > fast_coast * 2) {
@@ -1322,19 +1417,24 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         rpm = (int16_t)MIN((int16_t)run_speed_rpm(), rpm);
         _follow_fast = false;
     }
-    send_ff(REG_MAX_SPD, (uint16_t)((int16_t)(rpm * want_sign)));
-    send_ff(REG_MOTION, MOTION_SPEED);
     _follow_last_rpm = (int16_t)(rpm * want_sign);
     _follow_sign = want_sign;
     _follow_progress_ms = now;
     _follow_last_enc = _actual_pulses;
-    _follow_moving = true;
+    _follow_speed_pending = true;
+    send_u16(REG_MAX_SPD, (uint16_t)_follow_last_rpm);
 }
 
 void AP_ModbusSteering::service(uint32_t now)
 {
     if (_phase == Phase::IDLE_UNCAL) {
         bus_idle_poll(now);
+        return;
+    }
+
+    if (_phase == Phase::CAL_ALARM_WAIT) {
+        // Echoes here belong to the AUX clear retry, not a phase advance.
+        evaluate_cal_alarm_wait(now);
         return;
     }
 
@@ -1349,6 +1449,17 @@ void AP_ModbusSteering::service(uint32_t now)
         } else {
             evaluate_back_poll(now);
         }
+        return;
+    }
+
+    if (_phase == Phase::MID_ZERO) {
+        // Halt first, then AUX pos-zero only once the running bit drops;
+        // unlike the echo-driven phases this one waits on the status poll.
+        if (_got_echo) {
+            advance_after_echo();
+            return;
+        }
+        evaluate_mid_zero(now);
         return;
     }
 
@@ -1367,6 +1478,10 @@ void AP_ModbusSteering::service(uint32_t now)
             abort_home("Modbus exception", false);
             return;
         }
+        if (in_run() && _follow_speed_pending) {
+            // Slave rejected the MAX_SPD write; re-arm it.
+            send_u16(REG_MAX_SPD, (uint16_t)_follow_last_rpm);
+        }
         return;
     }
 
@@ -1384,6 +1499,11 @@ void AP_ModbusSteering::service(uint32_t now)
             if (in_run()) {
                 _phase = Phase::IDLE_READY;
                 _init_attempts = 0;
+                if (_follow_speed_pending) {
+                    // The MAX_SPD write never came back; re-arm it instead
+                    // of letting the SPEED trigger fire at a stale speed.
+                    send_u16(REG_MAX_SPD, (uint16_t)_follow_last_rpm);
+                }
                 return;
             }
             static uint32_t last_fail_ms;
