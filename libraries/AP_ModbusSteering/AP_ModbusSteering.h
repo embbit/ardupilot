@@ -117,6 +117,7 @@ private:
     uint16_t home_first_method() const;
     uint16_t home_method_now() const;
     uint16_t home_limit_bit() const;
+    uint16_t limit_bit_for_method(uint16_t method) const;
     int16_t mid_cruise_rpm() const;
     int32_t mid_brake_pulses() const;
     int32_t mid_final_pulses() const;

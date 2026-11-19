@@ -290,8 +290,16 @@ uint16_t AP_ModbusSteering::home_method_now() const
 
 uint16_t AP_ModbusSteering::home_limit_bit() const
 {
-    // Method 17 = N-OT on X2; method 18 = P-OT on X1.
-    return (home_method_now() == 18) ? DI_X1 : DI_X2;
+    return limit_bit_for_method(home_method_now());
+}
+
+uint16_t AP_ModbusSteering::limit_bit_for_method(uint16_t method) const
+{
+    // Method 18 = P-OT on X1; method 17 = N-OT on X2. The wiring on some
+    // installs swaps which physical end that is, so callers must derive
+    // direction meaning from the legs that actually completed, not from
+    // this table alone.
+    return (method == 18) ? DI_X1 : DI_X2;
 }
 
 int32_t AP_ModbusSteering::expected_full_travel() const
@@ -1014,14 +1022,14 @@ void AP_ModbusSteering::evaluate_mid_follow(uint32_t now)
         abort_home("alarm on mid", true);
         return;
     }
-    // Never drive into a limit input: mid travels away from the leg2 limit,
-    // so a limit in the travel direction means the half-travel was wrong.
-    // Positive travel ends at the X1 input, negative at X2 (same mapping
-    // home_limit_bit() uses). Both bits set at once means stuck/floating
-    // switches — inconclusive, let the distance and timeout checks decide.
+    // Never drive into a limit input: the mid run travels away from the
+    // leg2 end toward mid, so reaching the FAR end (leg1's limit, proven by
+    // the leg that just completed) means the half travel was wrong. Both
+    // bits active at once (stuck/floating switches) is inconclusive.
     const uint16_t di = _di_word;
-    if (((_mid_dir > 0) && ((di & DI_X1) != 0) && ((di & DI_X2) == 0)) ||
-        ((_mid_dir < 0) && ((di & DI_X2) != 0) && ((di & DI_X1) == 0))) {
+    const uint16_t near_limit = limit_bit_for_method(home_method_now());
+    const uint16_t far_limit = (near_limit == DI_X1) ? DI_X2 : DI_X1;
+    if (((di & far_limit) != 0) && ((di & near_limit) == 0)) {
         abort_home("mid limit hit", true);
         return;
     }
