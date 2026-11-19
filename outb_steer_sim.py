@@ -54,6 +54,9 @@ class Nema23Motor:
         self.mech_offset = 0.0
         # When True, ignore position commands until alarm-clear (0x0037=0x0004).
         self.alarmed = False
+        # Absolute/relative positioning mode from register 0x003A.
+        self.abs_mode = False
+        self.target_high = 0
         # When True, freeze shaft (no alarm) until cleared — HW stall / missing DI.
         self.force_stall = False
         # When True, report DI word 0 (limit switches disconnected).
@@ -147,8 +150,9 @@ class Nema23Motor:
         """Start positioning only when Bit0 is set (official CL57R Modbus doc)."""
         if (motion_word & 0x0001) == 0:
             return False
-        if (motion_word & 0x0002) != 0:
-            # Absolute
+        absolute = (motion_word & 0x0002) != 0 or self.abs_mode
+        if absolute:
+            # Absolute (0x003A selects the global mode)
             self.driver_target = self.pending_cmd
         else:
             # Relative
@@ -206,10 +210,12 @@ class Nema23Motor:
             target_vel = self.max_vel * direction
             # Limit switches block further travel into the stop, not leave.
             # X1=P-OT at positive end blocks +vel; X2=N-OT at negative end blocks -vel.
+            # Both set at once (stuck/floating switches) is inconclusive: do
+            # not block, mirroring the firmware's mid-limit check.
             di = self.di_word()
-            if (di & (1 << 1)) and target_vel > 0:
+            if di & (1 << 1) and not di & (1 << 2) and target_vel > 0:
                 target_vel = 0.0
-            if (di & (1 << 2)) and target_vel < 0:
+            if di & (1 << 2) and not di & (1 << 1) and target_vel < 0:
                 target_vel = 0.0
             if abs(self.velocity - target_vel) < 1.0:
                 self.velocity = target_vel
@@ -257,13 +263,13 @@ class Nema23Motor:
                 self.velocity = 0.0
                 if self.driver_target > int(round(self.position)):
                     self.raise_alarm()
-                    print(f"[CL57R Modbus Sim] ALARM raised (jammed at +stop) pos={int(self.position)} off={int(self.mech_offset)}")
+                    print(f"[CL57R Modbus Sim] ALARM raised (jammed at +stop) pos={int(self.position)}")
             elif mech < -SPEED_HARD_STOP:
                 self.position = float(-SPEED_HARD_STOP - self.mech_offset)
                 self.velocity = 0.0
                 if self.driver_target < int(round(self.position)):
                     self.raise_alarm()
-                    print(f"[CL57R Modbus Sim] ALARM raised (jammed at -stop) pos={int(self.position)} off={int(self.mech_offset)}")
+                    print(f"[CL57R Modbus Sim] ALARM raised (jammed at -stop) pos={int(self.position)}")
         else:
             self._coast(dt_s)
             new_pos = self.position + self.velocity * dt_s
@@ -344,9 +350,12 @@ sim_state = {
     "init_count": 0,
     "packets_rx": 0,
     "packets_dropped": 0,
+    "client_addr": None,
+    "last_rx_at": 0.0,
     "telemetry_file": None,
     "control_file": None,
     "mute_reads": False,
+    "mute_status": False,
     "last_cmd_target": 0,
 }
 
@@ -497,6 +506,14 @@ def poll_control_file(now):
         elif cmd == "UNMUTE":
             sim_state["mute_reads"] = False
             print("[CL57R Modbus Sim] Control UNMUTE reads")
+        elif cmd == "MUTESTAT":
+            # Stop answering status (0x0003) reads: the consumer keeps the
+            # last status word until UNMUTESTAT.
+            sim_state["mute_status"] = True
+            print("[CL57R Modbus Sim] Control MUTESTAT (status reads muted)")
+        elif cmd == "UNMUTESTAT":
+            sim_state["mute_status"] = False
+            print("[CL57R Modbus Sim] Control UNMUTESTAT")
         elif cmd == "STALL":
             motor.force_stall = True
             motor.velocity = 0.0
@@ -570,6 +587,19 @@ def handle_write_single(reg_addr, val):
         print(f"[CL57R Modbus Sim] POSITION ZEROED off={int(motor.mech_offset)}")
     elif reg_addr == 0x0052:
         motor.track_err_limit = val
+    elif reg_addr == 0x003A:
+        motor.abs_mode = (val == 0x0001)
+    elif reg_addr == 0x0034:
+        # Target high word (FC06 path used by the firmware)
+        motor.target_high = val
+        print(f"[CL57R Modbus Sim] TARGET_HI={val}")
+    elif reg_addr == 0x0035:
+        # Target low word: combine and latch as the pending command
+        combined = ((motor.target_high & 0xFFFF) << 16) | (val & 0xFFFF)
+        if combined & 0x80000000:
+            combined -= 0x100000000
+        motor.set_pending_cmd(combined)
+        print(f"[CL57R Modbus Sim] TARGET_LO={val} target={combined}")
     elif reg_addr == 0x0036 and (val & 0x0010):
         motor.clear_alarm()
         motor.speed_mode = False
@@ -600,9 +630,29 @@ def handle_write_single(reg_addr, val):
         print(f"[CL57R Modbus Sim] MOTION write 0x{val:04X} (no start)")
 
 
+def _safe_print(msg):
+    try:
+        print(msg)
+    except (OSError, ValueError):
+        pass
+
+
+def _tcp_connect(host, port):
+    while True:
+        try:
+            conn = socket.create_connection((host, port), timeout=2)
+            conn.settimeout(None)
+            _safe_print(f"[CL57R Modbus Sim] TCP connected to {host}:{port}")
+            return conn
+        except OSError as exc:
+            _safe_print(f"[CL57R Modbus Sim] TCP connect {host}:{port} retry: {exc}")
+            time.sleep(0.5)
+
+
 def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_lag_ms=0.0,
                          telemetry_file=None, link_drops=None, inject_positions=None,
-                         alarm_events=None, mute_reads=False, control_file=None):
+                         alarm_events=None, mute_reads=False, control_file=None,
+                         tcp_target=None):
     motor.encoder_lag_s = encoder_lag_ms / 1000.0
     motor.reported_position = motor.position
     sim_state["telemetry_file"] = telemetry_file
@@ -629,10 +679,16 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
         print(f"[CL57R Modbus Sim] Position inject schedule: {inject_positions}")
     if alarm_events:
         print(f"[CL57R Modbus Sim] Alarm schedule: {alarm_events}")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((HOST, MODBUS_UDP_PORT))
-    print(f"[CL57R Modbus Sim] NEMA23 inertia model, UDP {MODBUS_UDP_PORT}")
+    conn = None
+    if tcp_target:
+        host, port = tcp_target.rsplit(":", 1)
+        conn = _tcp_connect(host, int(port))
+        print(f"[CL57R Modbus Sim] NEMA23 inertia model, TCP {tcp_target}")
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((HOST, MODBUS_UDP_PORT))
+        print(f"[CL57R Modbus Sim] NEMA23 inertia model, UDP {MODBUS_UDP_PORT}")
     if link_drop_delay is not None and link_down_duration is not None:
         sim_state["link_drop_at"] = time.time() + link_drop_delay
         sim_state["link_restore_at"] = time.time() + link_drop_delay + link_down_duration
@@ -649,16 +705,48 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
             check_link_schedule(now)
             poll_control_file(now)
 
+            # A truncated datagram (host-side UART buffering quirks) leaves a
+            # partial frame that would otherwise stall the parser forever.
+            if raw_buffer and now - sim_state["last_rx_at"] > 0.12:
+                print(f"[WIRE drop-stale] {len(raw_buffer)} bytes "
+                      f"{raw_buffer.hex()}")
+                raw_buffer.clear()
             dt_s = now - last_physics_time
             motor.update(dt_s, sim_state["link_active"])
             last_physics_time = now
 
-            sock.settimeout(0.02)
-            try:
-                data, addr = sock.recvfrom(1024)
-                raw_buffer.extend(data)
-            except socket.timeout:
-                addr = None
+            if conn is not None:
+                conn.settimeout(0.02)
+                try:
+                    data = conn.recv(1024)
+                    sim_state["last_rx_at"] = time.time()
+                    if not data:
+                        # FCU closed or link lost: reconnect
+                        conn = _tcp_connect(host, int(port))
+                        addr = None
+                    else:
+                        addr = "tcp"
+                        raw_buffer.extend(data)
+                except socket.timeout:
+                    addr = None
+                except OSError:
+                    conn = _tcp_connect(host, int(port))
+                    addr = None
+            else:
+                sock.settimeout(0.02)
+                try:
+                    data, addr = sock.recvfrom(1024)
+                    sim_state["last_rx_at"] = time.time()
+                    # Pin the client: answer only the first valid requester. A
+                    # stray datagram on this port (probing tools) must not hijack
+                    # the reply address, or the FCU goes deaf mid-test while its
+                    # own requests keep being received.
+                    if sim_state["client_addr"] is not None and addr != sim_state["client_addr"]:
+                        print(f"[WIRE RX-ignore] {addr} {data.hex()}")
+                        continue
+                    raw_buffer.extend(data)
+                except socket.timeout:
+                    addr = None
 
             if not sim_state["link_active"]:
                 raw_buffer.clear()
@@ -689,6 +777,8 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                     received_crc = (req[-1] << 8) | req[-2]
                     if modbus_crc(req[:-2]) != received_crc:
                         continue
+                    if sim_state["client_addr"] is None:
+                        sim_state["client_addr"] = addr
 
                     sim_state["packets_rx"] += 1
                     sim_state["last_rx_hex"] = req.hex().upper()
@@ -729,16 +819,19 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                             response.append((low_word >> 8) & 0xFF)
                             response.append(low_word & 0xFF)
                         elif reg_addr == 0x0003:
-                            motor.refresh_status()
-                            qty = (req[4] << 8) | req[5]
-                            response.append(slave_id)
-                            response.append(0x03)
-                            response.append(0x02 if qty <= 1 else 0x04)
-                            response.append(0)
-                            response.append(motor.status_word & 0xFF)
-                            if qty >= 2:
+                            if sim_state["mute_status"]:
+                                pass
+                            else:
+                                motor.refresh_status()
+                                qty = (req[4] << 8) | req[5]
+                                response.append(slave_id)
+                                response.append(0x03)
+                                response.append(0x02 if qty <= 1 else 0x04)
                                 response.append(0)
-                                response.append(motor.error_code & 0xFF)
+                                response.append(motor.status_word & 0xFF)
+                                if qty >= 2:
+                                    response.append(0)
+                                    response.append(motor.error_code & 0xFF)
                         elif reg_addr == 0x0005:
                             di = motor.di_word()
                             response.append(slave_id)
@@ -751,7 +844,13 @@ def run_modbus_simulator(link_drop_delay=None, link_down_duration=None, encoder_
                         crc = modbus_crc(response)
                         response.append(crc & 0xFF)
                         response.append((crc >> 8) & 0xFF)
-                        sock.sendto(response, addr)
+                        if conn is not None:
+                            try:
+                                conn.sendall(bytes(response))
+                            except OSError:
+                                pass
+                        else:
+                            sock.sendto(response, addr)
                     elif len(response) > 0:
                         sim_state["packets_dropped"] += 1
 
@@ -793,6 +892,8 @@ def parse_args():
     parser.add_argument("--control-file", type=str, default=None,
                         help="Path polled for runtime cmds: DROP <s>, ALARM [pos], MUTE, UNMUTE, "
                              "STALL/UNSTALL, NODI/DI, BOTHDI/NOBOTHDI, SETSTOP <pulses>")
+    parser.add_argument("--tcp", type=str, default=None,
+                        help="Connect to the FCU over TCP (host:port) instead of UDP 14555")
     return parser.parse_args()
 
 
@@ -823,4 +924,4 @@ if __name__ == "__main__":
         link_drops = [(drop_delay, down_duration)]
     run_modbus_simulator(drop_delay, down_duration, args.encoder_lag_ms, args.telemetry_file,
                          link_drops, inject_positions, alarm_events, args.mute_reads,
-                         args.control_file)
+                         args.control_file, args.tcp)
