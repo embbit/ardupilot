@@ -605,6 +605,9 @@ void Rover::modbus_steering_update()
         gcs().send_named_float("MB_DBG", (float)modbus_steering.debug_txstate(now_ms));
         gcs().send_named_float("MB_DI", (float)modbus_steering.debug_di());
         gcs().send_named_float("MB_TGT", (float)modbus_steering.debug_follow_target());
+        gcs().send_named_float("MB_SPD", (float)modbus_steering.debug_max_speed());
+        gcs().send_named_float("MB_CMD", (float)modbus_steering.debug_follow_speed());
+        gcs().send_named_float("MB_OFF", (float)modbus_steering.debug_encoder_offset());
     }
 }
 

@@ -26,6 +26,9 @@ public:
     uint32_t debug_status() const { return (uint32_t)(_status_word | (_err_code << 8)); }
     uint32_t debug_di() const { return (uint32_t)_di_word; }
     int32_t debug_follow_target() const { return _debug_target; }
+    int16_t debug_max_speed() const { return _max_speed_feedback; }
+    int16_t debug_follow_speed() const { return _follow_last_rpm; }
+    int32_t debug_encoder_offset() const { return _encoder_offset; }
     uint32_t debug_txstate(uint32_t now) const
     {
         (void)now;
@@ -100,6 +103,7 @@ private:
         ENCODER,
         STATUS,
         DI_INPUT,
+        MAX_SPD,
     };
 
     bool in_init() const { return _phase <= Phase::INIT_TRACK_ERR; }
@@ -145,6 +149,7 @@ private:
     void evaluate_back_poll(uint32_t now);
     void handle_run(uint32_t now, float steering_out);
     void handle_run_link_failsafe(uint32_t now);
+    void stop_follow_leg(uint32_t now);
 
     void start_home();
     void begin_leg_prep();
@@ -187,7 +192,10 @@ private:
     uint16_t _di_word = 0;
     uint16_t _status_word = 0;
     uint16_t _err_code = 0;
+    int16_t _max_speed_feedback = 0;
     int32_t _actual_pulses = 0;
+    int32_t _encoder_raw = 0;
+    int32_t _encoder_offset = 0;
     int32_t _last_progress_enc = 0;
     int32_t _leg1_travel = 0;
     int32_t _leg_peak_travel = 0;
@@ -213,6 +221,10 @@ private:
     bool _follow_moving = false;
     bool _follow_fast = false;
     bool _follow_speed_pending = false;
+    bool _follow_stop_wait = false;
+    bool _follow_stop_status_seen = false;
+    bool _follow_stop_timeout_reported = false;
+    uint32_t _follow_stop_ms = 0;
     int8_t _follow_sign = 0;
     int16_t _follow_last_rpm = 0;
     uint32_t _follow_progress_ms = 0;

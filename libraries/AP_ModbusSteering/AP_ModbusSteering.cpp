@@ -60,6 +60,7 @@ constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint32_t LINK_LOST_CONFIRM_MS = 500;
 constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
 constexpr int32_t MID_JUMP_PULSES = 30000;   // ignore encoder jumps (drive zeroing)
+constexpr int32_t ENCODER_ZERO_WINDOW = 5000;
 constexpr uint32_t FOLLOW_REASSERT_MS = 2500;
 constexpr int32_t FOLLOW_MIN_MOVE_PULSES = 200;
 constexpr int16_t FOLLOW_MIN_RPM = 60;
@@ -543,6 +544,9 @@ void AP_ModbusSteering::consume_rx()
                     _err_code = (uint16_t)((_rx_buf[offset + 5] << 8) | _rx_buf[offset + 6]);
                 }
                 _got_status = true;
+                if (_follow_stop_wait) {
+                    _follow_stop_status_seen = true;
+                }
             } else if (_rx_expect == RxExpect::DI_INPUT && byte_count >= 2) {
                 const uint16_t raw = ((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 uint16_t di = raw;
@@ -554,7 +558,21 @@ void AP_ModbusSteering::consume_rx()
             } else if (_rx_expect == RxExpect::ENCODER && byte_count == 0x04 && frame_len >= 9) {
                 const uint16_t high_word = (_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4];
                 const uint16_t low_word = (_rx_buf[offset + 5] << 8) | _rx_buf[offset + 6];
-                _actual_pulses = (int32_t)(((uint32_t)high_word << 16) | low_word);
+                const int32_t raw = (int32_t)(((uint32_t)high_word << 16) | low_word);
+                const int32_t max_step = MAX((int32_t)2000,
+                                             abs((int32_t)_follow_last_rpm) * CL57R_STEPS_PER_REV / 120);
+                // This drive may zero its position register on speed-mode STOP/START.
+                // Preserve world position, but never apply this during homing.
+                if (in_run() && abs(raw - _encoder_raw) > max_step &&
+                    abs(raw) < ENCODER_ZERO_WINDOW) {
+                    _encoder_offset += _encoder_raw;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                                  "CL57R: encoder zeroed, offset %d", (int)_encoder_offset);
+                }
+                _encoder_raw = raw;
+                _actual_pulses = raw + _encoder_offset;
+            } else if (_rx_expect == RxExpect::MAX_SPD && byte_count >= 2) {
+                _max_speed_feedback = (int16_t)(((uint16_t)_rx_buf[offset + 3] << 8) | _rx_buf[offset + 4]);
             }
             _rx_expect = RxExpect::NONE;
         }
@@ -850,6 +868,8 @@ void AP_ModbusSteering::start_home()
     _measured_half_travel = 0;
     _leg1_travel = 0;
     _leg_dir = 0;
+    _encoder_raw = 0;
+    _encoder_offset = 0;
     _cal_start_ms = AP_HAL::millis();
     if (alarmed()) {
         // Recover from a latched drive alarm without needing CAL_TRIG=2
@@ -947,8 +967,11 @@ void AP_ModbusSteering::finish_cal()
     // it immediately instead of waiting for the next poll (a stale reading
     // here would kick the follow into a spurious correction run).
     _actual_pulses = 0;
+    _encoder_raw = 0;
+    _encoder_offset = 0;
     _follow_moving = false;
     _follow_speed_pending = false;
+    _follow_stop_wait = false;
     _follow_sign = 0;
     _run_link_failsafe = false;
     _run_limit_hold = false;
@@ -1213,8 +1236,12 @@ void AP_ModbusSteering::bus_idle_poll(uint32_t now)
         send_read(REG_STATUS, 2, RxExpect::STATUS);
         _run_poll_phase = 2;
         break;
-    default:
+    case 2:
         send_read(REG_DI_STATUS, 1, RxExpect::DI_INPUT);
+        _run_poll_phase = 3;
+        break;
+    default:
+        send_read(REG_MAX_SPD, 1, RxExpect::MAX_SPD);
         _run_poll_phase = 0;
         break;
     }
@@ -1275,6 +1302,19 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
     }
 }
 
+void AP_ModbusSteering::stop_follow_leg(uint32_t now)
+{
+    send_ff(REG_MOTION, MOTION_STOP);
+    _follow_moving = false;
+    _follow_speed_pending = false;
+    _follow_sign = 0;
+    _follow_fast = false;
+    _follow_stop_wait = true;
+    _follow_stop_status_seen = false;
+    _follow_stop_timeout_reported = false;
+    _follow_stop_ms = now;
+}
+
 void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
 {
     handle_run_link_failsafe(now);
@@ -1293,6 +1333,7 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
             _follow_speed_pending = false;
             _follow_sign = 0;
         }
+        _follow_stop_wait = false;
         bus_idle_poll(now);
         return;
     }
@@ -1304,7 +1345,28 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         return;
     }
 
-    const int32_t limit = travel_limit_pulses();
+    if (_follow_stop_wait) {
+        if (_follow_stop_status_seen && (_status_word & STATUS_RUNNING) == 0) {
+            _follow_stop_wait = false;
+            bus_idle_poll(now);
+            return;
+        }
+        const uint32_t stop_timeout = (uint32_t)constrain_int16(acc_ms.get(), 100, 2000) + 3000U;
+        if (!_follow_stop_timeout_reported && now - _follow_stop_ms > stop_timeout) {
+            _follow_stop_timeout_reported = true;
+            send_ff(REG_MOTION, MOTION_STOP);
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "CL57R: follow stop timeout st=%04x", (unsigned)_status_word);
+        }
+        bus_idle_poll(now);
+        return;
+    }
+
+    const int32_t fast_v = (int32_t)run_speed_rpm() * CL57R_STEPS_PER_REV / 60;
+    const int32_t decel_ms = constrain_int16(acc_ms.get(), 100, 2000);
+    // Deceleration distance plus 100 ms control latency and one 200 ms DI poll.
+    const int32_t limit_margin = fast_v * decel_ms / 2000 + fast_v * 3 / 10;
+    const int32_t limit = MAX((int32_t)0, travel_limit_pulses() - limit_margin);
     const float stick = constrain_float(steering_out, -1.0f, 1.0f);
     const int32_t target = (int32_t)(stick * (float)limit);
     _debug_target = target;
@@ -1365,38 +1427,26 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     const int32_t err = target - _actual_pulses;
     const int32_t abs_err = abs(err);
     const int32_t arrive = MAX(pos_db.get(), (int32_t)800);
-    const int32_t fast_v = (int32_t)run_speed_rpm() * CL57R_STEPS_PER_REV / 60;
-    // Coast after a STOP: decel time (200 ms) plus worst-case loop latency.
-    const int32_t fast_coast = fast_v / 10 + fast_v * 2 / 5;
+    const int32_t fast_coast = fast_v / 10 + fast_v * decel_ms / 2000;
     const int16_t creep_rpm_cap = (int16_t)MAX((int16_t)FOLLOW_MIN_RPM, (int16_t)(abs_err * 60 / 6000));
     const int32_t crawl_v = (int32_t)MIN((int16_t)run_speed_rpm(), creep_rpm_cap) * CL57R_STEPS_PER_REV / 60;
-    const int32_t crawl_coast = MAX((int32_t)arrive, crawl_v / 10 + crawl_v * 2 / 5);
+    const int32_t crawl_coast = MAX((int32_t)arrive, crawl_v / 10 + crawl_v * decel_ms / 2000);
 
     if (_follow_moving) {
         const int8_t want_sign = (err > 0) ? 1 : -1;
         if (want_sign != _follow_sign) {
             // Soft stop before reversing.
-            send_ff(REG_MOTION, MOTION_STOP);
-            _follow_moving = false;
-            _follow_speed_pending = false;
-            _follow_sign = 0;
-            _follow_fast = false;
+            stop_follow_leg(now);
             return;
         }
         if (_follow_fast) {
             if (abs_err <= fast_coast) {
-                // End the fast leg now and let it coast into the creep zone.
-                send_ff(REG_MOTION, MOTION_STOP);
-                _follow_moving = false;
-                _follow_speed_pending = false;
-                _follow_fast = false;
-                _follow_sign = 0;
+                stop_follow_leg(now);
+                return;
             }
         } else if (abs_err <= crawl_coast) {
-            send_ff(REG_MOTION, MOTION_STOP);
-            _follow_moving = false;
-            _follow_speed_pending = false;
-            _follow_sign = 0;
+            stop_follow_leg(now);
+            return;
         }
         if ((now - _follow_progress_ms) > FOLLOW_REASSERT_MS) {
             _follow_progress_ms = now;
