@@ -29,7 +29,6 @@ constexpr uint16_t REG_HOME_ACCEL = 0x0043;
 constexpr uint16_t REG_TRACK_ERR = 0x0052;
 constexpr uint16_t AUX_ALARM_CLEAR = 0x0004;
 constexpr uint16_t AUX_POS_ZERO = 0x0008;
-constexpr uint16_t MOTION_START_ABS = 0x0003;
 constexpr uint16_t MOTION_SPEED = 0x0008;
 constexpr uint16_t MOTION_HOME = 0x0010;
 constexpr uint16_t MOTION_STOP = 0x0020;
@@ -45,6 +44,7 @@ constexpr uint16_t ACCEL_DEFAULT = 200;
 constexpr uint16_t DECEL_DEFAULT = 200;
 constexpr int32_t TRACK_ERR_DEFAULT = 4000;
 constexpr uint32_t SEND_INTERVAL_MS = 50;
+constexpr uint32_t READ_TIMEOUT_MS = 150;
 constexpr uint32_t ECHO_TIMEOUT_MS = 300;
 constexpr uint8_t INIT_MAX_ATTEMPTS = 8;
 constexpr uint32_t LINK_OK_DEFAULT_MS = 2000;
@@ -53,10 +53,6 @@ constexpr uint32_t STALL_GRACE_MS = 1000;
 constexpr uint32_t STALL_WINDOW_MS = 800;
 constexpr int32_t STALL_MIN_PULSES = 80;
 constexpr int32_t MIN_MEASURED_TRAVEL = 1000;
-constexpr int32_t MID_POS_TOL = 800;
-// Ignore mid-run completion for a while: the status word can be stale from
-// the home leg (in_pos/home_done set at leg completion) right after MID_RUN.
-constexpr uint32_t MID_SETTLE_MS = 1000;
 constexpr uint32_t BACK_MAX_MS = 4000;
 constexpr int32_t BACK_RELEASE_PULSES = 1500;
 constexpr int32_t BACK_CAP_PULSES = 12000;
@@ -64,6 +60,11 @@ constexpr uint8_t BACK_MAX_TRIES = 2;
 constexpr int32_t CL57R_STEPS_PER_REV = 4000;
 constexpr uint32_t LINK_LOST_CONFIRM_MS = 500;
 constexpr uint32_t LINK_WARN_INTERVAL_MS = 2000;
+constexpr int32_t MID_JUMP_PULSES = 30000;   // ignore encoder jumps (drive zeroing)
+constexpr uint32_t FOLLOW_REASSERT_MS = 2500;
+constexpr int32_t FOLLOW_MIN_MOVE_PULSES = 200;
+constexpr int16_t FOLLOW_MIN_RPM = 60;
+constexpr int16_t FOLLOW_RPM_UPDATE = 30;
 }
 
 const AP_Param::GroupInfo AP_ModbusSteering::var_info[] = {
@@ -322,6 +323,27 @@ int16_t AP_ModbusSteering::backoff_signed_rpm() const
     return rpm;
 }
 
+int16_t AP_ModbusSteering::mid_cruise_rpm() const
+{
+    return (int16_t)home_seek_rpm();
+}
+
+int32_t AP_ModbusSteering::mid_brake_pulses() const
+{
+    // Fast-cruise stage ends this far before the mid. The speed switch is
+    // two echo-paced phases (~0.5-0.7 s) during which the shaft keeps
+    // cruising, so the window must cover that latency plus a crawl runway.
+    const int32_t v = (int32_t)home_seek_rpm() * CL57R_STEPS_PER_REV / 60;
+    return v * 7 / 10 + 8000;
+}
+
+int32_t AP_ModbusSteering::mid_final_pulses() const
+{
+    // Halt chain latency (~0.3-0.4 s) at crawl speed, with a floor.
+    const int32_t v = (int32_t)FOLLOW_MIN_RPM * CL57R_STEPS_PER_REV / 60;
+    return MAX((int32_t)1200, v * 2 / 5);
+}
+
 uint8_t AP_ModbusSteering::rtu_frame_len(const uint8_t *buf, uint8_t avail) const
 {
     if (avail < 2) {
@@ -367,26 +389,9 @@ void AP_ModbusSteering::send_u16(uint16_t reg, uint16_t value)
     }
     uint8_t tx_packet[8];
     modbus_create_write_packet((uint8_t)slave_id.get(), reg, value, tx_packet);
-    _uart->write(tx_packet, 8);
-    _last_send_ms = AP_HAL::millis();
-    _awaiting_echo = true;
-    _got_echo = false;
-    _rx_expect = RxExpect::NONE;
-}
-
-void AP_ModbusSteering::send_target_pos(int32_t target)
-{
-    if (_uart == nullptr) {
-        return;
-    }
-    uint8_t tx_packet[16];
-    uint16_t values[2];
-    values[0] = (uint16_t)((target >> 16) & 0xFFFF);
-    values[1] = (uint16_t)(target & 0xFFFF);
-    const uint16_t reg = (reg_address.get() > 0) ? (uint16_t)reg_address.get() : REG_TARGET_POS;
-    modbus_create_write_multiple_packet((uint8_t)slave_id.get(), reg, 2, values, tx_packet);
-    _uart->write(tx_packet, 13);
-    _last_target = target;
+    // UART writes can be partial when the TX buffer is full; a truncated
+    // frame is never answered and stalls the whole exchange.
+    write_all(tx_packet, 8);
     _last_send_ms = AP_HAL::millis();
     _awaiting_echo = true;
     _got_echo = false;
@@ -400,11 +405,39 @@ void AP_ModbusSteering::send_read(uint16_t reg, uint16_t count, RxExpect expect)
     }
     uint8_t tx_packet[8];
     modbus_create_read_packet((uint8_t)slave_id.get(), reg, count, tx_packet);
-    _uart->write(tx_packet, 8);
+    write_all(tx_packet, 8);
     _rx_expect = expect;
     _last_send_ms = AP_HAL::millis();
+    _last_read_sent_ms = _last_send_ms;
     _awaiting_echo = false;
     _got_echo = false;
+}
+
+void AP_ModbusSteering::write_all(const uint8_t *buf, uint16_t len)
+{
+    uint16_t off = 0;
+    uint16_t guard = 0;
+    while (off < len && guard < 200) {
+        const ssize_t n = _uart->write(buf + off, len - off);
+        if (n > 0) {
+            off += (uint16_t)n;
+        } else {
+            guard++;
+            if (guard == 20) {
+                // Diagnose slow TX: a full buffer means the SITL/HAL drain
+                // stalled; otherwise write() is misbehaving.
+                static uint32_t last_slow_ms;
+                const uint32_t tnow = AP_HAL::millis();
+                if (tnow - last_slow_ms > 1000) {
+                    last_slow_ms = tnow;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "CL57R: tx slow off=%u txspace=%u",
+                                  (unsigned)off, (unsigned)_uart->txspace());
+                }
+            }
+            hal.scheduler->delay(1);
+        }
+    }
 }
 
 void AP_ModbusSteering::consume_rx()
@@ -545,6 +578,7 @@ void AP_ModbusSteering::send_current()
 
     case Phase::CAL_STOP:
     case Phase::MID_STOP:
+    case Phase::MID_HALT:
     case Phase::BACK_STOP:
         send_u16(REG_MOTION, _use_estop ? MOTION_ESTOP : MOTION_STOP);
         break;
@@ -579,11 +613,12 @@ void AP_ModbusSteering::send_current()
     case Phase::MID_MAX_SPD:
         send_u16(REG_MAX_SPD, home_seek_rpm());
         break;
-    case Phase::MID_TARGET:
-        send_target_pos(_mid_target);
+    case Phase::MID_SPD:
+        // Fast cruise for the first stage, crawl once inside the brake window.
+        send_u16(REG_MAX_SPD, (uint16_t)(_mid_dir * (_mid_slow ? FOLLOW_MIN_RPM : mid_cruise_rpm())));
         break;
-    case Phase::MID_RUN:
-        send_u16(REG_MOTION, MOTION_START_ABS);
+    case Phase::MID_GO:
+        send_u16(REG_MOTION, MOTION_SPEED);
         break;
     case Phase::MID_ZERO:
         send_u16(REG_AUX_CONTROL, AUX_POS_ZERO);
@@ -594,11 +629,11 @@ void AP_ModbusSteering::send_current()
     case Phase::BACK_START:
         send_u16(REG_MOTION, MOTION_SPEED);
         break;
-    case Phase::RUN_TARGET:
-        send_target_pos(_last_target);
+    case Phase::RUN_FOLLOW_SPD:
+        send_u16(REG_MAX_SPD, (uint16_t)_follow_rpm_pending);
         break;
-    case Phase::RUN_MOTION:
-        send_u16(REG_MOTION, _queued_motion != 0 ? _queued_motion : MOTION_START_ABS);
+    case Phase::RUN_FOLLOW_GO:
+        send_u16(REG_MOTION, MOTION_SPEED);
         break;
     case Phase::RUN_STOP:
         send_u16(REG_MOTION, MOTION_STOP);
@@ -610,7 +645,7 @@ void AP_ModbusSteering::send_current()
     case Phase::IDLE_UNCAL:
     case Phase::IDLE_READY:
     case Phase::CAL_WAIT:
-    case Phase::MID_WAIT:
+    case Phase::MID_FOLLOW:
     case Phase::BACK_POLL:
         break;
     }
@@ -701,14 +736,26 @@ void AP_ModbusSteering::advance_after_echo()
         _phase = Phase::MID_MAX_SPD;
         break;
     case Phase::MID_MAX_SPD:
-        _phase = Phase::MID_TARGET;
-        break;
-    case Phase::MID_TARGET:
-        _phase = Phase::MID_RUN;
-        break;
-    case Phase::MID_RUN:
-        _phase = Phase::MID_WAIT;
+        // Speed-follow mid run, opposite to the leg2 seek direction. The
+        // distance is measured from the encoder because some units do not
+        // zero after the second home.
+        _phase = Phase::MID_SPD;
+        _mid_origin_enc = _actual_pulses;
+        _mid_last_enc = _actual_pulses;
+        _mid_traveled = 0;
+        _mid_dir = (_leg_dir >= 0) ? -1 : 1;
+        _mid_slow = false;
         _leg_start_ms = AP_HAL::millis();
+        _last_progress_ms = _leg_start_ms;
+        break;
+    case Phase::MID_SPD:
+        _phase = Phase::MID_GO;
+        break;
+    case Phase::MID_GO:
+        _phase = Phase::MID_FOLLOW;
+        break;
+    case Phase::MID_HALT:
+        _phase = Phase::MID_ZERO;
         break;
     case Phase::MID_ZERO:
         // Mid zero done; restore armed run speed before declaring ready.
@@ -741,12 +788,16 @@ void AP_ModbusSteering::advance_after_echo()
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "CL57R: cal aborted -> idle");
         break;
 
-    case Phase::RUN_TARGET:
-        _phase = Phase::RUN_MOTION;
-        _queued_motion = MOTION_START_ABS;
+    case Phase::RUN_FOLLOW_SPD:
+        if (_follow_need_go) {
+            _phase = Phase::RUN_FOLLOW_GO;
+        } else {
+            _phase = Phase::IDLE_READY;
+        }
         break;
-    case Phase::RUN_MOTION:
-        _queued_motion = 0;
+    case Phase::RUN_FOLLOW_GO:
+        _follow_moving = true;
+        _follow_need_go = false;
         _phase = Phase::IDLE_READY;
         break;
     case Phase::RUN_STOP:
@@ -759,7 +810,7 @@ void AP_ModbusSteering::advance_after_echo()
     case Phase::IDLE_UNCAL:
     case Phase::IDLE_READY:
     case Phase::CAL_WAIT:
-    case Phase::MID_WAIT:
+    case Phase::MID_FOLLOW:
     case Phase::BACK_POLL:
         break;
     }
@@ -782,6 +833,7 @@ void AP_ModbusSteering::start_home()
     _use_estop = false;
     _measured_half_travel = 0;
     _leg1_travel = 0;
+    _leg_dir = 0;
     _cal_start_ms = AP_HAL::millis();
     _phase = Phase::CAL_STOP;
     _awaiting_echo = false;
@@ -802,14 +854,16 @@ void AP_ModbusSteering::begin_leg_prep()
 
 void AP_ModbusSteering::begin_mid()
 {
-    // After native home, Bit0 often ignored until STOP exits home mode.
+    // This CL57R ignores absolute positioning starts after native home, so
+    // the mid run is speed-mode follow (see evaluate_mid_follow).
     _use_estop = false;
     _phase = Phase::MID_STOP;
     _awaiting_echo = false;
     _got_echo = false;
     _init_attempts = 0;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: mid target %d half %d",
-                  (int)_mid_target, (int)_measured_half_travel);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: mid target %d half %d dir %d legdir %d",
+                  (int)_mid_target, (int)_measured_half_travel,
+                  (int)_mid_dir, (int)_leg_dir);
 }
 
 void AP_ModbusSteering::begin_backoff(const char *why)
@@ -849,7 +903,13 @@ void AP_ModbusSteering::finish_cal()
 {
     max_steps.set_and_save(_measured_half_travel);
     _homed = true;
-    _have_run_target = false;
+    // The AUX POS_ZERO echo means the encoder now reads zero at mid; act on
+    // it immediately instead of waiting for the next poll (a stale reading
+    // here would kick the follow into a spurious correction run).
+    _actual_pulses = 0;
+    _follow_moving = false;
+    _follow_need_go = false;
+    _follow_sign = 0;
     _run_link_failsafe = false;
     _run_limit_hold = false;
     _phase = Phase::IDLE_READY;
@@ -892,6 +952,11 @@ void AP_ModbusSteering::evaluate_cal_wait(uint32_t now)
 
     const int32_t moved = abs(_actual_pulses - _last_progress_enc);
     if (moved >= STALL_MIN_PULSES) {
+        // Direction only from plausible motion: the drive zeroes its encoder
+        // at the limit, and that jump must not rewrite the seek direction.
+        if (moved < MID_JUMP_PULSES) {
+            _leg_dir = (_actual_pulses >= _last_progress_enc) ? 1 : -1;
+        }
         _last_progress_enc = _actual_pulses;
         _last_progress_ms = now;
     } else if ((now - _leg_start_ms) > STALL_GRACE_MS &&
@@ -939,7 +1004,7 @@ void AP_ModbusSteering::evaluate_cal_wait(uint32_t now)
     (void)_leg1_travel;
 }
 
-void AP_ModbusSteering::evaluate_mid_wait(uint32_t now)
+void AP_ModbusSteering::evaluate_mid_follow(uint32_t now)
 {
     if ((now - _leg_start_ms) > home_timeout_ms()) {
         abort_home("mid timeout", true);
@@ -949,19 +1014,57 @@ void AP_ModbusSteering::evaluate_mid_wait(uint32_t now)
         abort_home("alarm on mid", true);
         return;
     }
-    if ((now - _leg_start_ms) < MID_SETTLE_MS) {
-        // Status word may still reflect the completed home leg here.
+    // Never drive into a limit input: mid travels away from the leg2 limit,
+    // so a limit in the travel direction means the half-travel was wrong.
+    // Positive travel ends at the X1 input, negative at X2 (same mapping
+    // home_limit_bit() uses). Both bits set at once means stuck/floating
+    // switches — inconclusive, let the distance and timeout checks decide.
+    const uint16_t di = _di_word;
+    if (((_mid_dir > 0) && ((di & DI_X1) != 0) && ((di & DI_X2) == 0)) ||
+        ((_mid_dir < 0) && ((di & DI_X2) != 0) && ((di & DI_X1) == 0))) {
+        abort_home("mid limit hit", true);
         return;
     }
-    const bool in_pos = (_status_word & 0x0001U) != 0;
-    const int32_t err = abs(_actual_pulses - _mid_target);
-    if (in_pos || err <= MID_POS_TOL) {
-        if ((_status_word & STATUS_RUNNING) == 0 || err <= MID_POS_TOL) {
-            _phase = Phase::MID_ZERO;
-            _awaiting_echo = false;
-            _got_echo = false;
-            _init_attempts = 0;
+
+    // Accumulate travel, ignoring implausible encoder jumps (the drive may
+    // zero its position reference at any time).
+    const int32_t d = _actual_pulses - _mid_last_enc;
+    if (abs(d) < MID_JUMP_PULSES) {
+        _mid_traveled += abs(d);
+        if (abs(d) >= STALL_MIN_PULSES) {
+            _last_progress_ms = now;
         }
+    }
+    _mid_last_enc = _actual_pulses;
+
+    if (!_mid_slow && (_mid_traveled >= _measured_half_travel - mid_brake_pulses())) {
+        // Inside the brake window: drop to crawl so the halt (two echo
+        // cycles) cannot overshoot the mid by thousands of pulses.
+        _mid_slow = true;
+        _phase = Phase::MID_SPD;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        return;
+    }
+
+    if (_mid_traveled >= _measured_half_travel - mid_final_pulses()) {
+        // At the mid: stop, then zero the encoder wherever the shaft halts.
+        _use_estop = false;
+        _phase = Phase::MID_HALT;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
+        return;
+    }
+
+    if ((now - _last_progress_ms) > FOLLOW_REASSERT_MS) {
+        // No encoder progress: the drive may have dropped speed mode.
+        _last_progress_ms = now;
+        _phase = Phase::MID_GO;
+        _awaiting_echo = false;
+        _got_echo = false;
+        _init_attempts = 0;
     }
 }
 
@@ -990,6 +1093,14 @@ void AP_ModbusSteering::bus_idle_poll(uint32_t now)
 {
     if (_awaiting_echo) {
         return;
+    }
+    // One outstanding read at a time: a late answer to an older poll must
+    // not be mistaken for the answer to a newer one.
+    if (_rx_expect != RxExpect::NONE) {
+        if ((now - _last_send_ms) < READ_TIMEOUT_MS) {
+            return;
+        }
+        _rx_expect = RxExpect::NONE;
     }
     if (_last_send_ms != 0 && (now - _last_send_ms) < SEND_INTERVAL_MS) {
         return;
@@ -1043,13 +1154,16 @@ void AP_ModbusSteering::handle_run_link_failsafe(uint32_t now)
 
     if (!_run_link_failsafe) {
         _run_link_failsafe = true;
+        _follow_moving = false;
+        _follow_need_go = false;
+        _follow_sign = 0;
         _phase = Phase::RUN_STOP;
         _awaiting_echo = false;
         _got_echo = false;
         _init_attempts = 0;
         GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                      "CL57R: Modbus link lost, STOP (silent %ums crc_err=%u)",
-                      (unsigned)good_age, (unsigned)_rx_crc_err);
+                      "CL57R: Modbus link lost, STOP (silent %ums crc_err=%u phase=%u)",
+                      (unsigned)good_age, (unsigned)_rx_crc_err, (unsigned)_phase);
         _last_run_link_warn_ms = now;
         return;
     }
@@ -1077,10 +1191,13 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
         return;
     }
 
-    if (_phase == Phase::RUN_TARGET ||
-        _phase == Phase::RUN_MOTION ||
+    if (_phase == Phase::RUN_FOLLOW_SPD ||
+        _phase == Phase::RUN_FOLLOW_GO ||
         _phase == Phase::RUN_STOP) {
-        return; // write sequence driven by echo path in service()
+        // Write sequence driven by the echo path in service(). Do not poll
+        // here: a read would win the 50 ms send slot every tick and starve
+        // the pending write forever.
+        return;
     }
 
     const int32_t limit = travel_limit_pulses();
@@ -1094,6 +1211,9 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
     if (into_pos_stop || into_neg_stop) {
         if (!_run_limit_hold) {
             _run_limit_hold = true;
+            _follow_moving = false;
+            _follow_need_go = false;
+            _follow_sign = 0;
             _phase = Phase::RUN_STOP;
             _awaiting_echo = false;
             _got_echo = false;
@@ -1102,27 +1222,101 @@ void AP_ModbusSteering::handle_run(uint32_t now, float steering_out)
                           "CL57R: limit DI hit in run, hold (di=%04x enc=%d)",
                           (unsigned)_di_word, (int)_actual_pulses);
         }
-        // Keep polling: a silent link here would flap the run-link failsafe.
-        bus_idle_poll(now);
+        // Hold state keeps polling via the IDLE_READY path once the STOP
+        // write has gone out; do not poll here or the STOP itself starves.
         return;
     }
     _run_limit_hold = false;
 
-    const int32_t db = pos_db.get();
-    const bool need_write = !_have_run_target ||
-                            (db <= 0 ? (target != _last_target)
-                                     : (abs(target - _last_target) >= db));
-    if (need_write) {
-        _last_target = target;
-        _have_run_target = true;
-        _phase = Phase::RUN_TARGET;
-        _awaiting_echo = false;
-        _got_echo = false;
-        _init_attempts = 0;
+    // Speed-mode follow: this CL57R ignores absolute positioning starts, so
+    // the shaft is servoed through signed MAX_SPD + MOTION_SPEED (as v13).
+    // Control loops are slow (encoder polls plus echo-paced writes, ~0.5 s
+    // worst case), so full speed is only used outside a brake window; inside
+    // it the speed is ~0.6*err/s, which converges with margin.
+    const int32_t err = target - _actual_pulses;
+    const int32_t abs_err = abs(err);
+    const int32_t arrive = MAX(pos_db.get(), (int32_t)800);
+    const int32_t fast_v = (int32_t)run_speed_rpm() * CL57R_STEPS_PER_REV / 60;
+    // Full speed only well outside this window: it must cover at least 2-3
+    // poll+write cycles (~1 s of travel at run speed), otherwise the shaft
+    // reaches the target before the first downshift write lands.
+    const int32_t brake_window = MAX((int32_t)20000, fast_v * 3 / 4);
+    int16_t rpm;
+    if (abs_err > brake_window) {
+        rpm = (int16_t)run_speed_rpm();
+    } else {
+        rpm = (int16_t)MAX((int16_t)FOLLOW_MIN_RPM, (int16_t)(abs_err * 60 / 4000));
+        rpm = (int16_t)MIN((int16_t)run_speed_rpm(), rpm);
+    }
+
+    if (_follow_moving) {
+        if (abs_err <= arrive) {
+            _follow_moving = false;
+            _follow_sign = 0;
+            _phase = Phase::RUN_STOP;
+            _awaiting_echo = false;
+            _got_echo = false;
+            _init_attempts = 0;
+            return;
+        }
+        const int8_t want_sign = (err > 0) ? 1 : -1;
+        if (want_sign != _follow_sign) {
+            // Soft stop before reversing — avoids a harsh direction flip.
+            _follow_moving = false;
+            _follow_sign = 0;
+            _phase = Phase::RUN_STOP;
+            _awaiting_echo = false;
+            _got_echo = false;
+            _init_attempts = 0;
+            return;
+        }
+        if ((now - _follow_progress_ms) > FOLLOW_REASSERT_MS) {
+            _follow_progress_ms = now;
+            const int32_t moved = abs(_actual_pulses - _follow_last_enc);
+            _follow_last_enc = _actual_pulses;
+            if (moved < FOLLOW_MIN_MOVE_PULSES) {
+                // Drive dropped speed mode — reassert without reversing.
+                _follow_need_go = true;
+                _phase = Phase::RUN_FOLLOW_GO;
+                _awaiting_echo = false;
+                _got_echo = false;
+                _init_attempts = 0;
+                return;
+            }
+        }
+        const int16_t signed_rpm = (int16_t)(rpm * _follow_sign);
+        if (abs(signed_rpm - _follow_last_rpm) >= FOLLOW_RPM_UPDATE) {
+            _follow_rpm_pending = signed_rpm;
+            _follow_last_rpm = signed_rpm;
+            _phase = Phase::RUN_FOLLOW_SPD;
+            _awaiting_echo = false;
+            _got_echo = false;
+            _init_attempts = 0;
+            return;
+        }
+        bus_idle_poll(now);
         return;
     }
 
-    bus_idle_poll(now);
+    if (abs_err <= arrive) {
+        bus_idle_poll(now);
+        return;
+    }
+
+    // Start the follow toward the target.
+    const int8_t want_sign = (err > 0) ? 1 : -1;
+    _follow_rpm_pending = (int16_t)(rpm * want_sign);
+    _follow_last_rpm = _follow_rpm_pending;
+    _follow_sign = want_sign;
+    _follow_progress_ms = now;
+    _follow_last_enc = _actual_pulses;
+    _follow_need_go = true;
+    _phase = Phase::RUN_FOLLOW_SPD;
+    _awaiting_echo = false;
+    _got_echo = false;
+    _init_attempts = 0;
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "CL57R: follow start rpm=%d tgt=%d enc=%d",
+                  (int)_follow_rpm_pending, (int)target, (int)_actual_pulses);
 }
 
 void AP_ModbusSteering::service(uint32_t now)
@@ -1133,13 +1327,13 @@ void AP_ModbusSteering::service(uint32_t now)
     }
 
     if (_phase == Phase::CAL_WAIT ||
-        _phase == Phase::MID_WAIT ||
+        _phase == Phase::MID_FOLLOW ||
         _phase == Phase::BACK_POLL) {
         bus_idle_poll(now);
         if (_phase == Phase::CAL_WAIT) {
             evaluate_cal_wait(now);
-        } else if (_phase == Phase::MID_WAIT) {
-            evaluate_mid_wait(now);
+        } else if (_phase == Phase::MID_FOLLOW) {
+            evaluate_mid_follow(now);
         } else {
             evaluate_back_poll(now);
         }

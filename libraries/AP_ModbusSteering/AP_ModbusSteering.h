@@ -22,6 +22,19 @@ public:
     bool homing() const;
     bool alarmed() const { return (_status_word & (1U << 3)) != 0; }
     bool link_ok() const;
+    int32_t debug_enc() const { return _actual_pulses; }
+    uint16_t debug_status() const { return (uint16_t)(_status_word | ((uint16_t)_phase << 8)); }
+    uint32_t debug_txstate(uint32_t now) const
+    {
+        const uint32_t age = (now - _last_send_ms) / 10;
+        const uint32_t age_capped = (age > 255) ? 255 : age;
+        return (uint32_t)(_awaiting_echo ? 1 : 0) |
+               (_got_echo ? 2 : 0) |
+               (_got_exception ? 4 : 0) |
+               ((uint32_t)_rx_expect << 3) |
+               ((uint32_t)_init_attempts << 8) |
+               (age_capped << 16);
+    }
 
     static const struct AP_Param::GroupInfo var_info[];
 
@@ -52,9 +65,10 @@ private:
         MID_CLEAR,
         MID_ENABLE,
         MID_MAX_SPD,
-        MID_TARGET,
-        MID_RUN,
-        MID_WAIT,
+        MID_SPD,
+        MID_GO,
+        MID_FOLLOW,
+        MID_HALT,
         MID_ZERO,
 
         BACK_STOP,
@@ -67,8 +81,8 @@ private:
         ABORT_STOP,
 
         IDLE_READY,
-        RUN_TARGET,
-        RUN_MOTION,
+        RUN_FOLLOW_SPD,
+        RUN_FOLLOW_GO,
         RUN_STOP,
 
         // Post-cal: restore armed run speed in REG_MAX_SPD before IDLE_READY.
@@ -88,8 +102,8 @@ private:
     }
     bool in_run() const {
         return _phase == Phase::IDLE_READY ||
-               _phase == Phase::RUN_TARGET ||
-               _phase == Phase::RUN_MOTION ||
+               _phase == Phase::RUN_FOLLOW_SPD ||
+               _phase == Phase::RUN_FOLLOW_GO ||
                _phase == Phase::RUN_STOP;
     }
 
@@ -103,12 +117,15 @@ private:
     uint16_t home_first_method() const;
     uint16_t home_method_now() const;
     uint16_t home_limit_bit() const;
+    int16_t mid_cruise_rpm() const;
+    int32_t mid_brake_pulses() const;
+    int32_t mid_final_pulses() const;
     int32_t expected_full_travel() const;
     int32_t travel_limit_pulses() const;
     int16_t backoff_signed_rpm() const;
 
     void send_u16(uint16_t reg, uint16_t value);
-    void send_target_pos(int32_t target);
+    void write_all(const uint8_t *buf, uint16_t len);
     void send_read(uint16_t reg, uint16_t count, RxExpect expect);
     void send_current();
 
@@ -116,7 +133,7 @@ private:
     void service(uint32_t now);
     void bus_idle_poll(uint32_t now);
     void evaluate_cal_wait(uint32_t now);
-    void evaluate_mid_wait(uint32_t now);
+    void evaluate_mid_follow(uint32_t now);
     void evaluate_back_poll(uint32_t now);
     void handle_run(uint32_t now, float steering_out);
     void handle_run_link_failsafe(uint32_t now);
@@ -136,6 +153,7 @@ private:
     uint32_t _last_send_ms = 0;
     uint32_t _last_rx_ms = 0;
     uint32_t _rx_crc_err = 0;
+    uint32_t _last_read_sent_ms = 0;
     uint32_t _cal_start_ms = 0;
     uint32_t _leg_start_ms = 0;
     uint32_t _last_progress_ms = 0;
@@ -159,23 +177,33 @@ private:
     uint8_t _run_poll_phase = 0;
     uint16_t _di_word = 0;
     uint16_t _status_word = 0;
-    int32_t _last_target = 0;
     int32_t _actual_pulses = 0;
     int32_t _last_progress_enc = 0;
     int32_t _leg1_travel = 0;
     int32_t _leg_peak_travel = 0;
     int32_t _measured_half_travel = 0;
     int32_t _mid_target = 0;
+    int8_t _leg_dir = 0;         // observed direction of the current seek
+    int32_t _mid_origin_enc = 0;
+    int32_t _mid_last_enc = 0;
+    int32_t _mid_traveled = 0;
+    int8_t _mid_dir = 0;
+    bool _mid_slow = false;
     int8_t _cal_trig_last = 0;
     bool _cal_trig_inited = false;
     bool _rst_was_high = false;
     bool _cal_was_high = false;
-    bool _have_run_target = false;
     bool _run_link_failsafe = false;
     bool _run_limit_hold = false;
+    bool _follow_moving = false;
+    bool _follow_need_go = false;
+    int8_t _follow_sign = 0;
+    int16_t _follow_rpm_pending = 0;
+    int16_t _follow_last_rpm = 0;
+    uint32_t _follow_progress_ms = 0;
+    int32_t _follow_last_enc = 0;
     uint32_t _link_lost_candidate_ms = 0;
     uint32_t _last_run_link_warn_ms = 0;
-    uint16_t _queued_motion = 0;
     uint8_t _rx_buf[64] {};
     uint8_t _rx_len = 0;
 
